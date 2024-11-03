@@ -1,13 +1,11 @@
 # STT Research Project
 
+> [!IMPORTANT]  
+> This project is currently in progress. Updates will be posted over time as results come back.
+
 ## Introduction
 
 music2text is a research project that I'm currently working on to measure the effect of background noise on audio transcription. 
 
-## Code
-
-Most code related to this project is released under this project is released under the [MIT License](https://github.com/Ryan5453/music2text), however, some dataset-specific code is private and will not be released.
-
-## Credits
-
-Thanks to the Northeastern [Research Computing](https://rc.northeastern.edu/) for access to the Discovery Research Cluster, which allowed for this project to exist.
+## Base Model
+This project and its respective benchmarks are based off OpenAI's Whisper [large-v3-turbo](https://github.com/openai/whisper/pull/2361/files) model.
