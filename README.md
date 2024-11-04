@@ -3,9 +3,30 @@
 > [!IMPORTANT]  
 > This project is currently in progress. Updates will be posted over time as results come back.
 
-## Introduction
+## Dataset
 
-music2text is a research project that I'm currently working on to measure the effect of background noise on audio transcription. 
+## Benchmarks
 
-## Base Model
-This project and its respective benchmarks are based off OpenAI's Whisper [large-v3-turbo](https://github.com/openai/whisper/pull/2361/files) model.
+| Model                                       | Average | English | Spanish | German | French |
+| ------------------------------------------- | ------- | ------- | ------- | ------ | ------ |
+|                                             | WER     | WER     | WER     | WER    | WER    |
+| Whisper Large v1                            | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v1 w/ Language                | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v1 w/ Demucs                  | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v1 w/ Demucs + Language       | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v2                            | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v2 w/ Language                | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v2 w/ Demucs                  | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v2 w/ Demucs + Language       | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3                            | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3 w/ Language                | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3 w/ Demucs                  | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3 w/ Demucs + Language       | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3 Turbo                      | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3 Turbo w/ Language          | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3 Turbo w/ Demucs            | x.x     | x.x     | x.x     | x.x    | x.x    |
+| Whisper Large v3 Turbo w/ Demucs + Language | x.x     | x.x     | x.x     | x.x    | x.x    |
+
+> [!NOTE]  
+> - [Demucs](https://github.com/adefossez/demucs) refers to the htdemucs model specficically
+> - Language refers to the audio file language being provided to Whisper
