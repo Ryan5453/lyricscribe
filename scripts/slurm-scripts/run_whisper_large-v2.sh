@@ -20,4 +20,4 @@ source ${PWD}/.venv/bin/activate
 # I installed them via pip, so we have to add them to the LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=${PWD}/.venv/lib64/python3.11/site-packages/nvidia/cublas/lib:${PWD}/.venv/lib64/python3.11/site-packages/nvidia/cudnn/lib
 
-python scripts/whisper-wer.py --directory /path/to/your/audio --model large-v2
+python -u scripts/whisper-wer.py --directory /path/to/your/audio --model large-v2

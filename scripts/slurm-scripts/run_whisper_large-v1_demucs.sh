@@ -9,6 +9,7 @@
 #SBATCH --gres=gpu:XXX:1
 #SBATCH --job-name=whisper_large-v1_demucs
 #SBATCH --output=/path/to/your/output/whisper_large-v1_demucs.out
+#SBATCH --error=/path/to/your/output/whisper_large-v1_demucs.out
 #SBATCH --time=08:00:00 
 
 module load miniconda3/23.11.0
@@ -20,4 +21,4 @@ source ${PWD}/.venv/bin/activate
 # I installed them via pip, so we have to add them to the LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=${PWD}/.venv/lib64/python3.11/site-packages/nvidia/cublas/lib:${PWD}/.venv/lib64/python3.11/site-packages/nvidia/cudnn/lib
 
-python scripts/whisper-wer.py --directory /path/to/your/audio --model large-v1 --use_demucs
+python -u scripts/whisper-wer.py --directory /path/to/your/audio --model large-v1 --use_demucs
