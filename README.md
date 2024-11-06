@@ -4,7 +4,8 @@
 > This project is currently in progress. Updates will be posted over time as results come back.
 
 ## Dataset
-The dataset used for this project contains a total of 39,886 audio files. 831 files are used exclusively for testing (the benchmarks below), while the other 39,055 are used for training. The dataset is multilingual - the test subset was randomly chosen so it should be approximately the same makeup as the training set. 
+
+The dataset used for this project contains a total of 39,886 audio files. 831 files are used exclusively for testing (the benchmarks below), while the other 39,055 are used for training. The dataset is multilingual - approximately 58.2% English and 28.5% Spanish, with the remaining 13.3% is made up of 18 other languages.
 
 ## Benchmarks
 
