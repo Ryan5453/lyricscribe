@@ -9,7 +9,6 @@
 #SBATCH --gres=gpu:XXX:1
 #SBATCH --job-name=whisper_large-v1_demucs
 #SBATCH --output=/path/to/your/output/whisper_large-v1_demucs.out
-#SBATCH --error=/path/to/your/output/whisper_large-v1_demucs.out
 #SBATCH --time=08:00:00 
 
 module load miniconda3/23.11.0
