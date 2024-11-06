@@ -98,15 +98,15 @@ def transcribe_audio(model: FasterWhisperPipeline, audio_path: str) -> Tuple[str
     return split_lyrics(result["segments"]), result["language"]
 
 
-def calculate_wer(model: FasterWhisperPipeline, args: argparse.Namespace) -> list[float]:
+def calculate_wer(model: FasterWhisperPipeline, args: argparse.Namespace) -> dict:
     """
-    Calculates the WER for all audio files in the given directory. Optionally uses Demucs pre-processed audio.
+    Calculates the WER for all audio files in the given directory, grouped by language.
 
     :param model: The WhisperX model to use for transcription.
     :param args: The parsed arguments from argparse.
-    :return: A list of WER scores.
+    :return: A dictionary mapping languages to lists of WER scores.
     """
-    wer_scores = []
+    language_stats = {}  # Format: {'en': [], 'es': [], ...}
     file_name = "vocals.wav" if args.use_demucs else "audio.mp3"
 
     for root, dirs, files in os.walk(args.directory):
@@ -115,7 +115,6 @@ def calculate_wer(model: FasterWhisperPipeline, args: argparse.Namespace) -> lis
 
         isrc = os.path.basename(root)
 
-        # Check if we have both the audio file and lyrics
         if file_name in files and "lyrics.json" in files:
             try:
                 # Get reference text from lyrics.json
@@ -127,26 +126,33 @@ def calculate_wer(model: FasterWhisperPipeline, args: argparse.Namespace) -> lis
                 audio_path = os.path.join(root, file_name)
                 hypothesis_text, language = transcribe_audio(model, audio_path)
 
-                # Save hypothesis text to file
-                with open(os.path.join(root, args.model + "_hypothesis.txt"), "w") as f:
-                    f.write(hypothesis_text)
+                # Initialize language entry if not exists
+                if language not in language_stats:
+                    language_stats[language] = []
 
-                # Save language to file
-                with open(os.path.join(root, args.model + "_language.txt"), "w") as f:
-                    f.write(language)
+                model_fs = args.model.split("/")[-1]
+
+                # Save hypothesis and language in a single JSON file
+                with open(os.path.join(root, model_fs + "_results.json"), "w") as f:
+                    json.dump({
+                        "hypothesis": hypothesis_text,
+                        "language": language
+                    }, f, indent=2)
 
                 # Calculate WER
                 removed_double_newlines = reference_text.replace("\n\n", "\n")
                 calculated_wer = wer(removed_double_newlines, hypothesis_text)
-                wer_scores.append(calculated_wer)
+                
+                # Store WER score
+                language_stats[language].append(calculated_wer)
 
-                print(f"Processed {isrc} - WER: {calculated_wer:.4f}")
+                print(f"Processed {isrc} - Language: {language} - WER: {calculated_wer:.4f}")
 
             except Exception as e:
                 print(f"Error processing {isrc}: {str(e)}")
                 continue
 
-    return wer_scores
+    return language_stats
 
 
 def disable_vad(model: FasterWhisperPipeline):
@@ -159,24 +165,22 @@ def disable_vad(model: FasterWhisperPipeline):
     model._vad_params["vad_offset"] = 0.001
 
 
-def calculate_wer_both_modes(model: FasterWhisperPipeline, args: argparse.Namespace) -> tuple[list[float], list[float]]:
+def calculate_wer_both_modes(model: FasterWhisperPipeline, args: argparse.Namespace) -> tuple[dict, dict]:
     """
     Calculates the WER for all audio files with and without VAD.
 
     :param model: The WhisperX model to use for transcription.
     :param args: The parsed arguments from argparse.
-    :return: Two lists of WER scores (with VAD, without VAD).
+    :return: Two dictionaries of language statistics (with VAD, without VAD).
     """
-    # First calculate with VAD (default)
     print("\nCalculating WER with VAD enabled...")
-    wer_scores_vad = calculate_wer(model, args)
+    stats_vad = calculate_wer(model, args)
     
-    # Disable VAD and calculate again
     print("\nCalculating WER with VAD disabled...")
     disable_vad(model)
-    wer_scores_no_vad = calculate_wer(model, args)
+    stats_no_vad = calculate_wer(model, args)
     
-    return wer_scores_vad, wer_scores_no_vad
+    return stats_vad, stats_no_vad
 
 
 def calculate_wer_without_outliers(wer_scores: list[float]) -> tuple[list[float], float]:
@@ -208,6 +212,50 @@ def calculate_wer_without_outliers(wer_scores: list[float]) -> tuple[list[float]
     avg_wer = sum(filtered_scores) / len(filtered_scores) if filtered_scores else 0
     
     return filtered_scores, avg_wer
+
+
+def print_language_statistics(language_stats: dict, mode: str):
+    """
+    Prints WER statistics for each language, starting with overall averages.
+    
+    :param language_stats: Dictionary mapping languages to lists of WER scores
+    :param mode: String indicating the mode (VAD or No VAD)
+    """
+    print(f"\n{mode} Results:")
+    
+    # Calculate overall statistics
+    all_scores = []
+    total_samples = 0
+    for scores in language_stats.values():
+        all_scores.extend(scores)
+        total_samples += len(scores)
+    
+    # Print overall statistics
+    print("\nOverall Statistics:")
+    avg_wer = sum(all_scores) / len(all_scores) if all_scores else 0
+    filtered_scores, avg_wer_no_outliers = calculate_wer_without_outliers(all_scores)
+    print(f"Total samples: {total_samples}")
+    print(f"Average WER (with outliers): {avg_wer:.4f}")
+    print(f"Average WER (without outliers): {avg_wer_no_outliers:.4f}")
+    print(f"Removed {len(all_scores) - len(filtered_scores)} outliers")
+    
+    # Print per-language statistics
+    print("\nPer-Language Statistics:")
+    for language, wer_scores in sorted(language_stats.items()):
+        count = len(wer_scores)
+        percentage = (count / total_samples) * 100
+        
+        # Calculate statistics with and without outliers
+        avg_wer = sum(wer_scores) / count if wer_scores else 0
+        filtered_scores, avg_wer_no_outliers = calculate_wer_without_outliers(wer_scores)
+        
+        print(f"\nLanguage: {language}")
+        print(f"Sample count: {count} ({percentage:.1f}% of total)")
+        print(f"Average WER (with outliers): {avg_wer:.4f}")
+        print(f"Average WER (without outliers): {avg_wer_no_outliers:.4f}")
+        print(f"Individual WERs: {wer_scores}")
+        print(f"Filtered WERs: {filtered_scores}")
+        print(f"Removed {len(wer_scores) - len(filtered_scores)} outliers")
 
 
 def main():
@@ -248,34 +296,15 @@ def main():
 
     # Calculate WER for both VAD modes
     print(f"\nProcessing {'demucs' if args.use_demucs else 'original'} files...")
-    wer_scores_vad, wer_scores_no_vad = calculate_wer_both_modes(model, args)
-
-    # Calculate averages and remove outliers
-    avg_wer_vad = sum(wer_scores_vad) / len(wer_scores_vad) if wer_scores_vad else 0
-    avg_wer_no_vad = sum(wer_scores_no_vad) / len(wer_scores_no_vad) if wer_scores_no_vad else 0
-    
-    # Calculate WER without outliers
-    filtered_vad, avg_wer_vad_no_outliers = calculate_wer_without_outliers(wer_scores_vad)
-    filtered_no_vad, avg_wer_no_vad_no_outliers = calculate_wer_without_outliers(wer_scores_no_vad)
+    stats_vad, stats_no_vad = calculate_wer_both_modes(model, args)
 
     # Print results
     print("\nResults:")
     print(f"Model: {args.model}")
     print(f"Processing type: {'Demucs' if args.use_demucs else 'Original'}")
     
-    print("\nWith VAD:")
-    print(f"Average WER (with outliers): {avg_wer_vad:.4f}")
-    print(f"Average WER (without outliers): {avg_wer_vad_no_outliers:.4f}")
-    print("Individual WERs:", wer_scores_vad)
-    print(f"Filtered WERs (outliers removed): {filtered_vad}")
-    print(f"Removed {len(wer_scores_vad) - len(filtered_vad)} outliers")
-    
-    print("\nWithout VAD:")
-    print(f"Average WER (with outliers): {avg_wer_no_vad:.4f}")
-    print(f"Average WER (without outliers): {avg_wer_no_vad_no_outliers:.4f}")
-    print("Individual WERs:", wer_scores_no_vad)
-    print(f"Filtered WERs (outliers removed): {filtered_no_vad}")
-    print(f"Removed {len(wer_scores_no_vad) - len(filtered_no_vad)} outliers")
+    print_language_statistics(stats_vad, "With VAD")
+    print_language_statistics(stats_no_vad, "Without VAD")
 
 
 if __name__ == "__main__":
