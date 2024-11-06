@@ -53,6 +53,6 @@ The dataset used for this project contains a total of 39,886 audio files. 831 fi
 |                        | Filtered‡ | x.x       | x.x       | x.x       | x.x   |
 
 
-> [!NOTE]Notes
+> [!NOTE](Notes)
 > - [Demucs](https://github.com/adefossez/demucs) refers to the `htdemucs` model being applied to the source audio file before transcription
 > - Filtered‡ refers to WER scores with outliers removed using the IQR method (`Q1 - 1.5*IQR, Q3 + 1.5*IQR`)
