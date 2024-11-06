@@ -179,6 +179,37 @@ def calculate_wer_both_modes(model: FasterWhisperPipeline, args: argparse.Namesp
     return wer_scores_vad, wer_scores_no_vad
 
 
+def calculate_wer_without_outliers(wer_scores: list[float]) -> tuple[list[float], float]:
+    """
+    Removes outliers from WER scores using the IQR method and calculates the average.
+    
+    :param wer_scores: List of WER scores
+    :return: Tuple of (filtered scores, average WER without outliers)
+    """
+    if not wer_scores:
+        return [], 0.0
+        
+    # Calculate Q1, Q3, and IQR
+    sorted_scores = sorted(wer_scores)
+    n = len(sorted_scores)
+    q1_idx = int(n * 0.25)
+    q3_idx = int(n * 0.75)
+    
+    q1 = sorted_scores[q1_idx]
+    q3 = sorted_scores[q3_idx]
+    iqr = q3 - q1
+    
+    # Define bounds for outliers (1.5 * IQR)
+    lower_bound = q1 - (1.5 * iqr)
+    upper_bound = q3 + (1.5 * iqr)
+    
+    # Filter out outliers
+    filtered_scores = [score for score in wer_scores if lower_bound <= score <= upper_bound]
+    avg_wer = sum(filtered_scores) / len(filtered_scores) if filtered_scores else 0
+    
+    return filtered_scores, avg_wer
+
+
 def main():
     """
     Calculate average WER for a directory of audio files using WhisperX.
@@ -219,20 +250,32 @@ def main():
     print(f"\nProcessing {'demucs' if args.use_demucs else 'original'} files...")
     wer_scores_vad, wer_scores_no_vad = calculate_wer_both_modes(model, args)
 
-    # Calculate average WERs
+    # Calculate averages and remove outliers
     avg_wer_vad = sum(wer_scores_vad) / len(wer_scores_vad) if wer_scores_vad else 0
     avg_wer_no_vad = sum(wer_scores_no_vad) / len(wer_scores_no_vad) if wer_scores_no_vad else 0
+    
+    # Calculate WER without outliers
+    filtered_vad, avg_wer_vad_no_outliers = calculate_wer_without_outliers(wer_scores_vad)
+    filtered_no_vad, avg_wer_no_vad_no_outliers = calculate_wer_without_outliers(wer_scores_no_vad)
 
     # Print results
     print("\nResults:")
     print(f"Model: {args.model}")
     print(f"Processing type: {'Demucs' if args.use_demucs else 'Original'}")
+    
     print("\nWith VAD:")
-    print(f"Average WER: {avg_wer_vad:.4f}")
+    print(f"Average WER (with outliers): {avg_wer_vad:.4f}")
+    print(f"Average WER (without outliers): {avg_wer_vad_no_outliers:.4f}")
     print("Individual WERs:", wer_scores_vad)
+    print(f"Filtered WERs (outliers removed): {filtered_vad}")
+    print(f"Removed {len(wer_scores_vad) - len(filtered_vad)} outliers")
+    
     print("\nWithout VAD:")
-    print(f"Average WER: {avg_wer_no_vad:.4f}")
+    print(f"Average WER (with outliers): {avg_wer_no_vad:.4f}")
+    print(f"Average WER (without outliers): {avg_wer_no_vad_no_outliers:.4f}")
     print("Individual WERs:", wer_scores_no_vad)
+    print(f"Filtered WERs (outliers removed): {filtered_no_vad}")
+    print(f"Removed {len(wer_scores_no_vad) - len(filtered_no_vad)} outliers")
 
 
 if __name__ == "__main__":
