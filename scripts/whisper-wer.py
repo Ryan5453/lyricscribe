@@ -38,12 +38,13 @@ def transcribe_audio(
     return model.transcribe(audio, batch_size=16)
 
 
-def process_files(model: FasterWhisperPipeline, args: argparse.Namespace):
+def process_files(model: FasterWhisperPipeline, args: argparse.Namespace, vad_enabled: bool):
     """
     Processes all audio files in the given directory and saves transcriptions.
 
     :param model: The WhisperX model to use for transcription.
     :param args: The parsed arguments from argparse.
+    :param vad_enabled: Whether VAD is currently enabled
     """
     file_name = "vocals.wav" if args.use_demucs else "audio.mp3"
 
@@ -60,6 +61,9 @@ def process_files(model: FasterWhisperPipeline, args: argparse.Namespace):
                 result = transcribe_audio(model, audio_path)
 
                 model_fs = args.model.split("/")[-1]
+                source_type = "demucs" if args.use_demucs else "orig"
+                vad_status = "vad" if vad_enabled else "novad"
+                result_filename = f"{model_fs}_{source_type}_{vad_status}_results.json"
 
                 # Convert result to a serializable dictionary
                 serializable_result = {
@@ -75,7 +79,7 @@ def process_files(model: FasterWhisperPipeline, args: argparse.Namespace):
                 }
 
                 # Save hypothesis and language in a single JSON file
-                with open(os.path.join(root, model_fs + "_results.json"), "w") as f:
+                with open(os.path.join(root, result_filename), "w") as f:
                     json.dump(serializable_result, f, indent=2)
 
                 print(f"Processed {isrc}")
@@ -104,12 +108,12 @@ def process_both_modes(model: FasterWhisperPipeline, args: argparse.Namespace):
     """
     print("\nProcessing with VAD enabled...")
     print("-----------------------------------------------------")
-    process_files(model, args)
+    process_files(model, args, vad_enabled=True)
 
     print("\nProcessing with VAD disabled...")
     print("-----------------------------------------------------")
     disable_vad(model)
-    process_files(model, args)
+    process_files(model, args, vad_enabled=False)
 
 
 def main():
