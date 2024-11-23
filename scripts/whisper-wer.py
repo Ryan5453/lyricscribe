@@ -68,10 +68,6 @@ def process_files(model: FasterWhisperPipeline, args: argparse.Namespace):
                             "start": segment.start,
                             "end": segment.end,
                             "text": segment.text,
-                            "words": [
-                                {"word": word.word, "start": word.start, "end": word.end}
-                                for word in (segment.words or [])
-                            ]
                         }
                         for segment in result["segments"]
                     ],
