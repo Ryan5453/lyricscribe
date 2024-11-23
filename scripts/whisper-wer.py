@@ -65,9 +65,9 @@ def process_files(model: FasterWhisperPipeline, args: argparse.Namespace):
                 serializable_result = {
                     "segments": [
                         {
-                            "start": segment.start,
-                            "end": segment.end,
-                            "text": segment.text,
+                            "start": segment["start"],
+                            "end": segment["end"],
+                            "text": segment["text"],
                         }
                         for segment in result["segments"]
                     ],
