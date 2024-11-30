@@ -126,7 +126,7 @@ def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[f
                     
                     if os.path.exists(result_path):
                         hypothesis, language = load_hypothesis(result_path)
-                        score = wer(reference_text, hypothesis)
+                        score = wer(reference_text, hypothesis) * 100  # Convert to percentage
 
                         # language is a string like "en" or "es", but could be anything
                         if language == "en":
