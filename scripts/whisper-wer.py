@@ -127,6 +127,14 @@ def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[f
                     if os.path.exists(result_path):
                         hypothesis, language = load_hypothesis(result_path)
                         score = wer(reference_text, hypothesis)
+
+                        # language is a string like "en" or "es", but could be anything
+                        if language == "en":
+                            language = "english"
+                        elif language == "es":
+                            language = "spanish"
+                        else:
+                            language = "other"
                         
                         model_variant = f"{model_name}"
                         if variant_name:
