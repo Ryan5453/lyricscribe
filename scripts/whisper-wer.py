@@ -34,7 +34,7 @@ import os
 import json
 from jiwer import wer
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import argparse
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
@@ -54,16 +54,16 @@ def load_reference_lyrics(folder_path: str) -> str:
     return lyrics_data['unsynced']['data']
 
 
-def load_hypothesis(file_path: str) -> str:
+def load_hypothesis(file_path: str) -> Tuple[str, str]:
     """
     Load hypothesis text from JSON result file
 
     :param file_path: Path to the Whisper results JSON file
-    :return: The concatenated transcription text
+    :return: The concatenated transcription text and the predicted language
     """
     with open(file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-    return '\n'.join(segment['text'].strip() for segment in data['segments'])
+    return '\n'.join(segment['text'].strip() for segment in data['segments']), data["language"]
 
 
 def remove_outliers(scores: List[float]) -> List[float]:
@@ -111,8 +111,8 @@ def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[f
         if not os.path.isdir(folder_path):
             continue
 
+        # Load reference lyrics
         try:
-            # Load reference lyrics
             lyrics_path = os.path.join(folder_path, 'lyrics.json')
             with open(lyrics_path, 'r', encoding='utf-8') as f:
                 lyrics_data = json.load(f)
@@ -125,15 +125,7 @@ def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[f
                     result_path = os.path.join(folder_path, full_pattern)
                     
                     if os.path.exists(result_path):
-                        # Load results and get language
-                        with open(result_path, 'r', encoding='utf-8') as f:
-                            results_data = json.load(f)
-                        language = results_data.get('language', 'unknown').lower()
-                        if language not in ['english', 'spanish']:
-                            language = 'other'
-                            
-                        # Get hypothesis text
-                        hypothesis = '\n'.join(segment['text'].strip() for segment in results_data['segments'])
+                        hypothesis, language = load_hypothesis(result_path)
                         score = wer(reference_text, hypothesis)
                         
                         model_variant = f"{model_name}"
