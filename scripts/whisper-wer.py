@@ -1,11 +1,15 @@
 """
-This assumes you have a directory structure like this:
+This script calculates Word Error Rate (WER) scores for different Whisper model variants.
+It expects a directory structure like this:
 
 /root
     /<ISRC>
-        /vocals.wav  # Demucs processed audio
-        /audio.mp3  # Original audio
-        /lyrics.json
+        /lyrics.json  # Contains reference lyrics
+        /large-v1_results.json  # Whisper transcription results
+        /large-v1_orig_vad_results.json
+        /large-v1_demucs_novad_results.json
+        /large-v1_demucs_vad_results.json
+        # ... and similar files for other model variants
 
 The lyrics.json file should have the following structure:
 {
@@ -13,135 +17,145 @@ The lyrics.json file should have the following structure:
         "data": "lyrics"
     }
 }
+
+And the results.json files should have the following structure:
+{
+    "segments": [
+        {
+            "text": "segment text",
+            "start": 0.0,
+            "end": 0.0
+        }
+    ]
+}
 """
 
-import argparse
-import json
 import os
+import json
+from jiwer import wer
+import numpy as np
+from typing import Dict, List
+import argparse
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-import whisperx
-from whisperx.asr import FasterWhisperPipeline
-from whisperx.types import TranscriptionResult
 
-
-def transcribe_audio(
-    model: FasterWhisperPipeline, audio_path: str
-) -> TranscriptionResult:
+def load_reference_lyrics(folder_path: str) -> str:
     """
-    Transcribes an audio file using WhisperX.
+    Load reference lyrics from lyrics.json
 
-    :param model: The WhisperX model to use for transcription.
-    :param audio_path: The path to the audio file to transcribe.
-    :return: The transcription result.
+    :param folder_path: Path to the folder containing lyrics.json
+    :return: The reference lyrics text
     """
-    audio = whisperx.load_audio(audio_path)
-    return model.transcribe(audio, batch_size=16)
+    lyrics_path = os.path.join(folder_path, 'lyrics.json')
+    with open(lyrics_path, 'r', encoding='utf-8') as f:
+        lyrics_data = json.load(f)
+    return lyrics_data['unsynced']['data']
 
 
-def process_files(model: FasterWhisperPipeline, args: argparse.Namespace, vad_enabled: bool):
+def load_hypothesis(file_path: str) -> str:
     """
-    Processes all audio files in the given directory and saves transcriptions.
+    Load hypothesis text from JSON result file
 
-    :param model: The WhisperX model to use for transcription.
-    :param args: The parsed arguments from argparse.
-    :param vad_enabled: Whether VAD is currently enabled
+    :param file_path: Path to the Whisper results JSON file
+    :return: The concatenated transcription text
     """
-    file_name = "vocals.wav" if args.use_demucs else "audio.mp3"
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return '\n'.join(segment['text'].strip() for segment in data['segments'])
 
-    for root, dirs, files in os.walk(args.directory):
-        if root == args.directory:
+
+def remove_outliers(scores: List[float]) -> List[float]:
+    """
+    Remove outliers using IQR method
+
+    :param scores: List of WER scores
+    :return: List of scores with outliers removed
+    """
+    q1 = np.percentile(scores, 25)
+    q3 = np.percentile(scores, 75)
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    return [x for x in scores if lower_bound <= x <= upper_bound]
+
+
+def calculate_wer_scores(folder_path: str) -> Dict[str, List[float]]:
+    """
+    Calculate WER scores for all model variants
+
+    :param folder_path: Path to the root directory containing ISRC folders
+    :return: Dictionary mapping model variants to their WER scores
+    """
+    reference_text = load_reference_lyrics(folder_path)
+    results = {}
+    
+    models = {
+        'large-v1': 'Whisper Large v1',
+        'large-v2': 'Whisper Large v2',
+        'large-v3': 'Whisper Large v3',
+        'faster-whisper-large-v3-turbo-ct2': 'Whisper Large v3 Turbo'
+    }
+    
+    variants = [
+        ('results.json', ''),
+        ('orig_vad_results.json', 'with VAD'),
+        ('demucs_novad_results.json', 'with Demucs'),
+        ('demucs_vad_results.json', 'with Demucs + VAD')
+    ]
+    
+    for file in os.listdir(folder_path):
+        if not file.endswith('.json') or file == 'lyrics.json':
             continue
-
-        isrc = os.path.basename(root)
-
-        if file_name in files:
-            try:
-                # Transcribe audio
-                audio_path = os.path.join(root, file_name)
-                result = transcribe_audio(model, audio_path)
-
-                model_fs = args.model.split("/")[-1]
-                source_type = "demucs" if args.use_demucs else "orig"
-                vad_status = "vad" if vad_enabled else "novad"
-                result_filename = f"{model_fs}_{source_type}_{vad_status}_results.json"
-
-                # Convert result to a serializable dictionary
-                serializable_result = {
-                    "segments": [
-                        {
-                            "start": segment["start"],
-                            "end": segment["end"],
-                            "text": segment["text"],
-                        }
-                        for segment in result["segments"]
-                    ],
-                    "language": result["language"],
-                }
-
-                # Save hypothesis and language in a single JSON file
-                with open(os.path.join(root, result_filename), "w") as f:
-                    json.dump(serializable_result, f, indent=2)
-
-                print(f"Processed {isrc}")
-
-            except Exception as e:
-                print(f"Error processing {isrc}: {str(e)}")
-                continue
+            
+        for model_key, model_name in models.items():
+            for variant_file, variant_name in variants:
+                full_pattern = f"{model_key}_{variant_file}"
+                if file == full_pattern:
+                    hypothesis = load_hypothesis(os.path.join(folder_path, file))
+                    score = wer(reference_text, hypothesis)
+                    
+                    model_variant = f"{model_name}"
+                    if variant_name:
+                        model_variant = f"└─ {variant_name}"
+                    
+                    results[model_variant] = results.get(model_variant, []) + [score]
+    
+    return results
 
 
-def disable_vad(model: FasterWhisperPipeline):
+def print_results(results: Dict[str, List[float]]):
     """
-    Disables VAD by setting minimal onset/offset thresholds.
+    Print WER scores to terminal
 
-    :param model: The WhisperX model to modify
+    :param results: Dictionary mapping model variants to their WER scores
     """
-    model._vad_params["vad_onset"] = 0.00001
-    model._vad_params["vad_offset"] = 0.00001
-
-
-def process_both_modes(model: FasterWhisperPipeline, args: argparse.Namespace):
-    """
-    Processes all audio files with and without VAD.
-
-    :param model: The WhisperX model to use for transcription.
-    :param args: The parsed arguments from argparse.
-    """
-    print("\nProcessing with VAD enabled...")
-    print("-----------------------------------------------------")
-    process_files(model, args, vad_enabled=True)
-
-    print("\nProcessing with VAD disabled...")
-    print("-----------------------------------------------------")
-    disable_vad(model)
-    process_files(model, args, vad_enabled=False)
+    for model in sorted(results.keys()):
+        scores = results[model]
+        filtered_scores = remove_outliers(scores)
+        
+        filtered_avg = np.mean(filtered_scores) if filtered_scores else 0
+        print(f"{model} (no outliers): {filtered_avg:.2f}")
 
 
 def main():
     """
-    Process audio files using WhisperX and save their transcriptions.
+    Calculate WER scores and print results
     """
-    parser = argparse.ArgumentParser(description="Transcribe audio using WhisperX")
+    parser = argparse.ArgumentParser(description="Calculate WER scores for Whisper variants")
     parser.add_argument(
-        "--directory", type=str, required=True, help="Directory containing audio files"
+        "--directory", type=str, required=True,
+        help="Directory containing ISRC folders with transcriptions"
     )
-    parser.add_argument(
-        "--model", type=str, required=True, help="Whisper model name (e.g., 'large-v2')"
-    )
-    parser.add_argument(
-        "--use_demucs",
-        action="store_true",
-        help="Use demucs processed files instead of original MP3s",
-    )
-
+    
     args = parser.parse_args()
-
-    # Initialize the WhisperX model
-    print(f"Initializing WhisperX model: {args.model}")
-    model = whisperx.load_model(args.model, device="cuda", compute_type="float16")
-
-    # Process files in both VAD modes
-    print(f"\nProcessing {'demucs' if args.use_demucs else 'original'} files...")
-    process_both_modes(model, args)
+    
+    # Calculate WER scores
+    results = calculate_wer_scores(args.directory)
+    
+    # Print results
+    print_results(results)
 
 
 if __name__ == "__main__":
