@@ -30,15 +30,17 @@ And the results.json files should have the following structure:
 }
 """
 
-import os
-import json
-from jiwer import wer
-import numpy as np
-from typing import Dict, List, Tuple
 import argparse
+import json
+import os
+from collections import Counter
+from typing import Dict, List, Tuple
+
 import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
+import numpy as np
+from jiwer import wer
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 
 
 def load_reference_lyrics(folder_path: str) -> str:
@@ -48,10 +50,10 @@ def load_reference_lyrics(folder_path: str) -> str:
     :param folder_path: Path to the folder containing lyrics.json
     :return: The reference lyrics text
     """
-    lyrics_path = os.path.join(folder_path, 'lyrics.json')
-    with open(lyrics_path, 'r', encoding='utf-8') as f:
+    lyrics_path = os.path.join(folder_path, "lyrics.json")
+    with open(lyrics_path, "r", encoding="utf-8") as f:
         lyrics_data = json.load(f)
-    return lyrics_data['unsynced']['data']
+    return lyrics_data["unsynced"]["data"]
 
 
 def load_hypothesis(file_path: str) -> Tuple[str, str]:
@@ -61,9 +63,12 @@ def load_hypothesis(file_path: str) -> Tuple[str, str]:
     :param file_path: Path to the Whisper results JSON file
     :return: The concatenated transcription text and the predicted language
     """
-    with open(file_path, 'r', encoding='utf-8') as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return '\n'.join(segment['text'].strip() for segment in data['segments']), data["language"]
+    return (
+        "\n".join(segment["text"].strip() for segment in data["segments"]),
+        data["language"],
+    )
 
 
 def remove_outliers(scores: List[float]) -> List[float]:
@@ -81,28 +86,28 @@ def remove_outliers(scores: List[float]) -> List[float]:
     return [x for x in scores if lower_bound <= x <= upper_bound]
 
 
-def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
+def calculate_wer_scores(
+    root_path: str,
+) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
     """
     Calculate WER scores for all model variants, grouped by language
-
-    :param root_path: Path to the root directory containing ISRC folders
-    :return: Nested dictionary: model -> language -> score_type -> scores
     """
     results = {}
-    
+    language_counts = Counter()
+
     # Define model variants
     models = {
-        'large-v1': 'Whisper Large v1',
-        'large-v2': 'Whisper Large v2',
-        'large-v3': 'Whisper Large v3',
-        'faster-whisper-large-v3-turbo-ct2': 'Whisper Large v3 Turbo'
+        "large-v1": "Whisper Large v1",
+        "large-v2": "Whisper Large v2",
+        "large-v3": "Whisper Large v3",
+        "faster-whisper-large-v3-turbo-ct2": "Whisper Large v3 Turbo",
     }
-    
+
     variants = [
-        ('orig_novad_results.json', 'Base'),
-        ('orig_vad_results.json', 'with VAD'),
-        ('demucs_novad_results.json', 'with Demucs'),
-        ('demucs_vad_results.json', 'with Demucs + VAD')
+        ("orig_novad_results.json", "Base"),
+        ("orig_vad_results.json", "with VAD"),
+        ("demucs_novad_results.json", "with Demucs"),
+        ("demucs_vad_results.json", "with Demucs + VAD"),
     ]
 
     # Iterate through ISRC folders
@@ -113,96 +118,276 @@ def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[f
 
         # Load reference lyrics
         try:
-            lyrics_path = os.path.join(folder_path, 'lyrics.json')
-            with open(lyrics_path, 'r', encoding='utf-8') as f:
+            lyrics_path = os.path.join(folder_path, "lyrics.json")
+            with open(lyrics_path, "r", encoding="utf-8") as f:
                 lyrics_data = json.load(f)
-            reference_text = lyrics_data['unsynced']['data']
-            
+            reference_text = lyrics_data["unsynced"]["data"]
+
             # Process each model variant
             for model_key, model_name in models.items():
                 for variant_file, variant_name in variants:
                     full_pattern = f"{model_key}_{variant_file}"
                     result_path = os.path.join(folder_path, full_pattern)
-                    
+
                     if os.path.exists(result_path):
                         hypothesis, language = load_hypothesis(result_path)
-                        score = wer(reference_text, hypothesis) * 100  # Convert to percentage
+                        score = wer(reference_text, hypothesis) * 100
 
-                        # language is a string like "en" or "es", but could be anything
-                        if language == "en":
-                            language = "english"
-                        elif language == "es":
-                            language = "spanish"
-                        else:
-                            language = "other"
-                        
+                        # Use raw language code directly
+                        language_counts[language] += 1
+
                         model_variant = f"{model_name}"
-                        if variant_name != 'Base':
+                        if variant_name != "Base":
                             model_variant = f"{model_name} └─ {variant_name}"
-                        
-                        # Initialize nested dictionaries if they don't exist
+
                         if model_variant not in results:
-                            results[model_variant] = {'english': [], 'spanish': [], 'other': []}
-                        
+                            results[model_variant] = {}
+                        if language not in results[model_variant]:
+                            results[model_variant][language] = []
+
                         results[model_variant][language].append(score)
-                        
+
         except Exception as e:
             print(f"Error processing {isrc_folder}: {str(e)}")
-    
-    return results
+
+    return results, language_counts
 
 
-def print_results(results: Dict[str, Dict[str, List[float]]]):
+def print_results(results: Dict[str, Dict[str, List[float]]], language_counts: Counter):
     """
-    Print WER scores in table format
+    Print WER scores in table format for top 4 languages
     """
-    print("| Model | WER Type | Average | English | Spanish |")
-    print("| ---------------------- | --------- | --------- | --------- | --------- |")
-    
-    for model in sorted(results.keys()):
-        # Calculate raw scores
-        all_scores = []
-        eng_scores = results[model]['english']
-        spa_scores = results[model]['spanish']
-        
-        all_scores.extend(eng_scores + spa_scores)
-        
-        # Calculate averages
-        raw_avg = np.mean(all_scores) if all_scores else 0
-        raw_eng = np.mean(eng_scores) if eng_scores else 0
-        raw_spa = np.mean(spa_scores) if spa_scores else 0
-        
-        # Calculate filtered scores
-        filtered_all = remove_outliers(all_scores)
-        filtered_eng = remove_outliers(eng_scores)
-        filtered_spa = remove_outliers(spa_scores)
-        
-        filtered_avg = np.mean(filtered_all) if filtered_all else 0
-        filtered_eng = np.mean(filtered_eng) if filtered_eng else 0
-        filtered_spa = np.mean(filtered_spa) if filtered_spa else 0
-        
-        # Print results
-        print(f"| {model} | Raw | {raw_avg:.2f} | {raw_eng:.2f} | {raw_spa:.2f} |")
-        print(f"| | Filtered‡ | {filtered_avg:.2f} | {filtered_eng:.2f} | {filtered_spa:.2f} |")
+    # Get top 4 languages by count
+    sorted_languages = [lang for lang, _ in language_counts.most_common(4)]
+
+    # Create header
+    header = (
+        "| Model | WER Type |"
+        + " Average |"
+        + "".join(f" {lang} |" for lang in sorted_languages)
+    )
+    print(header)
+    print("| " + "-" * (len(header) - 3) + " |")
+
+    # Group models by their base name
+    model_groups = {}
+    for model in results.keys():
+        base_name = model.split("└─")[0].strip()
+        if base_name not in model_groups:
+            model_groups[base_name] = []
+        model_groups[base_name].append(model)
+
+    # Sort base models to ensure consistent order
+    sorted_base_models = sorted(
+        model_groups.keys(),
+        key=lambda x: (
+            "Turbo" in x,  # Put Turbo models last
+            x,  # Then sort alphabetically
+        ),
+    )
+
+    for base_model in sorted_base_models:
+        # First print the base model
+        base_results = [m for m in model_groups[base_model] if "└─" not in m]
+        if base_results:
+            # Print base model results
+            model = base_results[0]
+            # ... print logic for base model ...
+
+            # Calculate scores for base model
+            lang_scores = {
+                lang: results[model].get(lang, []) for lang in sorted_languages
+            }
+
+            all_scores = []
+            for scores in lang_scores.values():
+                all_scores.extend(scores)
+
+            raw_avg = np.mean(all_scores) if all_scores else 0
+            raw_langs = {
+                lang: np.mean(scores) if scores else 0
+                for lang, scores in lang_scores.items()
+            }
+
+            filtered_all = remove_outliers(all_scores)
+            filtered_avg = np.mean(filtered_all) if filtered_all else 0
+            filtered_langs = {
+                lang: np.mean(remove_outliers(scores)) if scores else 0
+                for lang, scores in lang_scores.items()
+            }
+
+            raw_line = f"| {model:<24} | Raw       | {raw_avg:.2f} |" + "".join(
+                f" {raw_langs[lang]:.2f} |" for lang in sorted_languages
+            )
+            filtered_line = f"| {' '*24} | Filtered‡ | {filtered_avg:.2f} |" + "".join(
+                f" {filtered_langs[lang]:.2f} |" for lang in sorted_languages
+            )
+
+            print(raw_line)
+            print(filtered_line)
+
+        # Then print variants in specific order
+        variants = [m for m in model_groups[base_model] if "└─" in m]
+        variants.sort(
+            key=lambda x: (
+                "VAD" in x and "Demucs" not in x,  # VAD only first
+                "Demucs" in x and "VAD" not in x,  # Demucs only second
+                "Demucs + VAD" in x,  # Demucs + VAD last
+            )
+        )
+
+        for model in variants:
+            # ... existing printing logic for variants ...
+            lang_scores = {
+                lang: results[model].get(lang, []) for lang in sorted_languages
+            }
+
+            all_scores = []
+            for scores in lang_scores.values():
+                all_scores.extend(scores)
+
+            raw_avg = np.mean(all_scores) if all_scores else 0
+            raw_langs = {
+                lang: np.mean(scores) if scores else 0
+                for lang, scores in lang_scores.items()
+            }
+
+            filtered_all = remove_outliers(all_scores)
+            filtered_avg = np.mean(filtered_all) if filtered_all else 0
+            filtered_langs = {
+                lang: np.mean(remove_outliers(scores)) if scores else 0
+                for lang, scores in lang_scores.items()
+            }
+
+            model_name = "└─" + model.split("└─")[1].strip()
+            raw_line = f"| {model_name:<24} | Raw       | {raw_avg:.2f} |" + "".join(
+                f" {raw_langs[lang]:.2f} |" for lang in sorted_languages
+            )
+            filtered_line = f"| {' '*24} | Filtered‡ | {filtered_avg:.2f} |" + "".join(
+                f" {filtered_langs[lang]:.2f} |" for lang in sorted_languages
+            )
+
+            print(raw_line)
+            print(filtered_line)
+
+
+def plot_wer_graphs(
+    results: Dict[str, Dict[str, List[float]]],
+    language_counts: Counter,
+    output_file: str,
+):
+    """
+    Generate and save WER comparison graphs
+
+    :param results: Dictionary of WER results
+    :param language_counts: Counter of language frequencies
+    :param output_file: Path where the output chart should be saved
+    """
+    # Get top 4 languages
+    top_languages = [lang for lang, _ in language_counts.most_common(4)]
+
+    # Prepare data for plotting
+    versions = ["v1", "v2", "v3", "v3 Turbo"]
+    variants = ["Base", "with VAD", "with Demucs", "with Demucs + VAD"]
+
+    # Create figure with 5 subplots (average + top 4 languages)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 25))
+
+    def get_data_for_language(lang):
+        data = {variant: [] for variant in variants}
+        for version in versions:
+            for variant in variants:
+                model_name = f"Whisper Large {version}"
+                if version == "v3 Turbo":
+                    model_name = "Whisper Large v3 Turbo"
+
+                full_model = model_name
+                if variant != "Base":
+                    full_model = f"{model_name} └─ {variant}"
+
+                scores = results.get(full_model, {}).get(lang, [])
+                data[variant].append(np.mean(scores) if scores else 0)
+        return data
+
+    def create_subplot(ax, data, title):
+        for label, values in data.items():
+            ax.plot(versions, values, marker="o", label=label, linewidth=2)
+        ax.set_title(f"{title} - Raw WER Comparison", fontsize=14)
+        ax.set_xlabel("Model Version", fontsize=12)
+        ax.set_ylabel("Word Error Rate (WER) %", fontsize=12)
+        ax.grid(True, linestyle="--", alpha=0.7)
+
+        # Calculate y-axis limits with some padding
+        all_values = [v for values in data.values() for v in values]
+        min_val = min(all_values)
+        max_val = max(all_values)
+        padding = (max_val - min_val) * 0.1  # 10% padding
+        ax.set_ylim(max(0, min_val - padding), max_val + padding)
+
+        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    # Update average scores calculation
+    all_scores_data = {variant: [] for variant in variants}
+    for version in versions:
+        for variant in variants:
+            model_name = f"Whisper Large {version}"
+            if version == "v3 Turbo":
+                model_name = "Whisper Large v3 Turbo"
+
+            full_model = model_name
+            if variant != "Base":
+                full_model = f"{model_name} └─ {variant}"
+
+            all_scores = []
+            if full_model in results:
+                for lang_scores in results[full_model].values():
+                    all_scores.extend(lang_scores)
+
+            all_scores_data[variant].append(np.mean(all_scores) if all_scores else 0)
+
+    # Plot average scores
+    create_subplot(axes[0], all_scores_data, "Average (All Languages)")
+
+    # Plot top 4 languages
+    for i, lang in enumerate(top_languages, 1):
+        lang_data = get_data_for_language(lang)
+        create_subplot(axes[i], lang_data, f"Language: {lang}")
+
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
 
 
 def main():
     """
-    Calculate WER scores and print results
+    Calculate WER scores, print results, and generate graphs
     """
-    parser = argparse.ArgumentParser(description="Calculate WER scores for Whisper variants")
-    parser.add_argument(
-        "--directory", type=str, required=True,
-        help="Directory containing ISRC folders with transcriptions"
+    parser = argparse.ArgumentParser(
+        description="Calculate WER scores for Whisper variants"
     )
-    
+    parser.add_argument(
+        "--directory",
+        type=str,
+        required=True,
+        help="Directory containing ISRC folders with transcriptions",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="whisper_comparison.png",
+        help="Output file path for the comparison chart (default: whisper_comparison.png)",
+    )
+
     args = parser.parse_args()
-    
+
     # Calculate WER scores
-    results = calculate_wer_scores(args.directory)
-    
+    results, language_counts = calculate_wer_scores(args.directory)
+
     # Print results
-    print_results(results)
+    print_results(results, language_counts)
+
+    # Generate and save graphs
+    plot_wer_graphs(results, language_counts, args.output)
 
 
 if __name__ == "__main__":

@@ -38,7 +38,9 @@ def transcribe_audio(
     return model.transcribe(audio, batch_size=16)
 
 
-def process_files(model: FasterWhisperPipeline, args: argparse.Namespace, vad_enabled: bool):
+def process_files(
+    model: FasterWhisperPipeline, args: argparse.Namespace, vad_enabled: bool
+):
     """
     Processes all audio files in the given directory and saves transcriptions.
 
