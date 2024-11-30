@@ -290,10 +290,10 @@ def plot_wer_graphs(
     versions = ["v1", "v2", "v3", "v3 Turbo"]
     variants = ["Base", "with VAD", "with Demucs", "with Demucs + VAD"]
 
-    # Create figure with 5 subplots (average + top 4 languages)
-    fig, axes = plt.subplots(5, 1, figsize=(12, 25))
+    # Create figure with 2x5 subplots (raw and filtered for average + top 4 languages)
+    fig, axes = plt.subplots(2, 5, figsize=(25, 10))
 
-    def get_data_for_language(lang):
+    def get_data_for_language(lang, filtered=False):
         data = {variant: [] for variant in variants}
         for version in versions:
             for variant in variants:
@@ -306,15 +306,17 @@ def plot_wer_graphs(
                     full_model = f"{model_name} └─ {variant}"
 
                 scores = results.get(full_model, {}).get(lang, [])
+                if filtered and scores:
+                    scores = remove_outliers(scores)
                 data[variant].append(np.mean(scores) if scores else 0)
         return data
 
-    def create_subplot(ax, data, title):
+    def create_subplot(ax, data, title, row_label=""):
         for label, values in data.items():
             ax.plot(versions, values, marker="o", label=label, linewidth=2)
-        ax.set_title(f"{title} - Raw WER Comparison", fontsize=14)
-        ax.set_xlabel("Model Version", fontsize=12)
-        ax.set_ylabel("Word Error Rate (WER) %", fontsize=12)
+        ax.set_title(f"{title}\n{row_label} WER Comparison", fontsize=12)
+        ax.set_xlabel("Model Version", fontsize=10)
+        ax.set_ylabel("Word Error Rate (WER) %", fontsize=10)
         ax.grid(True, linestyle="--", alpha=0.7)
 
         # Calculate y-axis limits with some padding
@@ -324,34 +326,45 @@ def plot_wer_graphs(
         padding = (max_val - min_val) * 0.1  # 10% padding
         ax.set_ylim(max(0, min_val - padding), max_val + padding)
 
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        # Only show legend for the rightmost plot in the first row
+        if ax.get_position().x0 >= 0.75 and ax.get_position().y0 >= 0.5:
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=10)
+        else:
+            ax.legend().set_visible(False)
 
-    # Update average scores calculation
-    all_scores_data = {variant: [] for variant in variants}
-    for version in versions:
-        for variant in variants:
-            model_name = f"Whisper Large {version}"
-            if version == "v3 Turbo":
-                model_name = "Whisper Large v3 Turbo"
+    # Calculate and plot average scores (raw and filtered)
+    for filtered in [False, True]:
+        row = 1 if filtered else 0
+        row_label = "Filtered" if filtered else "Raw"
+        
+        # Calculate average scores
+        all_scores_data = {variant: [] for variant in variants}
+        for version in versions:
+            for variant in variants:
+                model_name = f"Whisper Large {version}"
+                if version == "v3 Turbo":
+                    model_name = "Whisper Large v3 Turbo"
 
-            full_model = model_name
-            if variant != "Base":
-                full_model = f"{model_name} └─ {variant}"
+                full_model = model_name
+                if variant != "Base":
+                    full_model = f"{model_name} └─ {variant}"
 
-            all_scores = []
-            if full_model in results:
-                for lang_scores in results[full_model].values():
-                    all_scores.extend(lang_scores)
+                all_scores = []
+                if full_model in results:
+                    for lang_scores in results[full_model].values():
+                        if filtered:
+                            lang_scores = remove_outliers(lang_scores)
+                        all_scores.extend(lang_scores)
 
-            all_scores_data[variant].append(np.mean(all_scores) if all_scores else 0)
+                all_scores_data[variant].append(np.mean(all_scores) if all_scores else 0)
 
-    # Plot average scores
-    create_subplot(axes[0], all_scores_data, "Average (All Languages)")
+        # Plot average scores
+        create_subplot(axes[row, 0], all_scores_data, "Average (All Languages)", row_label)
 
-    # Plot top 4 languages
-    for i, lang in enumerate(top_languages, 1):
-        lang_data = get_data_for_language(lang)
-        create_subplot(axes[i], lang_data, f"Language: {lang}")
+        # Plot top 4 languages
+        for i, lang in enumerate(top_languages, 1):
+            lang_data = get_data_for_language(lang, filtered)
+            create_subplot(axes[row, i], lang_data, f"Language: {lang}", row_label)
 
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches="tight")
