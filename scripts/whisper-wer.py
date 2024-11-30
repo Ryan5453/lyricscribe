@@ -99,7 +99,7 @@ def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[f
     }
     
     variants = [
-        ('orig_novad_results.json', ''),
+        ('orig_novad_results.json', 'Base'),
         ('orig_vad_results.json', 'with VAD'),
         ('demucs_novad_results.json', 'with Demucs'),
         ('demucs_vad_results.json', 'with Demucs + VAD')
@@ -137,8 +137,8 @@ def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[f
                             language = "other"
                         
                         model_variant = f"{model_name}"
-                        if variant_name:
-                            model_variant = f"└─ {variant_name}"
+                        if variant_name != 'Base':
+                            model_variant = f"{model_name} └─ {variant_name}"
                         
                         # Initialize nested dictionaries if they don't exist
                         if model_variant not in results:
