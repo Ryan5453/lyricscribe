@@ -182,8 +182,8 @@ def print_results(results: Dict[str, Dict[str, List[float]]]):
         filtered_spa = np.mean(filtered_spa) if filtered_spa else 0
         
         # Print results
-        print(f"| {model} | Raw | {raw_avg:.1f} | {raw_eng:.1f} | {raw_spa:.1f} |")
-        print(f"| | Filtered‡ | {filtered_avg:.1f} | {filtered_eng:.1f} | {filtered_spa:.1f} |")
+        print(f"| {model} | Raw | {raw_avg:.2f} | {raw_eng:.2f} | {raw_spa:.2f} |")
+        print(f"| | Filtered‡ | {filtered_avg:.2f} | {filtered_eng:.2f} | {filtered_spa:.2f} |")
 
 
 def main():
