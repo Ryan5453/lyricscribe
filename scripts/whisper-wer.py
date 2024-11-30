@@ -81,16 +81,16 @@ def remove_outliers(scores: List[float]) -> List[float]:
     return [x for x in scores if lower_bound <= x <= upper_bound]
 
 
-def calculate_wer_scores(folder_path: str) -> Dict[str, List[float]]:
+def calculate_wer_scores(root_path: str) -> Dict[str, Dict[str, Dict[str, List[float]]]]:
     """
-    Calculate WER scores for all model variants
+    Calculate WER scores for all model variants, grouped by language
 
-    :param folder_path: Path to the root directory containing ISRC folders
-    :return: Dictionary mapping model variants to their WER scores
+    :param root_path: Path to the root directory containing ISRC folders
+    :return: Nested dictionary: model -> language -> score_type -> scores
     """
-    reference_text = load_reference_lyrics(folder_path)
     results = {}
     
+    # Define model variants
     models = {
         'large-v1': 'Whisper Large v1',
         'large-v2': 'Whisper Large v2',
@@ -104,39 +104,86 @@ def calculate_wer_scores(folder_path: str) -> Dict[str, List[float]]:
         ('demucs_novad_results.json', 'with Demucs'),
         ('demucs_vad_results.json', 'with Demucs + VAD')
     ]
-    
-    for file in os.listdir(folder_path):
-        if not file.endswith('.json') or file == 'lyrics.json':
+
+    # Iterate through ISRC folders
+    for isrc_folder in os.listdir(root_path):
+        folder_path = os.path.join(root_path, isrc_folder)
+        if not os.path.isdir(folder_path):
             continue
+
+        try:
+            # Load reference lyrics
+            lyrics_path = os.path.join(folder_path, 'lyrics.json')
+            with open(lyrics_path, 'r', encoding='utf-8') as f:
+                lyrics_data = json.load(f)
+            reference_text = lyrics_data['unsynced']['data']
             
-        for model_key, model_name in models.items():
-            for variant_file, variant_name in variants:
-                full_pattern = f"{model_key}_{variant_file}"
-                if file == full_pattern:
-                    hypothesis = load_hypothesis(os.path.join(folder_path, file))
-                    score = wer(reference_text, hypothesis)
+            # Process each model variant
+            for model_key, model_name in models.items():
+                for variant_file, variant_name in variants:
+                    full_pattern = f"{model_key}_{variant_file}"
+                    result_path = os.path.join(folder_path, full_pattern)
                     
-                    model_variant = f"{model_name}"
-                    if variant_name:
-                        model_variant = f"└─ {variant_name}"
-                    
-                    results[model_variant] = results.get(model_variant, []) + [score]
+                    if os.path.exists(result_path):
+                        # Load results and get language
+                        with open(result_path, 'r', encoding='utf-8') as f:
+                            results_data = json.load(f)
+                        language = results_data.get('language', 'unknown').lower()
+                        if language not in ['english', 'spanish']:
+                            language = 'other'
+                            
+                        # Get hypothesis text
+                        hypothesis = '\n'.join(segment['text'].strip() for segment in results_data['segments'])
+                        score = wer(reference_text, hypothesis)
+                        
+                        model_variant = f"{model_name}"
+                        if variant_name:
+                            model_variant = f"└─ {variant_name}"
+                        
+                        # Initialize nested dictionaries if they don't exist
+                        if model_variant not in results:
+                            results[model_variant] = {'english': [], 'spanish': [], 'other': []}
+                        
+                        results[model_variant][language].append(score)
+                        
+        except Exception as e:
+            print(f"Error processing {isrc_folder}: {str(e)}")
     
     return results
 
 
-def print_results(results: Dict[str, List[float]]):
+def print_results(results: Dict[str, Dict[str, List[float]]]):
     """
-    Print WER scores to terminal
-
-    :param results: Dictionary mapping model variants to their WER scores
+    Print WER scores in table format
     """
+    print("| Model | WER Type | Average | English | Spanish |")
+    print("| ---------------------- | --------- | --------- | --------- | --------- |")
+    
     for model in sorted(results.keys()):
-        scores = results[model]
-        filtered_scores = remove_outliers(scores)
+        # Calculate raw scores
+        all_scores = []
+        eng_scores = results[model]['english']
+        spa_scores = results[model]['spanish']
         
-        filtered_avg = np.mean(filtered_scores) if filtered_scores else 0
-        print(f"{model} (no outliers): {filtered_avg:.2f}")
+        all_scores.extend(eng_scores + spa_scores)
+        
+        # Calculate averages
+        raw_avg = np.mean(all_scores) if all_scores else 0
+        raw_eng = np.mean(eng_scores) if eng_scores else 0
+        raw_spa = np.mean(spa_scores) if spa_scores else 0
+        
+        # Calculate filtered scores
+        filtered_all = remove_outliers(all_scores)
+        filtered_eng = remove_outliers(eng_scores)
+        filtered_spa = remove_outliers(spa_scores)
+        
+        filtered_avg = np.mean(filtered_all) if filtered_all else 0
+        filtered_eng = np.mean(filtered_eng) if filtered_eng else 0
+        filtered_spa = np.mean(filtered_spa) if filtered_spa else 0
+        
+        # Print results
+        print(f"| {model} | Raw | {raw_avg:.1f} | {raw_eng:.1f} | {raw_spa:.1f} |")
+        print(f"| | Filtered‡ | {filtered_avg:.1f} | {filtered_eng:.1f} | {filtered_spa:.1f} |")
 
 
 def main():
