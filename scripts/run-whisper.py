@@ -3,16 +3,8 @@ This assumes you have a directory structure like this:
 
 /root
     /<ISRC>
-        /vocals.wav  # Demucs processed audio
         /audio.mp3  # Original audio
-        /lyrics.json
-
-The lyrics.json file should have the following structure:
-{
-    "unsynced": {
-        "data": "lyrics"
-    }
-}
+        /demucs.wav  # Demucs processed audio
 """
 
 import argparse
@@ -124,7 +116,7 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Transcribe audio using WhisperX")
     parser.add_argument(
-        "--directory", type=str, required=True, help="Directory containing audio files"
+        "--directory", type=str, required=True, help="Directory containing ISRC folders"
     )
     parser.add_argument(
         "--model", type=str, required=True, help="Whisper model name (e.g., 'large-v2')"
