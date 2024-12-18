@@ -336,7 +336,7 @@ def plot_wer_graphs(
     for filtered in [False, True]:
         row = 1 if filtered else 0
         row_label = "Filtered" if filtered else "Raw"
-        
+
         # Calculate average scores
         all_scores_data = {variant: [] for variant in variants}
         for version in versions:
@@ -356,10 +356,14 @@ def plot_wer_graphs(
                             lang_scores = remove_outliers(lang_scores)
                         all_scores.extend(lang_scores)
 
-                all_scores_data[variant].append(np.mean(all_scores) if all_scores else 0)
+                all_scores_data[variant].append(
+                    np.mean(all_scores) if all_scores else 0
+                )
 
         # Plot average scores
-        create_subplot(axes[row, 0], all_scores_data, "Average (All Languages)", row_label)
+        create_subplot(
+            axes[row, 0], all_scores_data, "Average (All Languages)", row_label
+        )
 
         # Plot top 4 languages
         for i, lang in enumerate(top_languages, 1):
