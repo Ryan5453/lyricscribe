@@ -30,16 +30,16 @@ def load_and_separate_audio(
     """
     # Load audio
     wav = AudioFile(input_path).read()
-    
+
     # Convert to torch tensor
     wav = torch.tensor(wav, dtype=torch.float32)
     if wav.dim() == 1:
         wav = wav[None]  # Add channel dimension
-    
+
     start_time = time.time()
     sources = separator.separate_tensor(wav)
     separation_time = time.time() - start_time
-    
+
     return sources, separation_time
 
 
@@ -62,7 +62,7 @@ def extract_vocals(
     output_path = os.path.join(root_path, isrc, output_filename)
 
     sources, separation_time = load_and_separate_audio(separator, input_path)
-    
+
     # Save only the vocals
     save_audio(sources["vocals"], output_path, separator.samplerate)
 
@@ -108,14 +108,20 @@ def process_files(root_path: str, model_name: str, output_filename: str):
 
     total_time = time.time() - total_start
     print(f"\nProcessed {processed} files in {total_time:.2f}s")
-    print(f"Average separation time per file: {total_separation_time/processed:.2f}s]\n")
+    print(
+        f"Average separation time per file: {total_separation_time/processed:.2f}s]\n"
+    )
 
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         print(f"Using GPU: {gpu_name}")
-    else:
-        cpu_info = platform.processor()
-        print(f"Using CPU: {cpu_info}")
+
+    if platform.system() == "Linux":
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if "model name" in line:
+                    print(f"Using CPU: {line.split(':')[1].strip()}")
+                    break
 
 
 def main():
@@ -146,4 +152,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

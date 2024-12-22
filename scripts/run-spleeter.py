@@ -110,9 +110,13 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     if gpus:
         gpu_details = tf.config.experimental.get_device_details(gpus[0])
         print(f"Using GPU: {gpu_details.get('device_name', 'Unknown GPU')}")
-    else:
-        cpu_info = platform.processor()
-        print(f"Using CPU: {cpu_info}")
+
+    if platform.system() == "Linux":
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if "model name" in line:
+                    print(f"Using CPU: {line.split(':')[1].strip()}")
+                    break
 
 
 def main():
@@ -144,4 +148,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
