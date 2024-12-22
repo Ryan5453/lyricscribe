@@ -37,7 +37,7 @@ def extract_vocals(
     audio = separator._load_audio(input_path)
 
     start_time = time.time()
-    _, sources = separator.separate_tensor(audio, separator.sample_rate)
+    _, sources = separator.separate_tensor(audio, separator.samplerate)
     separation_time = time.time() - start_time
 
     save_audio(sources["vocals"].cpu(), output_path, separator.samplerate)
