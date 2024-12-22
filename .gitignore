@@ -1,4 +1,4 @@
-# Other
+# macOS
 .DS_Store
 
 # Byte-compiled / optimized / DLL files
@@ -127,6 +127,7 @@ celerybeat.pid
 .venv
 env/
 venv/
+*_venv/
 ENV/
 env.bak/
 venv.bak/
