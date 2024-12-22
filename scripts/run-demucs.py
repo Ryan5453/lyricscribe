@@ -77,7 +77,7 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     :param model_name: Name of the Demucs model to use
     :param output_filename: Name of the output file
     """
-    print("\nProcessing files with Demucs...")
+    print("Processing files with Demucs...")
     print("-----------------------------------------------------")
 
     # Initialize model once
@@ -102,13 +102,13 @@ def process_files(root_path: str, model_name: str, output_filename: str):
             )
             processed += 1
             total_separation_time += separation_time
-            print(f"Successfully processed {isrc}\n")
+            print(f"Successfully processed {isrc}")
         except Exception as e:
-            print(f"Error processing {isrc}: {str(e)}\n")
+            print(f"Error processing {isrc}: {str(e)}")
 
     total_time = time.time() - total_start
     print(f"\nProcessed {processed} files in {total_time:.2f}s")
-    print(f"Average separation time per file: {total_separation_time/processed:.2f}s")
+    print(f"Average separation time per file: {total_separation_time/processed:.2f}s]\n")
 
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
