@@ -95,9 +95,8 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     print("-----------------------------------------------------")
 
     # Initialize model once
-    model = get_model(model_name)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    separator = Separator(model, device=device)
+    separator = Separator(model_name, device=device)
 
     total_start = time.time()
     processed = 0
