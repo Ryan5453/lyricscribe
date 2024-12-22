@@ -10,37 +10,10 @@ import argparse
 import os
 import platform
 import time
-from typing import Tuple
 
 import torch
 from demucs.api import Separator
-from demucs.audio import AudioFile, save_audio
-from demucs.pretrained import get_model
-
-
-def load_and_separate_audio(
-    separator: Separator, input_path: str
-) -> Tuple[dict, float]:
-    """
-    Loads and separates an audio file using Demucs.
-
-    :param separator: The Demucs separator instance
-    :param input_path: Path to the input audio file
-    :return: Tuple of (separated sources, separation time)
-    """
-    # Load audio
-    wav = AudioFile(input_path).read()
-
-    # Convert to torch tensor
-    wav = torch.tensor(wav, dtype=torch.float32)
-    if wav.dim() == 1:
-        wav = wav[None]  # Add channel dimension
-
-    start_time = time.time()
-    sources = separator.separate_tensor(wav)
-    separation_time = time.time() - start_time
-
-    return sources, separation_time
+from demucs.audio import save_audio
 
 
 def extract_vocals(
@@ -61,10 +34,13 @@ def extract_vocals(
     input_path = os.path.join(root_path, isrc, "audio.mp3")
     output_path = os.path.join(root_path, isrc, output_filename)
 
-    sources, separation_time = load_and_separate_audio(separator, input_path)
+    audio = separator._load_audio(input_path)
 
-    # Save only the vocals
-    save_audio(sources["vocals"], output_path, separator.samplerate)
+    start_time = time.time()
+    _, sources = separator.separate_tensor(audio, separator.sample_rate)
+    separation_time = time.time() - start_time
+
+    save_audio(sources["vocals"].cpu(), output_path, separator.samplerate)
 
     return separation_time
 
@@ -89,7 +65,7 @@ def process_files(root_path: str, model_name: str, output_filename: str):
         with open("/proc/cpuinfo", "r") as f:
             for line in f:
                 if "model name" in line:
-                    cpu_info = line.split(':')[1].strip()
+                    cpu_info = line.split(":")[1].strip()
                     break
     print(f"Using CPU: {cpu_info}")
     print("-----------------------------------------------------")
@@ -121,9 +97,7 @@ def process_files(root_path: str, model_name: str, output_filename: str):
 
     total_time = time.time() - total_start
     print(f"\nProcessed {processed} files in {total_time:.2f}s")
-    print(
-        f"Average separation time per file: {total_separation_time/processed:.2f}s]"
-    )
+    print(f"Average separation time per file: {total_separation_time/processed:.2f}s]")
 
 
 def main():

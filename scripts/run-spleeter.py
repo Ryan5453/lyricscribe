@@ -75,7 +75,7 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     :param output_filename: Name of the output file
     """
     print("Processing files with Spleeter...")
-    
+
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
         gpu_details = tf.config.experimental.get_device_details(gpus[0])
@@ -88,7 +88,7 @@ def process_files(root_path: str, model_name: str, output_filename: str):
         with open("/proc/cpuinfo", "r") as f:
             for line in f:
                 if "model name" in line:
-                    cpu_info = line.split(':')[1].strip()
+                    cpu_info = line.split(":")[1].strip()
                     break
     print(f"Using CPU: {cpu_info}")
     print("-----------------------------------------------------")
