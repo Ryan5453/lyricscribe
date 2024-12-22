@@ -4,7 +4,7 @@
 > This project is currently a draft, take everything with a grain of salt.
 
 ## Introduction
-Most public libraries of music lyrics are generally high quality, but the size of the libraries are quite small. For example, MusixMatch claims to have ~11 million human lyric transcriptions in their library, but Spotify has ~100 million songs in their library, leading to over 89% of songs having no lyrics!
+Most public libraries of music lyrics are generally high quality, but the size of the libraries are quite small. For example, MusixMatch claims to have ~11 million human lyric transcriptions in their library, but Spotify has ~100 million songs in their library, leading to around 89% of songs having no lyrics!
 
 In 2022, while I was working on a project that involved music lyrics, I had the idea of using speech-to-text models to transcribe songs. After a few tests, I found that most speech-to-text models at the time were not able to transcribe music well. However, upon the release of OpenAI's Whisper series of models later that year, I decided to revisit my original idea. I found that Whisper was *much* better at transcribing music than other STT models but the output of the best model at the time (`large`, now `large-v1`) still did not compare to human-written transcriptions.
 
