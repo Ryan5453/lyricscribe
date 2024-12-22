@@ -74,7 +74,7 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     :param model_name: Name of the Spleeter model to use
     :param output_filename: Name of the output file
     """
-    print("\nProcessing files with Spleeter...")
+    print("Processing files with Spleeter...")
     print("-----------------------------------------------------")
 
     # Initialize model once
@@ -98,13 +98,13 @@ def process_files(root_path: str, model_name: str, output_filename: str):
             )
             processed += 1
             total_separation_time += separation_time
-            print(f"Successfully processed {isrc}\n")
+            print(f"Successfully processed {isrc}")
         except Exception as e:
-            print(f"Error processing {isrc}: {str(e)}\n")
+            print(f"Error processing {isrc}: {str(e)}")
 
     total_time = time.time() - total_start
     print(f"\nProcessed {processed} files in {total_time:.2f}s")
-    print(f"Average separation time per file: {total_separation_time/processed:.2f}s")
+    print(f"Average separation time per file: {total_separation_time/processed:.2f}s\n")
 
     gpus = tf.config.list_physical_devices("GPU")
     if gpus:
