@@ -78,6 +78,20 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     :param output_filename: Name of the output file
     """
     print("Processing files with Demucs...")
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"Using GPU: {gpu_name}")
+    else:
+        print("Using GPU: None detected")
+
+    cpu_info = "Unknown"
+    if platform.system() == "Linux":
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if "model name" in line:
+                    cpu_info = line.split(':')[1].strip()
+                    break
+    print(f"Using CPU: {cpu_info}")
     print("-----------------------------------------------------")
 
     # Initialize model once
@@ -109,19 +123,8 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     total_time = time.time() - total_start
     print(f"\nProcessed {processed} files in {total_time:.2f}s")
     print(
-        f"Average separation time per file: {total_separation_time/processed:.2f}s]\n"
+        f"Average separation time per file: {total_separation_time/processed:.2f}s]"
     )
-
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        print(f"Using GPU: {gpu_name}")
-
-    if platform.system() == "Linux":
-        with open("/proc/cpuinfo", "r") as f:
-            for line in f:
-                if "model name" in line:
-                    print(f"Using CPU: {line.split(':')[1].strip()}")
-                    break
 
 
 def main():
