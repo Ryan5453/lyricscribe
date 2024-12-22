@@ -12,6 +12,7 @@ import platform
 import time
 
 import torch
+import torchaudio
 from demucs.api import Separator
 from demucs.audio import save_audio
 
@@ -40,7 +41,13 @@ def extract_vocals(
     _, sources = separator.separate_tensor(audio, separator.samplerate)
     separation_time = time.time() - start_time
 
-    save_audio(sources["vocals"].cpu(), output_path, samplerate=separator.samplerate, bits_per_sample=16, as_float=False)
+    save_audio(
+        sources["vocals"].cpu(),
+        output_path,
+        samplerate=separator.samplerate,
+        bits_per_sample=16,
+        as_float=False,
+    )
 
     return separation_time
 
@@ -73,6 +80,9 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     # Initialize model once
     device = "cuda" if torch.cuda.is_available() else "cpu"
     separator = Separator(model_name, device=device)
+
+    if "sox_io" in torchaudio.list_audio_backends():
+        torchaudio.set_audio_backend("sox_io")
 
     total_start = time.time()
     processed = 0
