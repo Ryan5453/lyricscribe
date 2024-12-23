@@ -81,9 +81,6 @@ def process_files(root_path: str, model_name: str, output_filename: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     separator = Separator(model_name, device=device)
 
-    if "sox_io" in torchaudio.list_audio_backends():
-        torchaudio.set_audio_backend("sox_io")
-
     total_start = time.time()
     processed = 0
     total_separation_time = 0
