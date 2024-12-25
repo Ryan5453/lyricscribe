@@ -20,7 +20,7 @@ This project uses a private dataset that consists of 39,886 audio files, with 83
 
 ## Audio Source Separators
 
-Two of the most prominent open-source audio source separators are [Spleeter](https://github.com/deezer/spleeter) and [Demucs](https://github.com/facebookresearch/demucs). Generally, Demucs produces higher quality output than Spleeter. Both audio source separators were tested on a 40GB SMX4 A100 GPU with 6 AMD EPYC 7543 cores and 24GB of RAM.
+Two of the most prominent open-source audio source separators are [Spleeter](https://github.com/deezer/spleeter) and [Demucs](https://github.com/facebookresearch/demucs). Generally, Demucs produces higher quality output than Spleeter but requires more resources to do so. Both audio source separators were tested on a 40GB SMX4 A100 GPU with 6 AMD EPYC 7543 cores and 24GB of RAM.
 
 ### Spleeter
 Spleeter offers three model variants - `2stems`, `4stems`, and `5stems`. By default, the Spleeter models cut all output above 11kHz, but additional model configurations (using the same weights) allow separation up to 16kHz. Spleeter is notably fast: when processing the test set, the 2stem 11kHz configuration took approximately 0.19 seconds per song (~1148x realtime), while the 16kHz configuration took approximately 0.21 seconds per song (~1039x realtime).
@@ -30,13 +30,15 @@ Demucs has multiple model generations, but this analysis focuses on the most rec
 
 ## Whisper Implementations
 
-All implementations of Whisper are not created equal. 
+Since the release of Whisper, there have been many alternative implementations that generally claim to either run faster or have higher. However, despite the use of the same model weights, these alternate implementations can have varying accuracies - not always for the good.  
 
-- OpenAI's Implementation
-- Hugging Face Transformers
-- FasterWhisper
-- WhisperX
-- whisper.cpp
+This analysis will focus on the following implementations:
+
+- [Original OpenAI Implementation](https://github.com/openai/whisper)
+- [Hugging Face's Transformers Library](https://github.com/huggingface/transformers)
+- [FasterWhisper](https://github.com/SYSTRAN/faster-whisper)
+- [WhisperX](https://github.com/m-bain/whisperX)
+- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) / [pywhispercpp](https://github.com/absadiki/pywhispercpp)
 
 ## Models
 
