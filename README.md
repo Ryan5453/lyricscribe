@@ -30,7 +30,7 @@ Demucs has multiple model generations, but this analysis focuses on the most rec
 
 ## Whisper Implementations
 
-Since the release of Whisper, there have been many alternative implementations that generally claim to either run faster or have higher. However, despite the use of the same model weights, these alternate implementations can have varying accuracies - not always for the good.  
+Since the release of Whisper, there have been many alternative implementations that generally claim to either run faster or have better quality. However, despite the use of the same model weights, these alternate implementations can have varying accuracies - not always for the good.  
 
 This analysis will focus on the following implementations:
 
