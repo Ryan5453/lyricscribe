@@ -14,7 +14,7 @@ This research project is to study the effect of such preprocessing, the impacts 
 
 ## Dataset
 
-This project uses a private dataset that consists of 39,886 audio files, with 831 files reserved for testing and 39,055 files for training. The dataset is multilingual, comprising approximately 58.2% English, 28.5% Spanish, and the remaining 13.3% distributed across 18 other languages[^1]. It will not be released for copyright reasons.
+This project uses a private dataset that consists of 39,886 audio files, with 831 files reserved for testing and 39,055 files for training. The dataset is multilingual, comprising approximately 58.2% English, 28.5% Spanish, and the remaining 13.3% distributed across 18 other languages.[^1] It will not be released for copyright reasons.
 
 [^1]: Language distribution was synthetically calculated based off Whisper `large-v3` outputs
 
