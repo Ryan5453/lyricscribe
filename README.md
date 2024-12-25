@@ -19,7 +19,6 @@ This project uses a private dataset that consists of 39,886 audio files, with 83
 [^1]: Language distribution was synthetically calculated based off Whisper `large-v3` outputs
 
 ## Audio Source Separators
-Audio duration: 181,254 seconds
 
 Two of the most prominent open-source audio source separators are [Spleeter](https://github.com/deezer/spleeter) and [Demucs](https://github.com/facebookresearch/demucs). Generally, Demucs produces higher quality output than Spleeter. Both audio source separators were tested on a 40GB SMX4 A100 GPU with 6 AMD EPYC 7543 cores and 24GB of RAM.
 
