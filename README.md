@@ -1,4 +1,4 @@
-# STT Research
+# SingingWhisper: STT Research
 
 > [!WARNING]  
 > This project is currently a draft, take everything with a grain of salt.
