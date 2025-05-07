@@ -1,7 +1,7 @@
 # LyricScribe: STT Research
 
 > [!WARNING]  
-> This project is currently a draft, take everything with a grain of salt.
+> This project is in progress and does not reflect the final results.
 
 ## Introduction
 Most public libraries of music lyrics are generally high quality, but the size of the libraries are quite small. For example, MusixMatch claims to have ~11 million human lyric transcriptions in their library, but Spotify has ~100 million songs in their library, indicating that approximately 89% of songs lack lyrics.
@@ -30,24 +30,21 @@ Demucs has multiple model generations, but this analysis focuses on the most rec
 
 ## STT Models
 
-As the end goal of this project is to finetune a STT model for music lyrics, this project will only focus on open-weights STT models. All models will be evaluated on the same test set, which contains five versions of each song from the test set (unprocessed and the four processed versions).
+As the end goal of this project is to finetune a STT model for music lyrics, this project will only focus on multilingual, open-weights STT models. All models will be evaluated on the same test set, which contains five versions of each song from the test set (unprocessed and the four pre-processed versions).
 
 ### Whisper
 
-OpenAI's Whisper series has had many different model variants released over the past few years, along with many public finetuned versions. Additionally, there have been many alternative implementations that generally claim to either run faster or have better quality. However, despite the use of the same model weights, these alternate implementations can have varying accuracies - not always for the good. We intend to evaluate the performance of the following models on all of the following implementations:
+OpenAI's Whisper series has had many different model variants released over the past few years, along with many public finetuned versions. Additionally, there have been many alternative implementations that generally claim to either run faster or have better quality. However, despite the use of the same model weights, these alternate implementations can have varying accuracies - not always for the good. We intend to evaluate the performance of the following models and implementations:
 
-#### Models
-- Whisper Large v2
-- Whisper Large v3
-- Whisper Large v3 Turbo
-- Distil-Whisper Large v2
-- Distil-Whisper Large v3
-- Distil-Whisper Large v3.5
-- CrisperWhisper (based off large-v2)
+| Model                               | OpenAI Implementation | HF Transformers | FasterWhisper | WhisperX | vLLM  |
+| ----------------------------------- | :-------------------: | :-------------: | :-----------: | :------: | :---: |
+| Whisper Large v2                    |           ✅           |        ✅        |       ✅       |    ✅     |   ✅   |
+| Whisper Large v3                    |           ✅           |        ✅        |       ✅       |    ✅     |   ✅   |
+| Whisper Large v3 Turbo              |           ✅           |        ✅        |       ✅       |    ✅     |   ✅   |
+| CrisperWhisper (based off large-v2) |           ❌           |        ✅        |       ✅       |    ✅     |   ✅   |
+| lite-whisper-large-v3               |           ❌           |        ✅        |       ❌       |    ❌     |   ❌   |
+| lite-whisper-large-v3-acc           |           ❌           |        ✅        |       ❌       |    ❌     |   ❌   |
 
-#### Implementations
+### NVIDIA Canary Models
 
-- [Original OpenAI Implementation](https://github.com/openai/whisper)
-- [FasterWhisper](https://github.com/SYSTRAN/faster-whisper)
-- [WhisperX](https://github.com/m-bain/whisperX)
-- [whisper.cpp](https://github.com/ggerganov/whisper.cpp) / [pywhispercpp](https://github.com/absadiki/pywhispercpp)
+NVIDIA has released multilingual (four languages) two STT models that we will be testing: Canary 1B and Canary 1B Flash. Currently the only public implementation available is NVIDIA's [NeMo Framework](https://github.com/NVIDIA/NeMo).
