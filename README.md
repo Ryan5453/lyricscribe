@@ -1,4 +1,4 @@
-# LyricScribe: STT Research
+# LyricScribe
 
 > [!WARNING]  
 > This project is in progress and does not reflect the final results.
