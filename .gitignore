@@ -1,4 +1,5 @@
 links.txt
+.ruff_cache/
 
 # macOS
 .DS_Store

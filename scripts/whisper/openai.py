@@ -1,83 +1,73 @@
-"""
-This assumes you have a directory structure like this:
-
-/root
-    /<ISRC>
-        /audio.mp3  # Original audio
-        ... # Other processed versions
-"""
-
-import argparse
-import glob
-import json
-import time
-import os
-
 import whisper
+import time
+from typing import Optional, Tuple
+from .cli import BaseTranscriber
+from .schemas import TranscriptionResult, Segment
 
 
-def main():
+class OpenAITranscriber(BaseTranscriber):
     """
-    Transcribe audio files using OpenAI's Whisper Implementation.
+    Transcribes audio files using OpenAI's Whisper implementation.
     """
-    parser = argparse.ArgumentParser(
-        description="Transcribe audio files using OpenAI Whisper"
-    )
-    parser.add_argument("--model", type=str, required=True, help="Whisper model to use")
-    parser.add_argument(
-        "--directory", type=str, required=True, help="Directory containing ISRC folders"
-    )
 
-    args = parser.parse_args()
+    def _load_model(self, model_name: str):
+        """
+        Loads the OpenAI Whisper model.
 
-    available_models = whisper.available_models()
-    if args.model not in available_models:
-        raise ValueError(
-            f"Model {args.model} not found. Available models: {available_models}"
-        )
+        :param model_name: The name of the model to load.
+        :return: The loaded model.
+        """
+        available_models = whisper.available_models()
+        if model_name not in available_models:
+            print(f"Model {model_name} not found. Available models: {available_models}")
+            raise ValueError(f"Model {model_name} not found.")
+        print(f"Loading OpenAI Whisper model: {model_name}...")
+        return whisper.load_model(model_name)
 
-    model = whisper.load_model(args.model)
+    def _transcribe_file(
+        self, audio_file_path: str
+    ) -> Tuple[Optional[TranscriptionResult], float]:
+        """
+        Transcribes a single audio file using the loaded OpenAI model.
 
-    # Find all ISRC folders in the directory
-    isrc_folders = [
-        f
-        for f in os.listdir(args.directory)
-        if os.path.isdir(os.path.join(args.directory, f))
-    ]
-
-    for isrc_folder in isrc_folders:
-        isrc_path = os.path.join(args.directory, isrc_folder)
-
-        # Find all versions of the audio file in the ISRC folder (either .wav or .mp3)
-        audio_files = glob.glob(os.path.join(isrc_path, "*.wav"))
-        audio_files.extend(glob.glob(os.path.join(isrc_path, "*.mp3")))
-
-        if not audio_files:
-            print(f"No audio files found in {isrc_path}")
-            continue
-
-        for audio_file in audio_files:
-            print(f"Transcribing {audio_file}...")
-            start_time = time.time()
-            results = model.transcribe(audio_file)
+        :param audio_file_path: The path to the audio file to transcribe.
+        :return: A tuple containing the transcription result and the transcription time in seconds.
+        """
+        start_time = time.time()
+        try:
+            result = self.model.transcribe(audio_file_path)
             end_time = time.time()
-            print(f"Transcribed {audio_file} in {end_time - start_time:.2f}s")
+            transcription_time = end_time - start_time
 
-            # Save results to a file in the ISRC folder
-            results_file = os.path.join(isrc_path, "transcription_results.jsonl")
-            with open(results_file, "a") as f:
-                data = {
-                    "file": audio_file,
-                    "model": args.model,
-                    "whisper_implementation": "openai",
-                    "transcription_time": end_time - start_time,
-                    "transcription": results,
-                }
-                json.dump(data, f)
-                f.write("\n")
+            # Convert OpenAI Whisper segments to our schema
+            segments = [
+                Segment(
+                    text=segment["text"], start=segment["start"], end=segment["end"]
+                )
+                for segment in result["segments"]
+            ]
 
-            print(f"Transcribed {audio_file} and saved results to {results_file}")
+            # Create our standardized result
+            transcription_result = TranscriptionResult(
+                full_text=result["text"],
+                segments=segments,
+                model_name=self.model_name,
+                whisper_implementation=self._get_implementation_name(),
+                audio_type=self._determine_audio_type(audio_file_path),
+                transcription_time=transcription_time,
+                language=result["language"],
+                source_file=audio_file_path,
+            )
 
+            return transcription_result, transcription_time
+        except Exception as e:
+            print(f"Error transcribing {audio_file_path} with OpenAI Whisper: {e}")
+            return None, 0
 
-if __name__ == "__main__":
-    main()
+    def _get_implementation_name(self) -> str:
+        """
+        Returns the name of the implementation.
+
+        :return: The name of the implementation.
+        """
+        return "OpenAI"
