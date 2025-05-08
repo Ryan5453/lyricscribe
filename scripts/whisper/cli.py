@@ -134,8 +134,7 @@ class BaseTranscriber(ABC):
 
                 results_file = os.path.join(isrc_path, "transcription_results.jsonl")
                 with open(results_file, "a") as f:
-                    json.dump(transcription_result.model_dump(), f)
-                    f.write("\n")
+                    f.write(json.dumps(transcription_result.model_dump()) + "\n")
 
                 print(f"Saved results to {results_file}")
 
