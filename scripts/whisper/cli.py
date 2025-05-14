@@ -241,7 +241,7 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=64,
+        default=16,
         help="Batch size for chunked processing (default: 64). Not supported for all backends.",
     )
 

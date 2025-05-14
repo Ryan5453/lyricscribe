@@ -9,7 +9,7 @@ from .schemas import TranscriptionResult, Segment
 
 class WhisperXTranscriber(BaseTranscriber):
     """
-    Transcribes audio files using WhisperX implementation.
+    Transcribes audio files using WhisperX's Whisper implementation.
     """
 
     def __init__(

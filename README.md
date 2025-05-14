@@ -36,14 +36,15 @@ As the end goal of this project is to finetune a STT model for music lyrics, thi
 
 OpenAI's Whisper series has had many different model variants released over the past few years, along with many public finetuned versions. Additionally, there have been many alternative implementations that generally claim to either run faster or have better quality. However, despite the use of the same model weights, these alternate implementations can have varying accuracies - not always for the good. We intend to evaluate the performance of the following models and implementations:
 
-| Model                               | OpenAI Implementation | HF Transformers | FasterWhisper | WhisperX | vLLM  |
-| ----------------------------------- | :-------------------: | :-------------: | :-----------: | :------: | :---: |
-| Whisper Large v2                    |           ✅           |        ✅        |       ✅       |    ✅     |   ✅   |
-| Whisper Large v3                    |           ✅           |        ✅        |       ✅       |    ✅     |   ✅   |
-| Whisper Large v3 Turbo              |           ✅           |        ✅        |       ✅       |    ✅     |   ✅   |
-| CrisperWhisper (based off large-v2) |           ❌           |        ✅        |       ✅       |    ✅     |   ✅   |
-| lite-whisper-large-v3               |           ❌           |        ✅        |       ❌       |    ❌     |   ❌   |
-| lite-whisper-large-v3-acc           |           ❌           |        ✅        |       ❌       |    ❌     |   ❌   |
+| Model                               | OpenAI Implementation | HF Transformers | FasterWhisper | WhisperX |
+| ----------------------------------- | :-------------------: | :-------------: | :-----------: | :------: |
+| Whisper Large v2                    |           ✅           |        ✅        |       ✅       |    ✅     |
+| Whisper Large v3                    |           ✅           |        ✅        |       ✅       |    ✅     |
+| Whisper Large v3 Turbo              |           ✅           |        ✅        |       ✅       |    ✅     |
+| Whisper Large v3 Turbo (FP8)        |           ✅           |        ✅        |       ✅       |    ✅     |
+| CrisperWhisper (based off large-v2) |           ❌           |        ✅        |       ✅       |    ✅     |
+| lite-whisper-large-v3               |           ❌           |        ✅        |       ❌       |    ❌     |
+| lite-whisper-large-v3-acc           |           ❌           |        ✅        |       ❌       |    ❌     |
 
 ### NVIDIA Canary Models
 
