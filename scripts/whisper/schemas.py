@@ -1,11 +1,12 @@
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from enum import Enum
-from datetime import timedelta
 
 
 class AudioProcessingType(str, Enum):
-    """Enum for different types of audio processing"""
+    """
+    Enum for different types of audio processing
+    """
 
     REGULAR = "regular"  # Original audio.mp3
     DEMUCS_BASE = "demucs_base"  # Demucs base model
@@ -15,7 +16,9 @@ class AudioProcessingType(str, Enum):
 
 
 class Segment(BaseModel):
-    """A segment of transcribed text with timing information"""
+    """
+    A segment of transcribed text with timing information
+    """
 
     text: str
     start: float  # Start time in seconds
@@ -23,17 +26,17 @@ class Segment(BaseModel):
 
 
 class TranscriptionResult(BaseModel):
-    """Complete transcription result including metadata and segmented text"""
+    """
+    Complete transcription result including metadata and segmented text
+    """
 
     full_text: str
     segments: List[Segment]
     model_name: str
     whisper_implementation: str
     audio_type: AudioProcessingType
+    alignment_model_load_time: Optional[float] = (
+        None  # Time spent loading alignment models in seconds
+    )
     transcription_time: float  # in seconds
-    language: str
-    source_file: str
-
-    def get_transcription_duration(self) -> timedelta:
-        """Returns the transcription time as a timedelta object"""
-        return timedelta(seconds=self.transcription_time)
+    detected_language: str

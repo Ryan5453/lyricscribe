@@ -5,9 +5,11 @@ description = "Converting music to lyrics"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "faster-whisper>=1.1.1",
     "openai-whisper>=20240930",
     "pydantic>=2.11.4",
     "transformers>=4.51.3",
+    "whisperx>=3.3.4",
 ]
 
 [dependency-groups]

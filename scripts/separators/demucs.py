@@ -106,7 +106,9 @@ def process_files(root_path: str, model_name: str, output_filename: str):
 
     total_time = time.time() - total_start
     print(f"\nProcessed {processed} files in {total_time:.2f}s")
-    print(f"Average separation time per file: {total_separation_time/processed:.2f}s]")
+    print(
+        f"Average separation time per file: {total_separation_time / processed:.2f}s]"
+    )
 
 
 def main():
