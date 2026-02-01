@@ -13,20 +13,21 @@ import argparse
 import glob
 import json
 import os
-from abc import ABC, abstractmethod
-from typing import Any, Optional
 import pathlib
+import sys
+from abc import ABC, abstractmethod
 from datetime import timedelta
+from typing import Any, Optional
 
-from .schemas import TranscriptionResult, AudioProcessingType
-from .openai import OpenAITranscriber
-from .transformers import (
-    TransformersSequentialTranscriber,
-    TransformersChunkedTranscriber,
-)
 from .fasterwhisper import (
-    FasterWhisperSequentialTranscriber,
     FasterWhisperChunkedTranscriber,
+    FasterWhisperSequentialTranscriber,
+)
+from .openai import OpenAITranscriber
+from .schemas import AudioProcessingType, TranscriptionResult
+from .transformers import (
+    TransformersChunkedTranscriber,
+    TransformersSequentialTranscriber,
 )
 from .whisperx import WhisperXTranscriber
 
@@ -36,17 +37,22 @@ class BaseTranscriber(ABC):
     Abstract base class for audio transcription.
     """
 
-    def __init__(self, model_name: str, directory: str):
+    def __init__(self, model_name: str, directory: Optional[str]):
         self.model_name = model_name
         self.directory = directory
-        self.model = self._load_model(model_name)
         self.whisper_implementation_name = self._get_implementation_name()
+        # Print implementation-specific init message
+        print(
+            f"Initializing {self.whisper_implementation_name} with model {self.model_name}..."
+        )
+        # Specific device logging (e.g. torch.cuda.is_available()) can be done in _load_model by implementations if desired.
+        self.model = self._load_model(model_name)
 
     @abstractmethod
     def _load_model(self, model_name: str) -> Any:
         """
         Attempts to load the transcription model.
-
+        Each implementation can log its specific device usage here.
         :param model_name: The name of the model to load.
         :return: The loaded model.
         """
@@ -192,8 +198,78 @@ class BaseTranscriber(ABC):
                 print(f"Saved results to {results_file}")
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def main(args: argparse.Namespace):
+    # Initialize transcriber with directory (can be None for single file mode)
+    directory = None
+    if args.directory:
+        directory = args.directory
+    elif args.file:  # This implies args.file is not None
+        directory = os.path.dirname(args.file)
+    # If directory is still None here, it means neither --directory nor --file was given,
+    # or --file was given but it's effectively at the root (e.g. "audio.mp3" not "path/to/audio.mp3")
+    # In the latter case, os.path.dirname("audio.mp3") is "", which is fine for Transcriber base class.
+
+    transcriber = None
+
+    if args.backend == "openai":
+        transcriber = OpenAITranscriber(model_name=args.model, directory=directory)
+    elif args.backend == "hf-sequential":
+        transcriber = TransformersSequentialTranscriber(
+            model_name=args.model, directory=directory
+        )
+    elif args.backend == "hf-chunked":
+        transcriber = TransformersChunkedTranscriber(
+            model_name=args.model,
+            directory=directory,
+            batch_size=args.batch_size,
+        )
+    elif args.backend == "faster-whisper-sequential":
+        transcriber = FasterWhisperSequentialTranscriber(
+            model_name=args.model,
+            directory=directory,
+            beam_size=args.beam_size,
+            vad_filter=args.vad,
+        )
+    elif args.backend == "faster-whisper-chunked":
+        transcriber = FasterWhisperChunkedTranscriber(
+            model_name=args.model,
+            directory=directory,
+            beam_size=args.beam_size,
+            vad_filter=args.vad,
+            batch_size=args.batch_size,
+        )
+    else:  # whisperx
+        transcriber = WhisperXTranscriber(
+            model_name=args.model,
+            directory=directory,
+            batch_size=args.batch_size,
+            beam_size=args.beam_size,
+        )
+
+    if transcriber:  # Ensure transcriber was initialized
+        if args.file:
+            transcriber.process_single_file(args.file)
+        elif (
+            args.directory
+        ):  # process_directory should be called if --directory is specified
+            transcriber.process_directory()
+        # If neither --file nor --directory is given, this point should not be reached
+        # due to the mutually exclusive group in argparser.
+        # However, the original code implies one of them must be true.
+    else:
+        # This case should ideally not happen if backend is valid and chosen.
+        # Consider if an error message or default behavior is needed if transcriber is None.
+        # For now, based on original structure, one backend is always chosen.
+        print(
+            f"Error: Could not initialize transcriber for backend {args.backend}",
+            file=sys.stderr,
+        )
+
+
+if __name__ == "__main__":
+    # This block is for when the script is run directly (e.g., for testing)
+    # It sets up its own argument parser.
+    parser = argparse.ArgumentParser(description="Whisper Audio Transcription CLI")
     parser.add_argument(
         "--model",
         type=str,
@@ -241,56 +317,9 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="Batch size for chunked processing (default: 64). Not supported for all backends.",
+        default=16,  # Original default in this script was 16.
+        help="Batch size for chunked processing (default: 16). Not supported for all backends.",
     )
 
-    args = parser.parse_args()
-
-    # Initialize transcriber with directory (can be None for single file mode)
-    directory = args.directory if args.directory else os.path.dirname(args.file)
-    transcriber = None
-
-    if args.backend == "openai":
-        transcriber = OpenAITranscriber(model_name=args.model, directory=directory)
-    elif args.backend == "hf-sequential":
-        transcriber = TransformersSequentialTranscriber(
-            model_name=args.model, directory=directory
-        )
-    elif args.backend == "hf-chunked":
-        transcriber = TransformersChunkedTranscriber(
-            model_name=args.model,
-            directory=directory,
-            batch_size=args.batch_size,
-        )
-    elif args.backend == "faster-whisper-sequential":
-        transcriber = FasterWhisperSequentialTranscriber(
-            model_name=args.model,
-            directory=directory,
-            beam_size=args.beam_size,
-            vad_filter=args.vad,
-        )
-    elif args.backend == "faster-whisper-chunked":
-        transcriber = FasterWhisperChunkedTranscriber(
-            model_name=args.model,
-            directory=directory,
-            beam_size=args.beam_size,
-            vad_filter=args.vad,
-            batch_size=args.batch_size,
-        )
-    else:  # whisperx
-        transcriber = WhisperXTranscriber(
-            model_name=args.model,
-            directory=directory,
-            batch_size=args.batch_size,
-            beam_size=args.beam_size,
-        )
-
-    if args.file:
-        transcriber.process_single_file(args.file)
-    else:
-        transcriber.process_directory()
-
-
-if __name__ == "__main__":
-    main()
+    cli_args = parser.parse_args()
+    main(cli_args)

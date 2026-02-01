@@ -1,8 +1,10 @@
 import time
+
 import torch
-from faster_whisper import WhisperModel, BatchedInferencePipeline
+from faster_whisper import BatchedInferencePipeline, WhisperModel
+
 from .cli import BaseTranscriber
-from .schemas import TranscriptionResult, Segment
+from .schemas import Segment, TranscriptionResult
 
 
 class FasterWhisperBaseTranscriber(BaseTranscriber):

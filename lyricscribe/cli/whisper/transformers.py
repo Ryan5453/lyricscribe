@@ -1,8 +1,10 @@
 import time
+
 import torch
 from transformers import pipeline
+
 from .cli import BaseTranscriber
-from .schemas import TranscriptionResult, Segment
+from .schemas import Segment, TranscriptionResult
 
 
 class TransformersSequentialTranscriber(BaseTranscriber):

@@ -1,7 +1,9 @@
-import whisper
 import time
+
+import whisper
+
 from .cli import BaseTranscriber
-from .schemas import TranscriptionResult, Segment
+from .schemas import Segment, TranscriptionResult
 
 
 class OpenAITranscriber(BaseTranscriber):

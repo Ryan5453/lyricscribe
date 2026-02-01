@@ -1,10 +1,12 @@
+import gc
 import time
+from typing import Any
+
 import torch
 import whisperx
-import gc
-from typing import Any
+
 from .cli import BaseTranscriber
-from .schemas import TranscriptionResult, Segment
+from .schemas import Segment, TranscriptionResult
 
 
 class WhisperXTranscriber(BaseTranscriber):

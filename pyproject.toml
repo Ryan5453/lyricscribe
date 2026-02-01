@@ -5,14 +5,35 @@ description = "Converting music to lyrics"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "demucs",
     "faster-whisper>=1.1.1",
     "openai-whisper>=20240930",
     "pydantic>=2.11.4",
+    "torchaudio>=2.5.1",
     "transformers>=4.51.3",
     "whisperx>=3.3.4",
 ]
+
+[project.scripts]
+lyricscribe = "lyricscribe.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["lyricscribe"]
 
 [dependency-groups]
 dev = [
     "ruff>=0.11.8",
 ]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+demucs = { git = "https://github.com/adefossez/demucs.git" }
+
+[tool.ruff]
+lint.extend-select = ["I"]

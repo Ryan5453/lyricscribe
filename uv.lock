@@ -848,7 +848,7 @@ wheels = [
 [[package]]
 name = "lyricscribe"
 version = "1.0.0.dev1"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "faster-whisper" },
     { name = "openai-whisper" },
