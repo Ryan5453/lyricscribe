@@ -16,5 +16,3 @@ The project includes a command-line interface for audio transcription and source
 uv sync
 uv run lyricscribe --help
 ```
-
-For more detailed information on the research methodology and results, please refer to the [paper](paper/paper.tex).
