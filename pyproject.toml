@@ -1,28 +1,20 @@
 [project]
 name = "lyricscribe"
-version = "1.0.0.dev1"
-description = "Converting music to lyrics"
+version = "1.0.0"
+description = "Tooling for ALT research."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "demucs",
-    "faster-whisper>=1.1.1",
-    "openai-whisper>=20240930",
-    "pydantic>=2.11.4",
-    "torchaudio>=2.5.1",
-    "transformers>=4.51.3",
-    "whisperx>=3.3.4",
+    "typer",
+    "demucs-next @ git+https://github.com/Ryan5453/demucs-next.git",
 ]
 
 [project.scripts]
-lyricscribe = "lyricscribe.cli.main:main"
+lyricscribe = "lyricscribe.cli.main:cli"
 
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-packages = ["lyricscribe"]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
@@ -31,9 +23,6 @@ dev = [
 
 [tool.uv]
 package = true
-
-[tool.uv.sources]
-demucs = { git = "https://github.com/adefossez/demucs.git" }
 
 [tool.ruff]
 lint.extend-select = ["I"]
