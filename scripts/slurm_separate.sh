@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=lyricscribe_separate
-#SBATCH --output=/projects/fahey.rya/music2text/logs/separate_%A_%a.out
-#SBATCH --error=/projects/fahey.rya/music2text/logs/separate_%A_%a.err
+#SBATCH --output=/projects/fahey.rya/music2text/logs/separation/separate_%A_%a.out
 #SBATCH --array=1-5
 #SBATCH --time=8:00:00
 #SBATCH --partition=gpu

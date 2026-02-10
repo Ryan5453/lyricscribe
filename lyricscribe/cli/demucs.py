@@ -21,7 +21,7 @@ def _load_model(model_name: str, stem: str | None) -> Separator:
     """
     if stem:
         logger.info(f"Loading model {model_name}, isolating {stem}")
-        return Separator(model=model_name, isolate_stem=stem)
+        return Separator(model=model_name, only_load=stem)
     else:
         logger.info(f"Loading model {model_name}, all stems")
         return Separator(model=model_name)
