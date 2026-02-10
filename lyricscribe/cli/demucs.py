@@ -118,7 +118,7 @@ def _process_file(
 
 
 def setup_job(
-    directory: Path,
+    directories: list[Path],
     db_path: Path,
     filename: str,
     model: str,
@@ -126,17 +126,19 @@ def setup_job(
     stem: str | None,
 ) -> None:
     """
-    Initialize a separation job by scanning a directory and registering files
-    into chunks in a SQLite database.
+    Initialize a separation job by scanning one or more directories and
+    registering files into chunks in a SQLite database.
 
-    :param directory: Root directory containing subdirectories to process.
+    :param directories: Root directories containing subdirectories to process.
     :param db_path: Path to create the SQLite database.
     :param filename: Audio filename to target within each subdirectory.
     :param model: Name of the Demucs model to use.
     :param num_chunks: Number of chunks to split the work into.
     :param stem: Stem to isolate, or ``None`` for all stems.
     """
-    subdirs = [d for d in directory.iterdir() if d.is_dir()]
+    subdirs = []
+    for directory in directories:
+        subdirs.extend(d for d in directory.iterdir() if d.is_dir())
     total = len(subdirs)
 
     if total == 0:
@@ -157,7 +159,7 @@ def setup_job(
         """)
 
         config = {
-            "directory": str(directory),
+            "directories": "|".join(str(d) for d in directories),
             "filename": filename,
             "model": model,
             "stem": stem or "",
@@ -275,7 +277,7 @@ def show_stats(db_path: Path) -> None:
 
     logger.info(f"Model: {config.get('model')}")
     logger.info(f"Stem: {config.get('stem') or 'all'}")
-    logger.info(f"Directory: {config.get('directory')}")
+    logger.info(f"Directories: {config.get('directories')}")
 
     status_data = {row[0]: {"count": row[1], "avg": row[2] or 0} for row in stats}
 

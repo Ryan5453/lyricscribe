@@ -1,5 +1,6 @@
 import logging
 from pathlib import Path
+from typing import List
 
 import typer
 
@@ -14,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 @separate_app.command()
 def setup(
-    directory: Path = typer.Argument(..., help="Directory containing subdirectories to process"),
+    directories: List[Path] = typer.Argument(..., help="One or more directories containing subdirectories to process"),
     db_path: Path = typer.Option(..., "--db", help="Path to create SQLite database"),
     filename: str = typer.Option(..., "--filename", help="Audio filename to process within each subdirectory (e.g. mix.wav)"),
     model: str = typer.Option("htdemucs", "--model", help="Demucs model to use"),
@@ -32,7 +33,7 @@ def setup(
     Run this once before submitting SLURM jobs.
     """
     setup_job(
-        directory=directory,
+        directories=directories,
         db_path=db_path,
         filename=filename,
         model=model,
