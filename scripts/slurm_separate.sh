@@ -23,7 +23,7 @@ fi
 DB_PATH=$1
 echo "Database: $DB_PATH"
 
-module load ffmpeg
+module load FFmpeg/7.1.1
 
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
