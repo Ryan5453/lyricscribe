@@ -18,11 +18,22 @@ Currently, the LyricScribe CLI only contains one subcommand, `lyricscribe separa
 
 ### `lyricscribe separate`
 
+The `separate` commands expect the dataset directory to contain **subdirectories**, each containing an audio file to be separated. The subdirectory names are used as identifiers for tracking progress. For example:
+
+```text
+dataset/
+├── song_001/
+│   └── mix.wav
+├── song_002/
+│   └── mix.wav
+└── ...
+```
+
 #### `lyricscribe separate setup`
 
-To be able to mass separate audio files, you need to set up a separation job. 
+To be able to mass separate audio files, you need to set up a separation job.
 This creates a database file that is used to coordinate work across multiple workers.
-It divides your dataset into chunks, tracks the status of each file, and stores the job configuration so workers can process independently. 
+It divides your dataset into chunks, tracks the status of each file, and stores the job configuration so workers can process independently.
 This makes it possible to resume interrupted jobs and retry only the failures.
 
 To set up the separation database:
@@ -31,22 +42,25 @@ To set up the separation database:
 # Save all stems (default)
 uv run lyricscribe separate setup /path/to/dataset \
     --db job_htdemucs_ft.db \
+    --filename mix.wav \
     --model htdemucs_ft \
     --chunks 5
 
 # Or isolate just one stem
 uv run lyricscribe separate setup /path/to/dataset \
     --db job_htdemucs_ft.db \
+    --filename mix.wav \
     --model htdemucs_ft \
     --stem vocals \
     --chunks 5
 ```
 
 Options:
+
 - `--db`: Path to create SQLite database (required)
+- `--filename`: Audio filename to process within each subdirectory, e.g. `mix.wav` (required)
 - `--model`: Demucs model to use (default: htdemucs)
 - `--stem`: Which stem to isolate - vocals, drums, bass, or other. If not specified, all stems are saved.
-- `--device`: Device for processing, cuda or cpu (default: cuda)
 - `--chunks`: Number of chunks to split dataset into (default: 5)
 
 #### `lyricscribe separate run`
@@ -59,6 +73,7 @@ uv run lyricscribe separate run --db job_htdemucs_ft.db --chunk-id 1
 ```
 
 Options:
+
 - `--db`: Path to job database (required)
 - `--chunk-id`: Which chunk to process, 1-indexed (required)
 
@@ -73,6 +88,7 @@ uv run lyricscribe separate inspect --db job_htdemucs_ft.db
 ```
 
 Options:
+
 - `--db`: Path to job database (required)
 
 #### `lyricscribe separate retry`
@@ -84,4 +100,5 @@ uv run lyricscribe separate retry --db job_htdemucs_ft.db
 ```
 
 Options:
+
 - `--db`: Path to job database (required)
