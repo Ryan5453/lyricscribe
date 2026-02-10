@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 @separate_app.command()
 def setup(
     directories: List[Path] = typer.Argument(..., help="One or more directories containing subdirectories to process"),
-    db_path: Path = typer.Option(..., "--db", help="Path to create SQLite database"),
+    job_dir: Path = typer.Option(..., "--job-dir", help="Directory to create for job files"),
     filename: str = typer.Option(..., "--filename", help="Audio filename to process within each subdirectory (e.g. mix.wav)"),
     model: str = typer.Option("htdemucs", "--model", help="Demucs model to use"),
     chunks: int = typer.Option(5, "--chunks", help="Number of chunks to split into"),
@@ -29,12 +29,12 @@ def setup(
     """
     Initialize separation job by registering files into chunks.
 
-    Stores all configuration (model, chunks, stem) in the database.
+    Stores all configuration in JSON files within the job directory.
     Run this once before submitting SLURM jobs.
     """
     setup_job(
         directories=directories,
-        db_path=db_path,
+        job_dir=job_dir,
         filename=filename,
         model=model,
         num_chunks=chunks,
@@ -44,7 +44,7 @@ def setup(
 
 @separate_app.command()
 def run(
-    db_path: Path = typer.Option(..., "--db", help="Path to job database"),
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
     chunk_id: int = typer.Option(
         ..., "--chunk-id", help="Chunk to process (1-based, for SLURM)"
     ),
@@ -52,29 +52,29 @@ def run(
     """
     Process one chunk (for SLURM workers).
 
-    Reads configuration from database and processes assigned chunk.
+    Reads configuration from job directory and processes assigned chunk.
     """
-    process_chunk(db_path=db_path, chunk_id=chunk_id)
+    process_chunk(job_dir=job_dir, chunk_id=chunk_id)
 
 
 @separate_app.command()
 def inspect(
-    db_path: Path = typer.Option(..., "--db", help="Path to job database"),
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
 ):
     """
     Inspect job details and processing statistics.
     """
-    show_stats(db_path)
+    show_stats(job_dir)
 
 
 @separate_app.command()
 def retry(
-    db_path: Path = typer.Option(..., "--db", help="Path to job database"),
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
 ):
     """
     Retry failed separations.
     """
-    retry_failed(db_path)
+    retry_failed(job_dir)
 
 
 if __name__ == "__main__":

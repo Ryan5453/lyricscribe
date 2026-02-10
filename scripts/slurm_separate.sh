@@ -8,24 +8,18 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 
-# Usage: sbatch --array=1-5 slurm_separate.sh /path/to/job.db
-
-echo "Chunk ID: ${SLURM_ARRAY_TASK_ID}"
-echo "GPU: $CUDA_VISIBLE_DEVICES"
-
 if [ -z "$1" ]; then
-    echo "Error: Database path not provided"
-    echo "Usage: sbatch slurm_separate.sh /path/to/job.db"
+    echo "Error: Job directory not provided"
+    echo "Usage: sbatch slurm_separate.sh /path/to/job-dir"
     exit 1
 fi
 
-DB_PATH=$1
-echo "Database: $DB_PATH"
+JOB_DIR=$1
+echo "Job directory: $JOB_DIR"
 
 module load FFmpeg/7.1.1
 
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
 
-
-lyricscribe separate run --db "$DB_PATH" --chunk-id ${SLURM_ARRAY_TASK_ID}
+lyricscribe separate run --job-dir "$JOB_DIR" --chunk-id ${SLURM_ARRAY_TASK_ID}
