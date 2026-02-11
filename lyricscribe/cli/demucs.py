@@ -151,7 +151,7 @@ def _process_file(
         logger.info(f"{name} completed in {duration:.2f}s")
         return "success"
 
-    except (torch.cuda.OutOfMemoryError, RuntimeError, OSError) as e:
+    except Exception as e:
         duration = time.time() - start_time
         _update_status(
             job_dir, chunk_id, chunk_data, name, "failed", duration, str(e)
