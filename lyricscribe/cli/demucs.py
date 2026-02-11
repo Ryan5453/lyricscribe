@@ -20,12 +20,16 @@ def _load_model(model_name: str, stem: str | None) -> Separator:
     :param stem: Stem to isolate, or ``None`` for all stems.
     :return: A loaded :class:`Separator` instance.
     """
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
     if stem:
-        logger.info(f"Loading model {model_name}, isolating {stem}")
-        return Separator(model=model_name, only_load=stem)
+        separator = Separator(model=model_name, only_load=stem)
     else:
-        logger.info(f"Loading model {model_name}, all stems")
-        return Separator(model=model_name)
+        separator = Separator(model=model_name)
+    logger.info(
+        f"Loaded model {model_name} on {separator.device}, "
+        f"isolating {stem or 'all stems'}"
+    )
+    return separator
 
 
 def _load_config(job_dir: Path) -> dict:
