@@ -14,11 +14,12 @@ source .venv/bin/activate
 uv pip install -e . --torch-backend=auto
 ```
 
-## Command Line Interface
+## CLI Usage
 
 Currently, the LyricScribe CLI only contains one subcommand, `lyricscribe separate`. This allows for mass vocal separation of files using [demucs-next](https://github.com/ryan5453/demucs-next), designed for usage on SLURM clusters.
 
-### `lyricscribe separate`
+<details>
+<summary><h3>lyricscribe separate</h3></summary>
 
 The `separate` commands expect the dataset directory to contain **subdirectories**, each containing an audio file to be separated. The subdirectory names are used as identifiers for tracking progress. For example:
 
@@ -31,8 +32,7 @@ dataset/
 └── ...
 ```
 
-<details>
-<summary><h4><code>lyricscribe separate setup</code></h4></summary>
+#### `lyricscribe separate setup`
 
 To be able to mass separate audio files, you need to set up a separation job.
 This creates a job directory with a config file and per-chunk JSON manifests to coordinate work across multiple workers.
@@ -66,10 +66,7 @@ Options:
 - `--stem`: Which stem to isolate - vocals, drums, bass, or other. If not specified, all stems are saved.
 - `--chunks`: Number of chunks to split dataset into (default: 5)
 
-</details>
-
-<details>
-<summary><h4><code>lyricscribe separate run</code></h4></summary>
+#### `lyricscribe separate run`
 
 This command can only be ran after you have run the `lyricscribe separate setup` command which creates the job directory.
 You need to run this command however many times you specified with the `--chunks` argument in the setup command.
@@ -85,10 +82,7 @@ Options:
 
 Output files will be saved in the same directory as the mixed audio with the template {model}_{stem}.wav.
 
-</details>
-
-<details>
-<summary><h4><code>lyricscribe separate inspect</code></h4></summary>
+#### `lyricscribe separate inspect`
 
 This command allows you to inspect the job details and show processing statistics from the job directory.
 
