@@ -4,6 +4,8 @@
 
 ## Installation
 
+Assuming you have `uv` installed, you can install the dependencies with the following commands:
+
 ```bash
 git clone https://github.com/Ryan5453/lyricscribe
 cd lyricscribe
@@ -29,12 +31,13 @@ dataset/
 └── ...
 ```
 
-#### `lyricscribe separate setup`
+<details>
+<summary><h4><code>lyricscribe separate setup</code></h4></summary>
 
 To be able to mass separate audio files, you need to set up a separation job.
 This creates a job directory with a config file and per-chunk JSON manifests to coordinate work across multiple workers.
 It divides your dataset into chunks, tracks the status of each file, and stores the job configuration so workers can process independently.
-This makes it possible to resume interrupted jobs and retry only the failures.
+This makes it possible to resume interrupted jobs since already-processed files are automatically skipped.
 
 To set up a separation job:
 
@@ -63,7 +66,10 @@ Options:
 - `--stem`: Which stem to isolate - vocals, drums, bass, or other. If not specified, all stems are saved.
 - `--chunks`: Number of chunks to split dataset into (default: 5)
 
-#### `lyricscribe separate run`
+</details>
+
+<details>
+<summary><h4><code>lyricscribe separate run</code></h4></summary>
 
 This command can only be ran after you have run the `lyricscribe separate setup` command which creates the job directory.
 You need to run this command however many times you specified with the `--chunks` argument in the setup command.
@@ -79,7 +85,10 @@ Options:
 
 Output files will be saved in the same directory as the mixed audio with the template {model}_{stem}.wav.
 
-#### `lyricscribe separate inspect`
+</details>
+
+<details>
+<summary><h4><code>lyricscribe separate inspect</code></h4></summary>
 
 This command allows you to inspect the job details and show processing statistics from the job directory.
 
@@ -91,14 +100,4 @@ Options:
 
 - `--job-dir`: Path to job directory (required)
 
-#### `lyricscribe separate retry`
-
-Retry all failed separations from a previous run.
-
-```bash
-uv run lyricscribe separate retry --job-dir ./jobs/htdemucs_ft
-```
-
-Options:
-
-- `--job-dir`: Path to job directory (required)
+</details>

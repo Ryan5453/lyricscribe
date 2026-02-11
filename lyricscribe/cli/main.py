@@ -4,7 +4,7 @@ from typing import List
 
 import typer
 
-from lyricscribe.cli.demucs import process_chunk, retry_failed, setup_job, show_stats
+from lyricscribe.cli.demucs import process_chunk, setup_job, show_stats
 
 cli = typer.Typer(help="LyricScribe")
 separate_app = typer.Typer(help="Audio source separation commands")
@@ -65,16 +65,6 @@ def inspect(
     Inspect job details and processing statistics.
     """
     show_stats(job_dir)
-
-
-@separate_app.command()
-def retry(
-    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
-):
-    """
-    Retry failed separations.
-    """
-    retry_failed(job_dir)
 
 
 if __name__ == "__main__":
