@@ -10,8 +10,24 @@ import torchaudio
 
 logger = logging.getLogger(__name__)
 
-class VAD():
+
+class VAD:
+    """Wrapper for Silero voice activity detection.
+
+    The class handles model loading, audio preparation (mono conversion
+    and resampling), and producing a compact JSON summary that contains
+    detected speech segments and a speech-percentage metric.
+
+    :param threshold: Decision threshold for the VAD model (0.0-1.0).
+    :param min_speech_theshold_ms: Minimum speech duration in milliseconds.
+    :param min_silence_threshold_ms: Minimum silence required to split segments (ms).
+    """
+
     def __init__ (self, threshold : float = 0.5, min_speech_theshold_ms: int = 250, min_silence_threshold_ms: int = 250):
+        """Initialize the VAD wrapper and load the Silero model.
+
+        The model is moved to the device selected via ``torch.device``.
+        """
         self.threshold = threshold
         self.min_speech_threshold_ms = min_speech_theshold_ms
         self.min_silence_threshold_ms = min_silence_threshold_ms
@@ -20,6 +36,12 @@ class VAD():
         logger.info(f"Loaded Silero VAD on {self.device}")
 
     def _load_audio(self, input_path: Path):
+        """Load an audio file, convert to mono, and resample to 16 kHz.
+
+        :param input_path: Path to the audio file to load.
+        :return: A 1-D :class:`torch.Tensor` containing the waveform samples
+                 and moved to the configured device.
+        """
         wav, sample_rate = torchaudio.load(input_path)
         if wav.shape[0] > 1:
             wav = wav.mean(dim =0, keepdim=True)
@@ -27,9 +49,16 @@ class VAD():
             wav = torchaudio.functional.resample(wav, sample_rate, 160000)
         return wav.squeeze(0).to(self.device)
 
-
-
     def process_file(self, input_path: Path, output_path: Path) -> bool:
+        """Run VAD on ``input_path`` and write a JSON summary to ``output_path``.
+
+        If the ``output_path`` already exists this function will log and
+        return immediately to avoid re-processing.
+
+        :param input_path: Path to the input audio file.
+        :param output_path: Path to write the JSON summary to.
+        :return: ``True`` on success, ``False`` on error.
+        """
         if output_path.exists():
             logger.info(f"{input_path.name} already exists, skipped")
             return True
@@ -59,8 +88,16 @@ class VAD():
             logger.error(f"{input_path.name} failed: {e}")
             return False
 
-
     def process_directory(self, directory: Path, filename: str) ->  str:
+        """Process subdirectories under ``directory`` that contain ``filename``.
+
+        For each subdirectory containing ``filename``, run VAD and write a
+        `vad_timestamps.json` file beside the input file.
+
+        :param directory: Root directory containing subdirectories to scan.
+        :param filename: Name of the audio file to look for in each subdirectory.
+        :return: A short summary string (not formatted).
+        """
         subdirs = [d for d in directory.iterdir() if d.is_dir()]
         success, fail, skipped = 0, 0, 0
         for subdir in subdirs:
@@ -82,6 +119,6 @@ class VAD():
             logger.info(f"Ran VAD on {input_path}, {success} successes, {fail} failues, {skipped} skips")
 
 
-            
+
 
 
