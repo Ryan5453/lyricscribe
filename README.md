@@ -4,6 +4,8 @@
 
 ## Installation
 
+Assuming you have `uv` installed, you can install the dependencies with the following commands:
+
 ```bash
 git clone https://github.com/Ryan5453/lyricscribe
 cd lyricscribe
@@ -12,11 +14,12 @@ source .venv/bin/activate
 uv pip install -e . --torch-backend=auto
 ```
 
-## Command Line Interface
+## CLI Usage
 
 Currently, the LyricScribe CLI only contains one subcommand, `lyricscribe separate`. This allows for mass vocal separation of files using [demucs-next](https://github.com/ryan5453/demucs-next), designed for usage on SLURM clusters.
 
-### `lyricscribe separate`
+<details>
+<summary><h3>lyricscribe separate</h3></summary>
 
 The `separate` commands expect the dataset directory to contain **subdirectories**, each containing an audio file to be separated. The subdirectory names are used as identifiers for tracking progress. For example:
 
@@ -34,7 +37,7 @@ dataset/
 To be able to mass separate audio files, you need to set up a separation job.
 This creates a job directory with a config file and per-chunk JSON manifests to coordinate work across multiple workers.
 It divides your dataset into chunks, tracks the status of each file, and stores the job configuration so workers can process independently.
-This makes it possible to resume interrupted jobs and retry only the failures.
+This makes it possible to resume interrupted jobs since already-processed files are automatically skipped.
 
 To set up a separation job:
 
@@ -91,14 +94,4 @@ Options:
 
 - `--job-dir`: Path to job directory (required)
 
-#### `lyricscribe separate retry`
-
-Retry all failed separations from a previous run.
-
-```bash
-uv run lyricscribe separate retry --job-dir ./jobs/htdemucs_ft
-```
-
-Options:
-
-- `--job-dir`: Path to job directory (required)
+</details>
