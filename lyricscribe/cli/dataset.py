@@ -124,7 +124,8 @@ def _ensure_musdb18hq(cache_dir: Path) -> Path:
     """
     test_dir = cache_dir / "test"
 
-    if test_dir.is_dir() and any(test_dir.iterdir()):
+    track_dirs = [d for d in test_dir.iterdir() if d.is_dir()] if test_dir.is_dir() else []
+    if track_dirs:
         logger.info(f"MUSDB18-HQ test tracks already cached at {test_dir}")
         return test_dir
 
@@ -141,22 +142,39 @@ def _ensure_musdb18hq(cache_dir: Path) -> Path:
 
     logger.info("Extracting test tracks from zip...")
     with zipfile.ZipFile(zip_path, "r") as zf:
-        test_members = [m for m in zf.namelist() if m.startswith("musdb18hq/test/")]
+        all_names = zf.namelist()
+
+        test_prefix = None
+        for name in all_names:
+            parts = Path(name).parts
+            if "test" in parts:
+                idx = parts.index("test")
+                test_prefix = str(Path(*parts[: idx + 1])) + "/"
+                break
+
+        if test_prefix is None:
+            raise RuntimeError(
+                f"No 'test/' directory in zip. First entries: {all_names[:10]}"
+            )
+
+        strip_prefix = test_prefix.removesuffix("test/")
+        test_files = [
+            m for m in all_names
+            if m.startswith(test_prefix) and not m.endswith("/")
+        ]
+        logger.info(f"Extracting {len(test_files)} files from '{test_prefix}'")
+
         with Progress(
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             TextColumn("{task.completed}/{task.total} files"),
         ) as progress:
-            task = progress.add_task("Extracting", total=len(test_members))
-            for member in test_members:
-                rel = Path(member).relative_to("musdb18hq")
-                target = cache_dir / rel
-                if member.endswith("/"):
-                    target.mkdir(parents=True, exist_ok=True)
-                else:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+            task = progress.add_task("Extracting", total=len(test_files))
+            for member in test_files:
+                target = cache_dir / member.removeprefix(strip_prefix)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
                 progress.update(task, advance=1)
 
     logger.info(f"Extracted test tracks to {test_dir}")
