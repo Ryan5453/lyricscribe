@@ -16,7 +16,59 @@ uv pip install -e . --torch-backend=auto
 
 ## CLI Usage
 
-Currently, the LyricScribe CLI only contains one subcommand, `lyricscribe separate`. This allows for mass vocal separation of files using [demucs-next](https://github.com/ryan5453/demucs-next), designed for usage on SLURM clusters.
+The LyricScribe CLI contains two subcommands: `lyricscribe dataset` for downloading public ALT datasets, and `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next).
+
+<details>
+<summary><h3>lyricscribe dataset</h3></summary>
+
+The `dataset` commands download public ALT benchmark datasets and convert them into a standardized per-song directory layout with a `lyrics.json` file matching the project's Pydantic schema.
+
+#### `lyricscribe dataset jam-alt`
+
+Downloads the [Jam-ALT](https://huggingface.co/datasets/jamendolyrics/jam-alt) dataset (79 songs in 4 languages) from HuggingFace. Each song gets a directory containing `audio.mp3` and `lyrics.json`.
+
+```bash
+uv run lyricscribe dataset jam-alt --output-dir ./dataset/jam_alt
+```
+
+Options:
+
+- `--output-dir`: Directory to write the dataset into (required)
+
+Output structure:
+
+```text
+jam_alt/
+├── SONG_NAME/
+│   ├── audio.mp3
+│   └── lyrics.json
+└── ...
+```
+
+#### `lyricscribe dataset musdb-alt`
+
+Downloads the [MUSDB-ALT](https://huggingface.co/datasets/jazasyed/musdb-alt) dataset (39 English songs). Lyrics are downloaded from HuggingFace, and audio is automatically downloaded from [MUSDB18-HQ](https://zenodo.org/records/3338373) on Zenodo (~30 GB, one-time download cached in `/tmp/lyricscribe/musdb18hq/`). Each song gets a directory containing `mixture.wav`, `vocals.wav`, and `lyrics.json`.
+
+```bash
+uv run lyricscribe dataset musdb-alt --output-dir ./dataset/musdb_alt
+```
+
+Options:
+
+- `--output-dir`: Directory to write the dataset into (required)
+
+Output structure:
+
+```text
+musdb_alt/
+├── SONG_NAME/
+│   ├── mixture.wav
+│   ├── vocals.wav
+│   └── lyrics.json
+└── ...
+```
+
+</details>
 
 <details>
 <summary><h3>lyricscribe separate</h3></summary>

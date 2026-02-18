@@ -18,9 +18,17 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 @separate_app.command()
 def setup(
-    directories: List[Path] = typer.Argument(..., help="One or more directories containing subdirectories to process"),
-    job_dir: Path = typer.Option(..., "--job-dir", help="Directory to create for job files"),
-    filename: str = typer.Option(..., "--filename", help="Audio filename to process within each subdirectory (e.g. mix.wav)"),
+    directories: List[Path] = typer.Argument(
+        ..., help="One or more directories containing subdirectories to process"
+    ),
+    job_dir: Path = typer.Option(
+        ..., "--job-dir", help="Directory to create for job files"
+    ),
+    filename: str = typer.Option(
+        ...,
+        "--filename",
+        help="Audio filename to process within each subdirectory (e.g. mix.wav)",
+    ),
     model: str = typer.Option("htdemucs", "--model", help="Demucs model to use"),
     chunks: int = typer.Option(5, "--chunks", help="Number of chunks to split into"),
     stem: str | None = typer.Option(

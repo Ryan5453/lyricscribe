@@ -132,8 +132,7 @@ def _ensure_musdb18hq(cache_dir: Path) -> Path:
 
     if not zip_path.exists():
         logger.info(
-            "Downloading MUSDB18-HQ from Zenodo (~30 GB). "
-            "This is a one-time download."
+            "Downloading MUSDB18-HQ from Zenodo (~30 GB). This is a one-time download."
         )
         _download_file(MUSDB18HQ_URL, zip_path)
         logger.info(f"Download complete: {zip_path}")
@@ -295,6 +294,5 @@ def download_musdb_alt(output_dir: Path) -> None:
     )
     if unmatched:
         logger.warning(
-            f"{len(unmatched)} tracks had no MUSDB18-HQ match: "
-            + ", ".join(unmatched)
+            f"{len(unmatched)} tracks had no MUSDB18-HQ match: " + ", ".join(unmatched)
         )

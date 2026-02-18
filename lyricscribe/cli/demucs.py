@@ -153,9 +153,7 @@ def _process_file(
 
     except Exception as e:
         duration = time.time() - start_time
-        _update_status(
-            job_dir, chunk_id, chunk_data, name, "failed", duration, str(e)
-        )
+        _update_status(job_dir, chunk_id, chunk_data, name, "failed", duration, str(e))
         logger.error(f"{name} failed: {e}")
         traceback.print_exc()
         return "failed"
@@ -335,4 +333,3 @@ def show_stats(job_dir: Path) -> None:
     success_count = counts.get("success", 0)
     completion = 100 * success_count / total if total > 0 else 0
     logger.info(f"Completion: {completion:.1f}%")
-
