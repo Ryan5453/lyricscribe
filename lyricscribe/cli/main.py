@@ -4,11 +4,14 @@ from typing import List
 
 import typer
 
+from lyricscribe.cli.dataset import download_jam_alt, download_musdb_alt
 from lyricscribe.cli.demucs import process_chunk, setup_job, show_stats
 
 cli = typer.Typer(help="LyricScribe")
 separate_app = typer.Typer(help="Audio source separation commands")
 cli.add_typer(separate_app, name="separate")
+dataset_app = typer.Typer(help="Dataset download commands")
+cli.add_typer(dataset_app, name="dataset")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -65,6 +68,36 @@ def inspect(
     Inspect job details and processing statistics.
     """
     show_stats(job_dir)
+
+
+@dataset_app.command("jam-alt")
+def jam_alt(
+    output_dir: Path = typer.Option(
+        ..., "--output-dir", help="Directory to write the Jam-ALT dataset into"
+    ),
+):
+    """
+    Download the Jam-ALT dataset (79 songs, 4 languages).
+
+    Downloads audio and lyrics from HuggingFace and writes per-song
+    directories with audio.mp3 and lyrics.json.
+    """
+    download_jam_alt(output_dir)
+
+
+@dataset_app.command("musdb-alt")
+def musdb_alt(
+    output_dir: Path = typer.Option(
+        ..., "--output-dir", help="Directory to write the MUSDB-ALT dataset into"
+    ),
+):
+    """
+    Download the MUSDB-ALT dataset (39 English songs).
+
+    Downloads lyrics from HuggingFace and audio from MUSDB18-HQ (Zenodo).
+    Writes per-song directories with mixture.wav, vocals.wav, and lyrics.json.
+    """
+    download_musdb_alt(output_dir)
 
 
 if __name__ == "__main__":
