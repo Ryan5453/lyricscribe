@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=lyricscribe_separate
-#SBATCH --output=/projects/fahey.rya/music2text/logs/separation/separate_%A_%a.out
-#SBATCH --array=1-5%4
+#SBATCH --output=/projects/fahey.rya/music2text/logs/separation/separate_%j.out
 #SBATCH --time=8:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:h200:1
@@ -22,4 +21,4 @@ module load FFmpeg/7.1.1
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
 
-lyricscribe separate run --job-dir "$JOB_DIR" --chunk-id ${SLURM_ARRAY_TASK_ID}
+lyricscribe separate run --job-dir "$JOB_DIR" --chunk-id 1
