@@ -68,15 +68,15 @@ def _process_file(
     start_time = time.time()
 
     try:
-        sources = model.separate(input_path)
+        separated = model.separate(input_path)
 
         if stem:
-            sources.export_stem(stem, output_path)
+            separated.export_stem(stem, output_path)
         else:
             output_dir = Path(output_path)
-            for stem_name in model._model.sources:
+            for stem_name in separated.sources:
                 stem_output = output_dir / f"{model_name}_{stem_name}.wav"
-                sources.export_stem(stem_name, str(stem_output))
+                separated.export_stem(stem_name, str(stem_output))
 
         duration = time.time() - start_time
         update_status(job_dir, chunk_id, chunk_data, name, "success", duration, None)
