@@ -4,7 +4,7 @@ import shutil
 import zipfile
 from pathlib import Path
 
-import datasets as hf_datasets
+import datasets
 import requests
 from rich.progress import (
     BarColumn,
@@ -55,7 +55,7 @@ def _build_lyrics(
     :param text: Full lyrics as a single string.
     :param lines: List of dicts with ``start`` (seconds), ``end`` (seconds),
         and ``text`` keys.
-    :param language: ISO 639-1 language code.
+    :param language: Language of the lyrics.
     :param provider: Provider name for attribution.
     :return: A populated :class:`Lyrics` instance.
     """
@@ -112,33 +112,33 @@ def _download_file(url: str, dest: Path) -> None:
     partial.rename(dest)
 
 
-def _ensure_musdb18hq(cache_dir: Path) -> Path:
+def _download_musdb18hq(cache_dir: Path) -> Path:
     """
     Ensure MUSDB18-HQ test tracks are available locally.
 
-    Downloads the zip from Zenodo if necessary, extracts the ``test/``
-    subdirectory, and deletes the zip to free disk space.
+    Downloads the zip from Zenodo, extracts the ``test/``
+    subdirectory, and deletes the zip to free disk space. If tracks
+    are already cached, returns immediately.
 
     :param cache_dir: Base cache directory for MUSDB18-HQ files.
     :return: Path to the extracted ``test/`` directory.
     """
     test_dir = cache_dir / "test"
 
-    track_dirs = [d for d in test_dir.iterdir() if d.is_dir()] if test_dir.is_dir() else []
+    track_dirs = (
+        [d for d in test_dir.iterdir() if d.is_dir()] if test_dir.is_dir() else []
+    )
     if track_dirs:
         logger.info(f"MUSDB18-HQ test tracks already cached at {test_dir}")
         return test_dir
 
     zip_path = cache_dir / MUSDB18HQ_ZIP_NAME
 
-    if not zip_path.exists():
-        logger.info(
-            "Downloading MUSDB18-HQ from Zenodo (~30 GB). This is a one-time download."
-        )
-        _download_file(MUSDB18HQ_URL, zip_path)
-        logger.info(f"Download complete: {zip_path}")
-    else:
-        logger.info(f"Using cached zip: {zip_path}")
+    logger.info(
+        "Downloading MUSDB18-HQ from Zenodo (~30 GB). This is a one-time download."
+    )
+    _download_file(MUSDB18HQ_URL, zip_path)
+    logger.info(f"Download complete: {zip_path}")
 
     logger.info("Extracting test tracks from zip...")
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -159,8 +159,7 @@ def _ensure_musdb18hq(cache_dir: Path) -> Path:
 
         strip_prefix = test_prefix.removesuffix("test/")
         test_files = [
-            m for m in all_names
-            if m.startswith(test_prefix) and not m.endswith("/")
+            m for m in all_names if m.startswith(test_prefix) and not m.endswith("/")
         ]
         logger.info(f"Extracting {len(test_files)} files from '{test_prefix}'")
 
@@ -195,8 +194,8 @@ def download_jam_alt(output_dir: Path) -> None:
     :param output_dir: Root directory for the output dataset.
     """
     logger.info("Loading Jam-ALT dataset from HuggingFace...")
-    ds = hf_datasets.load_dataset("jamendolyrics/jam-alt", split="test")
-    ds = ds.cast_column("audio", hf_datasets.Audio(decode=False))
+    ds = datasets.load_dataset("jamendolyrics/jam-alt", split="test")
+    ds = ds.cast_column("audio", datasets.Audio(decode=False))
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -243,7 +242,7 @@ def download_musdb_alt(output_dir: Path) -> None:
     """
     Download the MUSDB-ALT dataset and convert it to per-song directories.
 
-    Lyrics come from HuggingFace. Audio (``mixture.wav`` and ``vocals.wav``)
+    Lyrics come from HuggingFace while audio (``mixture.wav`` and ``vocals.wav``)
     comes from MUSDB18-HQ, which is automatically downloaded from Zenodo
     and cached.
 
@@ -253,9 +252,9 @@ def download_musdb_alt(output_dir: Path) -> None:
     :param output_dir: Root directory for the output dataset.
     """
     logger.info("Loading MUSDB-ALT lyrics from HuggingFace...")
-    ds = hf_datasets.load_dataset("jazasyed/musdb-alt", split="test")
+    ds = datasets.load_dataset("jazasyed/musdb-alt", split="test")
 
-    test_dir = _ensure_musdb18hq(MUSDB18HQ_CACHE_DIR)
+    test_dir = _download_musdb18hq(MUSDB18HQ_CACHE_DIR)
 
     available_tracks = {d.name: d for d in test_dir.iterdir() if d.is_dir()}
 
@@ -271,6 +270,8 @@ def download_musdb_alt(output_dir: Path) -> None:
         song_dir = output_dir / safe_name
         lyrics_path = song_dir / "lyrics.json"
 
+        # While in theory this should not be needed, if there is any
+        # issues with this code then it should make rerunning it faster.
         if lyrics_path.exists():
             skipped += 1
             continue

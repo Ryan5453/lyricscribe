@@ -9,6 +9,9 @@ dependencies = [
     "demucs-next @ git+https://github.com/Ryan5453/demucs-next.git",
     "datasets",
     "pydantic",
+    "transformers",
+    "nemo_toolkit[asr]",
+    "silero-vad",
 ]
 
 [project.scripts]

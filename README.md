@@ -16,7 +16,7 @@ uv pip install -e . --torch-backend=auto
 
 ## CLI Usage
 
-The LyricScribe CLI contains two subcommands: `lyricscribe dataset` for downloading public ALT datasets, and `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next).
+The LyricScribe CLI contains three subcommands: `lyricscribe dataset` for downloading public ALT datasets, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), and `lyricscribe transcribe` for batch ASR transcription.
 
 <details>
 <summary><h3>lyricscribe dataset</h3></summary>
@@ -140,6 +140,73 @@ This command allows you to inspect the job details and show processing statistic
 
 ```bash
 uv run lyricscribe separate inspect --job-dir ./jobs/htdemucs_ft
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+
+</details>
+
+<details>
+<summary><h3>lyricscribe transcribe</h3></summary>
+
+The `transcribe` commands run ASR inference on audio files using Whisper, Parakeet, Canary, or other compatible models. Like the separation commands, transcription uses a chunk-based job system for parallel SLURM processing with automatic resuming.
+
+#### `lyricscribe transcribe setup`
+
+Set up a transcription job by scanning dataset directories for audio files and splitting them into chunks.
+
+```bash
+# Basic setup
+uv run lyricscribe transcribe setup /path/to/dataset \
+    --job-dir ./jobs/whisper_vocals \
+    --filename vocals.wav \
+    --model openai/whisper-large-v3
+
+# With VAD segmentation and multiple chunks
+uv run lyricscribe transcribe setup /path/to/dataset \
+    --job-dir ./jobs/parakeet_mixture \
+    --filename mixture.wav \
+    --model nvidia/parakeet-tdt-0.6b-v3 \
+    --chunks 5 \
+    --vad
+```
+
+Options:
+
+- `--job-dir`: Directory to create for job files (required)
+- `--filename`: Audio filename to transcribe within each subdirectory (required)
+- `--model`: HuggingFace model ID (required). Whisper models use HuggingFace Transformers, all others use NeMo.
+- `--chunks`: Number of chunks to split dataset into (default: 1)
+- `--batch-size`: Batch size for inference (default: 1)
+- `--vad`: Enable Silero VAD-based segmentation (flag)
+
+#### `lyricscribe transcribe run`
+
+Process one chunk of a transcription job. Results are appended to a JSONL file in the job directory.
+
+```bash
+uv run lyricscribe transcribe run --job-dir ./jobs/whisper_vocals --chunk-id 1
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+- `--chunk-id`: Which chunk to process, 1-indexed (required)
+
+Output files (`results_{chunk_id}.jsonl`) are saved in the job directory. Each line contains:
+
+```json
+{"song_id": "...", "audio_file": "...", "transcription": "...", "model_name": "...", "duration_seconds": 0.0, "error": null}
+```
+
+#### `lyricscribe transcribe inspect`
+
+Inspect transcription job details and show processing statistics.
+
+```bash
+uv run lyricscribe transcribe inspect --job-dir ./jobs/whisper_vocals
 ```
 
 Options:
