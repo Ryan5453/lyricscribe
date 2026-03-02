@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+from torch.jit import ScriptModule
 from silero_vad import load_silero_vad
 
 from lyricscribe.jobs import update_status
@@ -150,7 +151,7 @@ def _transcribe_with_oom_retry(
     transcriber: Transcriber,
     input_path: str,
     use_vad: bool,
-    vad_model: object | None,
+    vad_model: ScriptModule | None,
 ) -> str:
     """
     Attempt transcription with automatic OOM recovery.

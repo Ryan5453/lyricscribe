@@ -2,6 +2,7 @@ import logging
 from abc import ABC, abstractmethod
 
 import torch
+from torch.jit import ScriptModule
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ class Transcriber(ABC):
     def transcribe_with_vad(
         self,
         audio_path: str,
-        vad_model: object,
+        vad_model: ScriptModule,
     ) -> str:
         """
         Transcribe an audio file using VAD-based segmentation.

@@ -1,6 +1,7 @@
 import logging
 
 import torch
+from torch.jit import ScriptModule
 import torchaudio
 from silero_vad import get_speech_timestamps
 from transformers import pipeline
@@ -78,7 +79,7 @@ class WhisperTranscriber(Transcriber):
     def transcribe_with_vad(
         self,
         audio_path: str,
-        vad_model: object,
+        vad_model: ScriptModule,
     ) -> str:
         """
         Transcribe with VAD by batching speech segments through the pipeline.

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import nemo.collections.asr as nemo_asr
 import torch
+from torch.jit import ScriptModule
 import torchaudio
 from silero_vad import get_speech_timestamps
 
@@ -60,7 +61,7 @@ class NemoTranscriber(Transcriber):
     def transcribe_with_vad(
         self,
         audio_path: str,
-        vad_model: object,
+        vad_model: ScriptModule,
     ) -> str:
         """
         Transcribe with VAD using NeMo's manifest-based offset/duration.
