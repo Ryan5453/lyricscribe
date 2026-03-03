@@ -64,7 +64,7 @@ class NemoTranscriber(Transcriber):
             (Canary). Ignored for CTC/TDT models (Parakeet).
         :return: Transcribed text.
         """
-        kwargs: dict = {"batch_size": self.batch_size}
+        kwargs: dict = {"batch_size": self.batch_size, "channel_selector": "average"}
         if language and self.is_multitask:
             kwargs["source_lang"] = language
             kwargs["target_lang"] = language
@@ -124,7 +124,7 @@ class NemoTranscriber(Transcriber):
                         entry["pnc"] = "yes"
                     manifest_file.write(json.dumps(entry) + "\n")
 
-            kwargs: dict = {"batch_size": self.batch_size}
+            kwargs: dict = {"batch_size": self.batch_size, "channel_selector": "average"}
             if language and self.is_multitask:
                 kwargs["source_lang"] = language
                 kwargs["target_lang"] = language
