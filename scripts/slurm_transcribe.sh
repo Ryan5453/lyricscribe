@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=lyricscribe_transcribe
 #SBATCH --output=/projects/fahey.rya/music2text/logs/transcription/transcribe_%j.out
-#SBATCH --time=12:00:00
+#SBATCH --time=8:00:00
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:h200:1
 #SBATCH --cpus-per-task=8
