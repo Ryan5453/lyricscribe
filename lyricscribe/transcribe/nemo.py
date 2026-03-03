@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 import nemo.collections.asr as nemo_asr
+import numpy as np
 import torch
 import torchaudio
 from nemo.collections.asr.models import EncDecMultiTaskModel
@@ -13,6 +14,19 @@ from torch.jit import ScriptModule
 from lyricscribe.transcribe.base import Transcriber
 
 logger = logging.getLogger(__name__)
+
+
+def _load_mono(audio_path: str) -> tuple[np.ndarray, int]:
+    """
+    Load an audio file and average channels to mono.
+
+    :param audio_path: Path to the audio file.
+    :return: Tuple of (mono samples as float32 ndarray, sample rate).
+    """
+    wav, sr = torchaudio.load(audio_path)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    return wav.squeeze(0).numpy(), sr
 
 
 class NemoTranscriber(Transcriber):
@@ -64,11 +78,12 @@ class NemoTranscriber(Transcriber):
             (Canary). Ignored for CTC/TDT models (Parakeet).
         :return: Transcribed text.
         """
-        kwargs: dict = {"batch_size": self.batch_size, "channel_selector": "average"}
+        audio, _ = _load_mono(audio_path)
+        kwargs: dict = {"batch_size": self.batch_size}
         if language and self.is_multitask:
             kwargs["source_lang"] = language
             kwargs["target_lang"] = language
-        output = self.model.transcribe([audio_path], **kwargs)
+        output = self.model.transcribe(audio, **kwargs)
         return output[0].text.strip()
 
     def transcribe_with_vad(
@@ -109,11 +124,15 @@ class NemoTranscriber(Transcriber):
             return ""
 
         with tempfile.TemporaryDirectory() as tmp_dir:
+            # Save mono audio for the manifest to reference
+            mono_path = str(Path(tmp_dir) / "mono.wav")
+            torchaudio.save(mono_path, wav, sample_rate)
+
             manifest_path = Path(tmp_dir) / "manifest.json"
             with open(manifest_path, "w") as manifest_file:
                 for seg in timestamps:
                     entry = {
-                        "audio_filepath": audio_path,
+                        "audio_filepath": mono_path,
                         "offset": round(seg["start"], 3),
                         "duration": round(seg["end"] - seg["start"], 3),
                     }
@@ -124,7 +143,7 @@ class NemoTranscriber(Transcriber):
                         entry["pnc"] = "yes"
                     manifest_file.write(json.dumps(entry) + "\n")
 
-            kwargs: dict = {"batch_size": self.batch_size, "channel_selector": "average"}
+            kwargs: dict = {"batch_size": self.batch_size}
             if language and self.is_multitask:
                 kwargs["source_lang"] = language
                 kwargs["target_lang"] = language
