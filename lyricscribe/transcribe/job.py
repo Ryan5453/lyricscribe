@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from torch.jit import ScriptModule
 from silero_vad import load_silero_vad
+from torch.jit import ScriptModule
 
 from lyricscribe.jobs import update_status
 from lyricscribe.transcribe.base import Transcriber
@@ -76,6 +76,7 @@ def setup_job(
     num_chunks: int,
     batch_size: int,
     vad: bool,
+    lyrics_filename: str | None = None,
 ) -> None:
     """
     Initialize a transcription job by scanning directories and writing
@@ -88,6 +89,8 @@ def setup_job(
     :param num_chunks: Number of chunks to split the work into.
     :param batch_size: Batch size for inference.
     :param vad: Whether to enable VAD-based segmentation.
+    :param lyrics_filename: Optional JSON filename (e.g. ``lyrics.json``)
+        to read ``detected_language`` from in each subdirectory.
     """
     subdirs = []
     for directory in directories:
@@ -109,6 +112,7 @@ def setup_job(
         "model": model,
         "batch_size": batch_size,
         "vad": vad,
+        "lyrics_filename": lyrics_filename,
         "num_chunks": num_chunks,
         "total_files": total,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -128,10 +132,24 @@ def setup_job(
             name = subdir.name
             input_file = subdir / filename
 
+            language = None
+            if lyrics_filename:
+                lyrics_path = subdir / lyrics_filename
+                if lyrics_path.exists():
+                    try:
+                        with open(lyrics_path) as lf:
+                            lyrics_data = json.load(lf)
+                        language = lyrics_data.get("detected_language")
+                    except (json.JSONDecodeError, OSError) as e:
+                        logger.warning(
+                            f"{name}: failed to read {lyrics_filename}: {e}"
+                        )
+
             files.append(
                 {
                     "name": name,
                     "input_path": str(input_file),
+                    "language": language,
                     "status": "pending",
                     "duration_seconds": None,
                     "error_message": None,
@@ -152,6 +170,7 @@ def _transcribe_with_oom_retry(
     input_path: str,
     use_vad: bool,
     vad_model: ScriptModule | None,
+    language: str | None = None,
 ) -> str:
     """
     Attempt transcription with automatic OOM recovery.
@@ -164,14 +183,17 @@ def _transcribe_with_oom_retry(
     :param input_path: Path to the audio file.
     :param use_vad: Whether to use VAD-based transcription.
     :param vad_model: Loaded Silero VAD model, or ``None``.
+    :param language: Optional language code.
     :return: Transcribed text.
     :raises torch.cuda.OutOfMemoryError: If OOM persists at batch_size=1.
     """
     while True:
         try:
             if use_vad:
-                return transcriber.transcribe_with_vad(input_path, vad_model)
-            return transcriber.transcribe(input_path)
+                return transcriber.transcribe_with_vad(
+                    input_path, vad_model, language=language
+                )
+            return transcriber.transcribe(input_path, language=language)
         except torch.cuda.OutOfMemoryError:
             if transcriber.batch_size <= 1:
                 raise
@@ -217,8 +239,9 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
 
     # Auto-calibrate batch size using first pending file
     first_path = pending[0]["input_path"]
+    first_language = pending[0].get("language")
     if Path(first_path).exists():
-        transcriber.calibrate_batch_size(first_path)
+        transcriber.calibrate_batch_size(first_path, language=first_language)
 
     output_path = job_dir / f"results_{chunk_id}.jsonl"
 
@@ -247,7 +270,11 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
 
         try:
             text = _transcribe_with_oom_retry(
-                transcriber, input_path, use_vad, vad_model
+                transcriber,
+                input_path,
+                use_vad,
+                vad_model,
+                language=entry.get("language"),
             )
 
             duration = time.time() - start_time

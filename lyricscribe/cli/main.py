@@ -2,7 +2,6 @@ import json
 import logging
 from pathlib import Path
 
-
 import jiwer
 import typer
 
@@ -114,6 +113,11 @@ def transcribe_setup(
     vad: bool = typer.Option(
         False, "--vad", help="Enable VAD-based segmentation with Silero"
     ),
+    lyrics_file: str | None = typer.Option(
+        None,
+        "--lyrics-file",
+        help="JSON file in each subdirectory to read detected_language from (e.g. lyrics.json)",
+    ),
 ):
     """
     Initialize a transcription job by registering files into chunks.
@@ -126,6 +130,7 @@ def transcribe_setup(
         num_chunks=chunks,
         batch_size=batch_size,
         vad=vad,
+        lyrics_filename=lyrics_file,
     )
 
 

@@ -37,11 +37,14 @@ class Transcriber(ABC):
         ...
 
     @abstractmethod
-    def transcribe(self, audio_path: str) -> str:
+    def transcribe(self, audio_path: str, language: str | None = None) -> str:
         """
         Transcribe a single audio file.
 
         :param audio_path: Absolute path to the audio file.
+        :param language: Optional language code hint.
+            Used by models that accept language input (e.g. Whisper,
+            Canary). Ignored by models that auto-detect (e.g. Parakeet).
         :return: Transcribed text.
         """
         ...
@@ -51,6 +54,7 @@ class Transcriber(ABC):
         self,
         audio_path: str,
         vad_model: ScriptModule,
+        language: str | None = None,
     ) -> str:
         """
         Transcribe an audio file using VAD-based segmentation.
@@ -61,6 +65,7 @@ class Transcriber(ABC):
 
         :param audio_path: Absolute path to the audio file.
         :param vad_model: Loaded Silero VAD model instance.
+        :param language: Optional language code hint.
         :return: Concatenated transcription of all speech segments.
         """
         ...
@@ -69,6 +74,7 @@ class Transcriber(ABC):
         self,
         audio_path: str,
         max_batch_size: int = MAX_AUTO_BATCH_SIZE,
+        language: str | None = None,
     ) -> None:
         """
         Profile GPU memory to determine the optimal batch size.
@@ -87,6 +93,8 @@ class Transcriber(ABC):
         :param audio_path: Path to a representative audio file for
             profiling. Should be typical of the files to be processed.
         :param max_batch_size: Upper cap on the computed batch size.
+        :param language: Optional language code, forwarded to
+            :meth:`transcribe` during the profiling inference.
         """
         if self.batch_size > 0:
             logger.info(
@@ -110,7 +118,7 @@ class Transcriber(ABC):
         old_batch = self.batch_size
         self.batch_size = 1
         try:
-            self.transcribe(audio_path)
+            self.transcribe(audio_path, language=language)
         except Exception as e:
             logger.warning(
                 f"Calibration inference failed ({e}), defaulting to batch_size=1"

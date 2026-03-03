@@ -1,9 +1,9 @@
 import logging
 
 import torch
-from torch.jit import ScriptModule
 import torchaudio
 from silero_vad import get_speech_timestamps
+from torch.jit import ScriptModule
 from transformers import pipeline
 
 from lyricscribe.transcribe.base import Transcriber
@@ -62,7 +62,7 @@ class WhisperTranscriber(Transcriber):
 
         self.pipe = pipeline(**kwargs)
 
-    def transcribe(self, audio_path: str) -> str:
+    def transcribe(self, audio_path: str, language: str | None = None) -> str:
         """
         Transcribe a full audio file using sequential decoding.
 
@@ -71,15 +71,20 @@ class WhisperTranscriber(Transcriber):
         batch size.
 
         :param audio_path: Path to the audio file.
+        :param language: Optional ISO 639-1 language code hint.
         :return: Transcribed text.
         """
-        result = self.pipe(audio_path, generate_kwargs={"task": "transcribe"})
+        generate_kwargs = {"task": "transcribe"}
+        if language:
+            generate_kwargs["language"] = language
+        result = self.pipe(audio_path, generate_kwargs=generate_kwargs)
         return result["text"].strip()
 
     def transcribe_with_vad(
         self,
         audio_path: str,
         vad_model: ScriptModule,
+        language: str | None = None,
     ) -> str:
         """
         Transcribe with VAD by batching speech segments through the pipeline.
@@ -91,6 +96,7 @@ class WhisperTranscriber(Transcriber):
 
         :param audio_path: Path to the audio file.
         :param vad_model: Loaded Silero VAD model.
+        :param language: Optional language code hint.
         :return: Concatenated transcription of speech segments.
         """
         wav, sample_rate = torchaudio.load(audio_path)
@@ -119,10 +125,14 @@ class WhisperTranscriber(Transcriber):
             for seg in timestamps
         ]
 
+        generate_kwargs = {"task": "transcribe"}
+        if language:
+            generate_kwargs["language"] = language
+
         results = self.pipe(
             segments,
             batch_size=self.batch_size,
-            generate_kwargs={"task": "transcribe"},
+            generate_kwargs=generate_kwargs,
         )
 
         parts = [r["text"].strip() for r in results if r["text"].strip()]

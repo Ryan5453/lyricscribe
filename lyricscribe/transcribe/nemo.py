@@ -5,9 +5,10 @@ from pathlib import Path
 
 import nemo.collections.asr as nemo_asr
 import torch
-from torch.jit import ScriptModule
 import torchaudio
+from nemo.collections.asr.models import EncDecMultiTaskModel
 from silero_vad import get_speech_timestamps
+from torch.jit import ScriptModule
 
 from lyricscribe.transcribe.base import Transcriber
 
@@ -34,6 +35,7 @@ class NemoTranscriber(Transcriber):
         """
         super().__init__(model_name, batch_size)
         self.model = None
+        self.is_multitask = False
 
     def load(self) -> None:
         """
@@ -46,22 +48,34 @@ class NemoTranscriber(Transcriber):
         self.model = nemo_asr.models.ASRModel.from_pretrained(
             model_name=self.model_name
         )
-        logger.info(f"Loaded NeMo model on {self.model.device}")
+        self.is_multitask = isinstance(self.model, EncDecMultiTaskModel)
+        logger.info(
+            f"Loaded NeMo model on {self.model.device}"
+            f"{' (multi-task)' if self.is_multitask else ''}"
+        )
 
-    def transcribe(self, audio_path: str) -> str:
+    def transcribe(self, audio_path: str, language: str | None = None) -> str:
         """
         Transcribe a single audio file.
 
         :param audio_path: Path to the audio file.
+        :param language: Optional language code. Passed as
+            ``source_lang``/``target_lang`` for multi-task models
+            (Canary). Ignored for CTC/TDT models (Parakeet).
         :return: Transcribed text.
         """
-        output = self.model.transcribe([audio_path], batch_size=self.batch_size)
+        kwargs: dict = {"batch_size": self.batch_size}
+        if language and self.is_multitask:
+            kwargs["source_lang"] = language
+            kwargs["target_lang"] = language
+        output = self.model.transcribe([audio_path], **kwargs)
         return output[0].text.strip()
 
     def transcribe_with_vad(
         self,
         audio_path: str,
         vad_model: ScriptModule,
+        language: str | None = None,
     ) -> str:
         """
         Transcribe with VAD using NeMo's manifest-based offset/duration.
@@ -73,6 +87,7 @@ class NemoTranscriber(Transcriber):
 
         :param audio_path: Path to the audio file.
         :param vad_model: Loaded Silero VAD model.
+        :param language: Optional language code.
         :return: Concatenated transcription of speech segments.
         """
         wav, sample_rate = torchaudio.load(audio_path)
@@ -102,11 +117,20 @@ class NemoTranscriber(Transcriber):
                         "offset": round(seg["start"], 3),
                         "duration": round(seg["end"] - seg["start"], 3),
                     }
+                    if language and self.is_multitask:
+                        entry["source_lang"] = language
+                        entry["target_lang"] = language
+                        entry["taskname"] = "asr"
+                        entry["pnc"] = "yes"
                     manifest_file.write(json.dumps(entry) + "\n")
 
+            kwargs: dict = {"batch_size": self.batch_size}
+            if language and self.is_multitask:
+                kwargs["source_lang"] = language
+                kwargs["target_lang"] = language
             outputs = self.model.transcribe(
                 str(manifest_path),
-                batch_size=self.batch_size,
+                **kwargs,
             )
             parts = [o.text.strip() for o in outputs if o.text.strip()]
             return " ".join(parts)
