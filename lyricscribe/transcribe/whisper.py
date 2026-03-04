@@ -131,7 +131,7 @@ class WhisperTranscriber(Transcriber):
 
         results = self.pipe(
             segments,
-            batch_size=self.batch_size,
+            batch_size=1,  # Must be 1; varying segment lengths cause collation errors
             generate_kwargs=generate_kwargs,
         )
 
