@@ -64,6 +64,14 @@ class NemoTranscriber(Transcriber):
         )
         self.is_multitask = isinstance(self.model, EncDecMultiTaskModel)
 
+        # Disable CUDA graphs for RNNT/TDT models (e.g. Parakeet).
+        # CUDA graphs cause illegal memory access on H200 GPUs.
+        decoding = getattr(self.model, "decoding", None)
+        inner = getattr(decoding, "decoding", None)
+        computer = getattr(inner, "decoding_computer", None)
+        if computer is not None and hasattr(computer, "cuda_graphs_mode"):
+            computer.cuda_graphs_mode = None
+
         logger.info(
             f"Loaded NeMo model on {self.model.device}"
             f"{' (multi-task)' if self.is_multitask else ''}"
