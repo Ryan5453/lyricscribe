@@ -259,8 +259,16 @@ def _evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
     for results_path in job_dir.glob("results*.jsonl"):
         with open(results_path) as f:
             for line in f:
-                r = json.loads(line)
-                results_map[r["song_id"]] = r
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    results_map[r["song_id"]] = r
+                except json.JSONDecodeError:
+                    if verbose:
+                        logger.warning(f"Skipping invalid JSON line in {results_path}")
+                    continue
 
     results = list(results_map.values())
 
