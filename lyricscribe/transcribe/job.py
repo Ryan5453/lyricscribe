@@ -76,6 +76,7 @@ def setup_job(
     num_chunks: int,
     batch_size: int,
     vad: bool,
+    chunked: bool = False,
     lyrics_filename: str | None = None,
 ) -> None:
     """
@@ -89,6 +90,7 @@ def setup_job(
     :param num_chunks: Number of chunks to split the work into.
     :param batch_size: Batch size for inference.
     :param vad: Whether to enable VAD-based segmentation.
+    :param chunked: Whether to use fixed-length chunked inference.
     :param lyrics_filename: Optional JSON filename (e.g. ``lyrics.json``)
         to read ``detected_language`` from in each subdirectory.
     """
@@ -112,6 +114,7 @@ def setup_job(
         "model": model,
         "batch_size": batch_size,
         "vad": vad,
+        "chunked": chunked,
         "lyrics_filename": lyrics_filename,
         "num_chunks": num_chunks,
         "total_files": total,
@@ -169,6 +172,7 @@ def _transcribe_with_oom_retry(
     transcriber: Transcriber,
     input_path: str,
     use_vad: bool,
+    use_chunked: bool,
     vad_model: ScriptModule | None,
     language: str | None = None,
 ) -> str:
@@ -182,6 +186,7 @@ def _transcribe_with_oom_retry(
     :param transcriber: Loaded transcriber instance.
     :param input_path: Path to the audio file.
     :param use_vad: Whether to use VAD-based transcription.
+    :param use_chunked: Whether to use chunked inference.
     :param vad_model: Loaded Silero VAD model, or ``None``.
     :param language: Optional language code.
     :return: Transcribed text.
@@ -189,11 +194,13 @@ def _transcribe_with_oom_retry(
     """
     while True:
         try:
-            if use_vad:
-                return transcriber.transcribe_with_vad(
-                    input_path, vad_model, language=language
-                )
-            return transcriber.transcribe(input_path, language=language)
+            return transcriber.transcribe(
+                input_path,
+                use_vad=use_vad,
+                vad_model=vad_model,
+                use_chunked=use_chunked,
+                language=language,
+            )
         except torch.cuda.OutOfMemoryError:
             if transcriber.batch_size <= 1:
                 raise
@@ -220,6 +227,7 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     model_name = config["model"]
     batch_size = config.get("batch_size", 0)
     use_vad = config.get("vad", False)
+    use_chunked = config.get("chunked", False)
 
     transcriber = _create_transcriber(model_name, batch_size)
     transcriber.load()
@@ -243,7 +251,7 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     if Path(first_path).exists():
         transcriber.calibrate_batch_size(first_path, language=first_language)
 
-    output_path = job_dir / f"results_{chunk_id}.jsonl"
+    output_path = job_dir / "results.jsonl"
 
     success_count = 0
     failed_count = 0
@@ -273,6 +281,7 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
                 transcriber,
                 input_path,
                 use_vad,
+                use_chunked,
                 vad_model,
                 language=entry.get("language"),
             )

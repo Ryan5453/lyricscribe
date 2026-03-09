@@ -37,36 +37,23 @@ class Transcriber(ABC):
         ...
 
     @abstractmethod
-    def transcribe(self, audio_path: str, language: str | None = None) -> str:
-        """
-        Transcribe a single audio file.
-
-        :param audio_path: Absolute path to the audio file.
-        :param language: Optional language code hint.
-            Used by models that accept language input (e.g. Whisper,
-            Canary). Ignored by models that auto-detect (e.g. Parakeet).
-        :return: Transcribed text.
-        """
-        ...
-
-    @abstractmethod
-    def transcribe_with_vad(
+    def transcribe(
         self,
         audio_path: str,
-        vad_model: ScriptModule,
+        use_vad: bool = False,
+        vad_model: ScriptModule | None = None,
+        use_chunked: bool = False,
         language: str | None = None,
     ) -> str:
         """
-        Transcribe an audio file using VAD-based segmentation.
-
-        Runs the provided VAD model on the audio to identify speech
-        regions, then transcribes only those regions and concatenates
-        the results.
+        Transcribe a single audio file, optionally with VAD and/or chunking.
 
         :param audio_path: Absolute path to the audio file.
-        :param vad_model: Loaded Silero VAD model instance.
+        :param use_vad: Whether to use VAD to segment the audio.
+        :param vad_model: Loaded Silero VAD model instance (required if use_vad=True).
+        :param use_chunked: Whether to use fixed-length chunked inference.
         :param language: Optional language code hint.
-        :return: Concatenated transcription of all speech segments.
+        :return: Transcribed text.
         """
         ...
 

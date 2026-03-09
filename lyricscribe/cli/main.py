@@ -113,6 +113,9 @@ def transcribe_setup(
     vad: bool = typer.Option(
         False, "--vad", help="Enable VAD-based segmentation with Silero"
     ),
+    chunked: bool = typer.Option(
+        False, "--chunked", help="Use fixed-length chunked inference instead of full-context"
+    ),
     lyrics_file: str | None = typer.Option(
         None,
         "--lyrics-file",
@@ -130,6 +133,7 @@ def transcribe_setup(
         num_chunks=chunks,
         batch_size=batch_size,
         vad=vad,
+        chunked=chunked,
         lyrics_filename=lyrics_file,
     )
 
@@ -159,6 +163,40 @@ def transcribe_inspect(
     logger.info(f"VAD: {'enabled' if config.get('vad') else 'disabled'}")
     logger.info(f"Batch size: {config.get('batch_size', 1)}")
     jobs.show_stats(job_dir)
+
+
+@transcribe_app.command("reset")
+def transcribe_reset(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+):
+    """
+    Reset a transcription job so it can be re-run from scratch.
+
+    Deletes results files and resets all chunk statuses to pending.
+    """
+    # Delete results files
+    deleted = 0
+    for p in job_dir.glob("results*.jsonl"):
+        p.unlink()
+        deleted += 1
+    logger.info(f"Deleted {deleted} results file(s)")
+
+    # Reset chunk statuses
+    reset_count = 0
+    for chunk_path in sorted(job_dir.glob("chunk_*.json")):
+        with open(chunk_path) as f:
+            chunk_data = json.load(f)
+        for entry in chunk_data["files"]:
+            if entry["status"] != "pending":
+                entry["status"] = "pending"
+                entry["duration_seconds"] = None
+                entry["error_message"] = None
+                entry["processed_at"] = None
+                reset_count += 1
+        with open(chunk_path, "w") as f:
+            json.dump(chunk_data, f, indent=2)
+
+    logger.info(f"Reset {reset_count} entries to pending")
 
 
 @dataset_app.command("jam-alt")
@@ -214,8 +252,9 @@ def evaluate(
         return
 
     results = []
-    for path in sorted(job_dir.glob("results_*.jsonl")):
-        with open(path) as f:
+    results_path = job_dir / "results.jsonl"
+    if results_path.exists():
+        with open(results_path) as f:
             for line in f:
                 results.append(json.loads(line))
 

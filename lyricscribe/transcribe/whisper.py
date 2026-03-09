@@ -62,78 +62,63 @@ class WhisperTranscriber(Transcriber):
 
         self.pipe = pipeline(**kwargs)
 
-    def transcribe(self, audio_path: str, language: str | None = None) -> str:
-        """
-        Transcribe a full audio file using sequential decoding.
-
-        Always uses Whisper's native sequential long-form algorithm
-        (no chunked batching) for consistent results regardless of
-        batch size.
-
-        :param audio_path: Path to the audio file.
-        :param language: Optional ISO 639-1 language code hint.
-        :return: Transcribed text.
-        """
-        generate_kwargs = {"task": "transcribe"}
-        if language:
-            generate_kwargs["language"] = language
-        result = self.pipe(audio_path, generate_kwargs=generate_kwargs)
-        return result["text"].strip()
-
-    def transcribe_with_vad(
+    def transcribe(
         self,
         audio_path: str,
-        vad_model: ScriptModule,
+        use_vad: bool = False,
+        vad_model: ScriptModule | None = None,
+        use_chunked: bool = False,
         language: str | None = None,
     ) -> str:
         """
-        Transcribe with VAD by batching speech segments through the pipeline.
-
-        Loads the audio, resamples to 16 kHz mono, runs Silero VAD to
-        identify speech regions, then passes all segments as a list to
-        the pipeline for batched processing. Each segment uses sequential
-        decoding independently.
-
-        :param audio_path: Path to the audio file.
-        :param vad_model: Loaded Silero VAD model.
-        :param language: Optional language code hint.
-        :return: Concatenated transcription of speech segments.
+        Transcribe a single audio file, optionally with VAD and/or chunking.
         """
-        wav, sample_rate = torchaudio.load(audio_path)
-        if wav.shape[0] > 1:
-            wav = wav.mean(dim=0, keepdim=True)
-        if sample_rate != 16000:
-            wav = torchaudio.functional.resample(wav, sample_rate, 16000)
-            sample_rate = 16000
-
-        wav_1d = wav.squeeze(0)
-        timestamps = get_speech_timestamps(
-            wav_1d,
-            vad_model,
-            sampling_rate=sample_rate,
-            return_seconds=False,
-        )
-
-        if not timestamps:
-            return ""
-
-        segments = [
-            {
-                "raw": wav_1d[seg["start"] : seg["end"]].numpy(),
-                "sampling_rate": sample_rate,
-            }
-            for seg in timestamps
-        ]
-
         generate_kwargs = {"task": "transcribe"}
         if language:
             generate_kwargs["language"] = language
 
-        results = self.pipe(
-            segments,
-            batch_size=1,  # Must be 1; varying segment lengths cause collation errors
-            generate_kwargs=generate_kwargs,
-        )
+        kwargs = {
+            "batch_size": self.batch_size if use_chunked else 1,
+            "generate_kwargs": generate_kwargs,
+        }
+        if use_chunked:
+            kwargs["chunk_length_s"] = 30
+            kwargs["stride_length_s"] = (4, 2)
 
-        parts = [r["text"].strip() for r in results if r["text"].strip()]
-        return " ".join(parts)
+        if use_vad:
+            if vad_model is None:
+                raise ValueError("vad_model must be provided when use_vad=True")
+            wav, sample_rate = torchaudio.load(audio_path)
+            if wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            if sample_rate != 16000:
+                wav = torchaudio.functional.resample(wav, sample_rate, 16000)
+                sample_rate = 16000
+
+            wav_1d = wav.squeeze(0)
+            timestamps = get_speech_timestamps(
+                wav_1d,
+                vad_model,
+                sampling_rate=sample_rate,
+                return_seconds=False,
+            )
+
+            if not timestamps:
+                return ""
+
+            segments = [
+                {
+                    "raw": wav_1d[seg["start"] : seg["end"]].numpy(),
+                    "sampling_rate": sample_rate,
+                }
+                for seg in timestamps
+            ]
+
+            results = self.pipe(segments, **kwargs)
+            if isinstance(results, dict):
+                results = [results]
+            parts = [r["text"].strip() for r in results if r["text"].strip()]
+            return " ".join(parts)
+        else:
+            result = self.pipe(audio_path, **kwargs)
+            return result["text"].strip()

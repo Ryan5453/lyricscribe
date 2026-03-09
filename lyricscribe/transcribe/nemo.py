@@ -18,14 +18,19 @@ logger = logging.getLogger(__name__)
 
 def _load_mono(audio_path: str) -> tuple[np.ndarray, int]:
     """
-    Load an audio file and average channels to mono.
+    Load an audio file, average channels to mono, and resample to 16 kHz.
+
+    NeMo models expect 16 kHz input when given raw numpy arrays.
 
     :param audio_path: Path to the audio file.
-    :return: Tuple of (mono samples as float32 ndarray, sample rate).
+    :return: Tuple of (mono 16 kHz samples as float32 ndarray, sample rate).
     """
     wav, sr = torchaudio.load(audio_path)
     if wav.shape[0] > 1:
         wav = wav.mean(dim=0, keepdim=True)
+    if sr != 16000:
+        wav = torchaudio.functional.resample(wav, sr, 16000)
+        sr = 16000
     return wav.squeeze(0).numpy(), sr
 
 
@@ -77,82 +82,95 @@ class NemoTranscriber(Transcriber):
             f"{' (multi-task)' if self.is_multitask else ''}"
         )
 
-    def transcribe(self, audio_path: str, language: str | None = None) -> str:
-        """
-        Transcribe a single audio file.
-
-        :param audio_path: Path to the audio file.
-        :param language: Optional language code. Passed as
-            ``source_lang``/``target_lang`` for multi-task models
-            (Canary). Ignored for CTC/TDT models (Parakeet).
-        :return: Transcribed text.
-        """
-        audio, _ = _load_mono(audio_path)
-        kwargs: dict = {"batch_size": self.batch_size}
-        if language and self.is_multitask:
-            kwargs["source_lang"] = language
-            kwargs["target_lang"] = language
-        output = self.model.transcribe(audio, **kwargs)
-        return output[0].text.strip()
-
-    def transcribe_with_vad(
+    def transcribe(
         self,
         audio_path: str,
-        vad_model: ScriptModule,
+        use_vad: bool = False,
+        vad_model: ScriptModule | None = None,
+        use_chunked: bool = False,
         language: str | None = None,
     ) -> str:
         """
-        Transcribe with VAD using NeMo's manifest-based offset/duration.
-
-        Loads the audio, resamples to 16 kHz mono, runs Silero VAD to
-        find speech regions, then writes a temporary NeMo manifest with
-        one entry per segment. NeMo handles the seeking internally, so
-        no audio slicing is needed.
-
-        :param audio_path: Path to the audio file.
-        :param vad_model: Loaded Silero VAD model.
-        :param language: Optional language code.
-        :return: Concatenated transcription of speech segments.
+        Transcribe a single audio file, optionally with VAD and/or chunking.
         """
-        wav, sample_rate = torchaudio.load(audio_path)
+        wav, sr = torchaudio.load(audio_path)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)
-        if sample_rate != 16000:
-            wav = torchaudio.functional.resample(wav, sample_rate, 16000)
-            sample_rate = 16000
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+            sr = 16000
 
-        wav_1d = wav.squeeze(0)
-        timestamps = get_speech_timestamps(
-            wav_1d,
-            vad_model,
-            sampling_rate=sample_rate,
-            return_seconds=True,
-        )
+        total_duration = wav.shape[1] / sr
 
-        if not timestamps:
-            return ""
+        if use_vad:
+            if vad_model is None:
+                raise ValueError("vad_model must be provided when use_vad=True")
+            wav_1d = wav.squeeze(0)
+            timestamps = get_speech_timestamps(
+                wav_1d,
+                vad_model,
+                sampling_rate=sr,
+                return_seconds=True,
+            )
+            if not timestamps:
+                return ""
+        else:
+            timestamps = [{"start": 0.0, "end": total_duration}]
+
+        if not use_chunked and not use_vad:
+            # Optimize: use direct array via original code path if no VAD/chunking
+            audio = wav.squeeze(0).numpy()
+            kwargs: dict = {"batch_size": self.batch_size}
+            if language and self.is_multitask:
+                kwargs["source_lang"] = language
+                kwargs["target_lang"] = language
+            output = self.model.transcribe(audio, **kwargs)
+            return output[0].text.strip()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            # Save mono audio for the manifest to reference
             mono_path = str(Path(tmp_dir) / "mono.wav")
-            torchaudio.save(mono_path, wav, sample_rate)
+            torchaudio.save(mono_path, wav, sr)
 
             manifest_path = Path(tmp_dir) / "manifest.json"
             with open(manifest_path, "w") as manifest_file:
                 for seg in timestamps:
-                    entry = {
-                        "audio_filepath": mono_path,
-                        "offset": round(seg["start"], 3),
-                        "duration": round(seg["end"] - seg["start"], 3),
-                    }
-                    if language and self.is_multitask:
-                        entry["source_lang"] = language
-                        entry["target_lang"] = language
-                        entry["taskname"] = "asr"
-                        entry["pnc"] = "yes"
-                    manifest_file.write(json.dumps(entry) + "\n")
+                    start = seg["start"]
+                    end = seg["end"]
 
-            kwargs: dict = {"batch_size": self.batch_size}
+                    if use_chunked:
+                        CHUNK_S = 30.0
+                        OVERLAP_S = 5.0
+                        STEP_S = CHUNK_S - OVERLAP_S
+
+                        offset = start
+                        while offset < end:
+                            duration = min(CHUNK_S, end - offset)
+                            entry = {
+                                "audio_filepath": mono_path,
+                                "offset": round(offset, 3),
+                                "duration": round(duration, 3),
+                            }
+                            if language and self.is_multitask:
+                                entry["source_lang"] = language
+                                entry["target_lang"] = language
+                                entry["taskname"] = "asr"
+                                entry["pnc"] = "yes"
+                            manifest_file.write(json.dumps(entry) + "\n")
+                            offset += STEP_S
+                    else:
+                        entry = {
+                            "audio_filepath": mono_path,
+                            "offset": round(start, 3),
+                            "duration": round(end - start, 3),
+                        }
+                        if language and self.is_multitask:
+                            entry["source_lang"] = language
+                            entry["target_lang"] = language
+                            entry["taskname"] = "asr"
+                            entry["pnc"] = "yes"
+                        manifest_file.write(json.dumps(entry) + "\n")
+
+            kwargs = {"batch_size": self.batch_size}
             if language and self.is_multitask:
                 kwargs["source_lang"] = language
                 kwargs["target_lang"] = language
@@ -160,5 +178,7 @@ class NemoTranscriber(Transcriber):
                 str(manifest_path),
                 **kwargs,
             )
+            if not isinstance(outputs, list):
+                outputs = [outputs]
             parts = [o.text.strip() for o in outputs if o.text.strip()]
             return " ".join(parts)
