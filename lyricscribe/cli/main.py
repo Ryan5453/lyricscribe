@@ -239,7 +239,7 @@ def evaluate(
 
         measures = jiwer.compute_measures(references[song_id], hypothesis)
 
-        logger.info(
+        logger.debug(
             f"{song_id}: WER={measures['wer']:.2%}  "
             f"I={measures['insertions']}  "
             f"D={measures['deletions']}  "
