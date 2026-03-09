@@ -186,11 +186,32 @@ def dataset_musdb_alt(
 
 
 @evaluate_app.command("run")
-def evaluate(job_dir: Path = typer.Option(..., "--job-dir", help = "Path to job directory",), ground_truth: Path = typer.Option(..., "--ground-truth", )):
-    """Evaluate transcription quality"""
+def evaluate(
+    job_dir: Path = typer.Option(
+        ..., "--job-dir", help="Path to job directory"
+    ),
+):
+    """Evaluate transcription quality against ground-truth lyrics."""
 
-    with open(ground_truth) as f:
-        references = json.load(f)
+    with open(job_dir / "config.json") as f:
+        config = json.load(f)
+
+    directories = [Path(d) for d in config["directories"]]
+
+    references: dict[str, str] = {}
+    for directory in directories:
+        for song_dir in directory.iterdir():
+            if not song_dir.is_dir():
+                continue
+            lyrics_path = song_dir / "lyrics.json"
+            if lyrics_path.exists():
+                with open(lyrics_path) as f:
+                    lyrics_data = json.load(f)
+                references[song_dir.name] = lyrics_data["unsynced"]["data"]
+
+    if not references:
+        logger.warning("No ground-truth lyrics found in dataset directories")
+        return
 
     results = []
     for path in sorted(job_dir.glob("results_*.jsonl")):
@@ -200,46 +221,46 @@ def evaluate(job_dir: Path = typer.Option(..., "--job-dir", help = "Path to job 
 
     if not results:
         logger.warning("No results found in job directory")
-        return 
-    
-    totals = {"wer" : [], "insertions": [], "deletions": [], "subsitutions" : []}
-    
+        return
+
+    totals = {"wer": [], "insertions": [], "deletions": [], "substitutions": []}
+
     for r in results:
         song_id = r["song_id"]
         hypothesis = r["transcription"]
 
         if hypothesis is None:
-            logger.warning(f"{song_id}: skipping this song, no transcription available")
+            logger.warning(f"{song_id}: skipped (no transcription)")
             continue
 
         if song_id not in references:
-            logger.warning(f"{song_id}: skipping this song, no ground truth available")
+            logger.warning(f"{song_id}: skipped (no ground truth)")
             continue
 
         measures = jiwer.compute_measures(references[song_id], hypothesis)
 
         logger.info(
-            f"{song_id}: WER: {measures['wer']:.2%} "
-            f"insertions: {measures['insertions']} "
-            f"deletions: {measures['deletions']} "
-            f"substitutions: {measures['substitutions']}"
+            f"{song_id}: WER={measures['wer']:.2%}  "
+            f"I={measures['insertions']}  "
+            f"D={measures['deletions']}  "
+            f"S={measures['substitutions']}"
         )
-        
+
         totals["wer"].append(measures["wer"])
         totals["insertions"].append(measures["insertions"])
         totals["deletions"].append(measures["deletions"])
         totals["substitutions"].append(measures["substitutions"])
 
-    n = len(totals['wer'])
+    n = len(totals["wer"])
     if n == 0:
         logger.warning("No songs could be evaluated")
         return
 
     logger.info(f"--- Summary ({n} songs) ---")
-    logger.info(f"Avg WER: {sum(totals['wer']) / n:.2%}")
-    logger.info(f"Total insertions:{sum(totals['insertions'])}")
-    logger.info(f"Total deletions:{sum(totals['deletions'])}")
-    logger.info(f"Total substitutions:{sum(totals['substitutions'])}")
+    logger.info(f"Mean WER: {sum(totals['wer']) / n:.2%}")
+    logger.info(f"Total insertions: {sum(totals['insertions'])}")
+    logger.info(f"Total deletions: {sum(totals['deletions'])}")
+    logger.info(f"Total substitutions: {sum(totals['substitutions'])}")
 
 if __name__ == "__main__":
     cli()
