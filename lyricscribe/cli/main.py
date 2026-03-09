@@ -177,7 +177,7 @@ def transcribe_reset(
     # Delete results files
     deleted = 0
     for p in job_dir.glob("results*.jsonl"):
-        p.unlink()
+        p.unlink(missing_ok=True)
         deleted += 1
     logger.info(f"Deleted {deleted} results file(s)")
 

@@ -23,8 +23,8 @@ set -euo pipefail
 
 MAX_SUBMITTED=8
 POLL_INTERVAL=30
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TRANSCRIBE_SCRIPT="$SCRIPT_DIR/slurm_transcribe.sh"
+# Hardcode path since $0 inside SLURM points to /var/spool/slurmd/...
+TRANSCRIBE_SCRIPT="/projects/fahey.rya/music2text/lyricscribe/scripts/slurm_transcribe.sh"
 
 if [ -z "${1:-}" ]; then
     echo "Error: jobs file required"
