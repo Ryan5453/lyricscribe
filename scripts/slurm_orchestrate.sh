@@ -79,6 +79,13 @@ while true; do
         JOB_DIR="${JOB_DIRS[$NEXT]}"
         CHUNK_ID="${CHUNK_IDS[$NEXT]}"
 
+        # Reset job dir if not already done
+        if [ -z "${RESET_DIRS[$JOB_DIR]:-}" ]; then
+            echo "Resetting: $JOB_DIR"
+            lyricscribe transcribe reset --job-dir "$JOB_DIR"
+            RESET_DIRS["$JOB_DIR"]=1
+        fi
+
         # Submit
         SLURM_OUT=$(sbatch "$TRANSCRIBE_SCRIPT" "$JOB_DIR" "$CHUNK_ID")
         SLURM_ID=$(echo "$SLURM_OUT" | awk '{print $NF}')
