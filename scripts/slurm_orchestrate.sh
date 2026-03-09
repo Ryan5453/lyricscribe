@@ -79,11 +79,25 @@ while true; do
         JOB_DIR="${JOB_DIRS[$NEXT]}"
         CHUNK_ID="${CHUNK_IDS[$NEXT]}"
 
-        # Submit
-        SLURM_OUT=$(sbatch "$TRANSCRIBE_SCRIPT" "$JOB_DIR" "$CHUNK_ID")
-        SLURM_ID=$(echo "$SLURM_OUT" | awk '{print $NF}')
-        SLURM_IDS+=("$SLURM_ID")
-        echo "[$((NEXT + 1))/$TOTAL] Submitted job $SLURM_ID: $(basename "$(dirname "$JOB_DIR")")/$(basename "$JOB_DIR") chunk $CHUNK_ID"
+        # Submit with retries for transient SLURM errors
+        MAX_RETRIES=5
+        RETRY_COUNT=0
+        while true; do
+            if SLURM_OUT=$(sbatch "$TRANSCRIBE_SCRIPT" "$JOB_DIR" "$CHUNK_ID" 2>&1); then
+                SLURM_ID=$(echo "$SLURM_OUT" | awk '{print $NF}')
+                SLURM_IDS+=("$SLURM_ID")
+                echo "[$((NEXT + 1))/$TOTAL] Submitted job $SLURM_ID: $(basename "$(dirname "$JOB_DIR")")/$(basename "$JOB_DIR") chunk $CHUNK_ID"
+                break
+            else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
+                    echo "Error: Failed to submit job after $MAX_RETRIES retries. Output: $SLURM_OUT"
+                    exit 1
+                fi
+                echo "Warning: sbatch failed, retrying in 10s ($RETRY_COUNT/$MAX_RETRIES)..."
+                sleep 10
+            fi
+        done
 
         NEXT=$((NEXT + 1))
         CURRENT=$((CURRENT + 1))
