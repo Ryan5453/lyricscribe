@@ -108,6 +108,11 @@ def setup_job(
 
     job_dir.mkdir(parents=True, exist_ok=True)
 
+    # Clean up old results when running setup to avoid duplicate appends during run
+    results_path = job_dir / "results.jsonl"
+    if results_path.exists():
+        results_path.unlink()
+
     config = {
         "directories": [str(d) for d in directories],
         "filename": filename,
