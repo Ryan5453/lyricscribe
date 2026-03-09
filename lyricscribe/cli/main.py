@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 from pathlib import Path
@@ -223,18 +224,19 @@ def dataset_musdb_alt(
     download_musdb_alt(output_dir)
 
 
-@evaluate_app.command("run")
-def evaluate(
-    job_dir: Path = typer.Option(
-        ..., "--job-dir", help="Path to job directory"
-    ),
-):
-    """Evaluate transcription quality against ground-truth lyrics."""
+def _evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
+    config_path = job_dir / "config.json"
+    if not config_path.exists():
+        return None
 
-    with open(job_dir / "config.json") as f:
+    with open(config_path) as f:
         config = json.load(f)
 
-    directories = [Path(d) for d in config["directories"]]
+    directories = [Path(d) for d in config.get("directories", [])]
+    if not directories:
+        if verbose:
+            logger.warning("Job config has no directories")
+        return None
 
     references: dict[str, str] = {}
     for directory in directories:
@@ -248,42 +250,49 @@ def evaluate(
                 references[song_dir.name] = lyrics_data["unsynced"]["data"]
 
     if not references:
-        logger.warning("No ground-truth lyrics found in dataset directories")
-        return
+        if verbose:
+            logger.warning("No ground-truth lyrics found in dataset directories")
+        return None
 
-    results = []
-    results_path = job_dir / "results.jsonl"
-    if results_path.exists():
+    results_map = {}
+    # Read from either results.jsonl or results_*.jsonl
+    for results_path in job_dir.glob("results*.jsonl"):
         with open(results_path) as f:
             for line in f:
-                results.append(json.loads(line))
+                r = json.loads(line)
+                results_map[r["song_id"]] = r
+
+    results = list(results_map.values())
 
     if not results:
-        logger.warning("No results found in job directory")
-        return
+        if verbose:
+            logger.warning("No results found in job directory")
+        return None
 
     totals = {"wer": [], "insertions": [], "deletions": [], "substitutions": []}
-
     for r in results:
         song_id = r["song_id"]
         hypothesis = r["transcription"]
 
         if hypothesis is None:
-            logger.warning(f"{song_id}: skipped (no transcription)")
+            if verbose:
+                logger.warning(f"{song_id}: skipped (no transcription)")
             continue
 
         if song_id not in references:
-            logger.warning(f"{song_id}: skipped (no ground truth)")
+            if verbose:
+                logger.warning(f"{song_id}: skipped (no ground truth)")
             continue
 
         measures = jiwer.compute_measures(references[song_id], hypothesis)
 
-        logger.debug(
-            f"{song_id}: WER={measures['wer']:.2%}  "
-            f"I={measures['insertions']}  "
-            f"D={measures['deletions']}  "
-            f"S={measures['substitutions']}"
-        )
+        if verbose:
+            logger.debug(
+                f"{song_id}: WER={measures['wer']:.2%}  "
+                f"I={measures['insertions']}  "
+                f"D={measures['deletions']}  "
+                f"S={measures['substitutions']}"
+            )
 
         totals["wer"].append(measures["wer"])
         totals["insertions"].append(measures["insertions"])
@@ -292,14 +301,93 @@ def evaluate(
 
     n = len(totals["wer"])
     if n == 0:
-        logger.warning("No songs could be evaluated")
+        if verbose:
+            logger.warning("No songs could be evaluated")
+        return None
+
+    return {
+        "n_songs": n,
+        "mean_wer": sum(totals["wer"]) / n,
+        "insertions": sum(totals["insertions"]),
+        "deletions": sum(totals["deletions"]),
+        "substitutions": sum(totals["substitutions"]),
+        "config": config,
+    }
+
+
+@evaluate_app.command("run")
+def evaluate(
+    job_dir: Path = typer.Option(
+        ..., "--job-dir", help="Path to job directory"
+    ),
+):
+    """Evaluate transcription quality against ground-truth lyrics."""
+    stats = _evaluate_job(job_dir, verbose=True)
+    if not stats:
         return
 
-    logger.info(f"--- Summary ({n} songs) ---")
-    logger.info(f"Mean WER: {sum(totals['wer']) / n:.2%}")
-    logger.info(f"Total insertions: {sum(totals['insertions'])}")
-    logger.info(f"Total deletions: {sum(totals['deletions'])}")
-    logger.info(f"Total substitutions: {sum(totals['substitutions'])}")
+    logger.info(f"--- Summary ({stats['n_songs']} songs) ---")
+    logger.info(f"Mean WER: {stats['mean_wer']:.2%}")
+    logger.info(f"Total insertions: {stats['insertions']}")
+    logger.info(f"Total deletions: {stats['deletions']}")
+    logger.info(f"Total substitutions: {stats['substitutions']}")
+
+
+@evaluate_app.command("summarize")
+def evaluate_summarize(
+    jobs_dir: Path = typer.Option(
+        ..., "--jobs-dir", help="Path to base jobs directory containing model subdirectories"
+    ),
+    output: Path = typer.Option(
+        "evaluation_summary.csv", "--output", help="Output CSV file path"
+    ),
+):
+    """Aggregate evaluation results across all jobs into a CSV file."""
+    all_stats = []
+    
+    for config_path in jobs_dir.glob("**/config.json"):
+        job_dir = config_path.parent
+        stats = _evaluate_job(job_dir, verbose=False)
+        if stats:
+            config = stats["config"]
+            model = config.get("model", "unknown")
+            dataset = ", ".join([Path(d).name for d in config.get("directories", [])])
+            vad = config.get("vad", False)
+            chunked = config.get("chunked", False)
+            filename = config.get("filename", "")
+            
+            all_stats.append({
+                "job_dir": str(job_dir.relative_to(jobs_dir)),
+                "model": model,
+                "dataset": dataset,
+                "filename": filename,
+                "vad": vad,
+                "chunked": chunked,
+                "mean_wer": stats["mean_wer"],
+                "n_songs": stats["n_songs"],
+                "insertions": stats["insertions"],
+                "deletions": stats["deletions"],
+                "substitutions": stats["substitutions"],
+            })
+
+    if not all_stats:
+        logger.error("No successful evaluations found to summarize.")
+        return
+
+    all_stats.sort(key=lambda x: x["mean_wer"])
+
+    with open(output, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, 
+            fieldnames=[
+                "job_dir", "model", "dataset", "filename", "vad", "chunked", 
+                "mean_wer", "n_songs", "insertions", "deletions", "substitutions"
+            ]
+        )
+        writer.writeheader()
+        writer.writerows(all_stats)
+
+    logger.info(f"Successfully summarized {len(all_stats)} jobs -> {output}")
 
 if __name__ == "__main__":
     cli()

@@ -16,7 +16,7 @@ uv pip install -e . --torch-backend=auto
 
 ## CLI Usage
 
-The LyricScribe CLI contains three subcommands: `lyricscribe dataset` for downloading public ALT datasets, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), and `lyricscribe transcribe` for batch ASR transcription.
+The LyricScribe CLI contains four subcommands: `lyricscribe dataset` for downloading public ALT datasets, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), `lyricscribe transcribe` for batch ASR transcription, and `lyricscribe evaluate` for transcription quality evaluation.
 
 <details>
 <summary><h3>lyricscribe dataset</h3></summary>
@@ -212,5 +212,37 @@ uv run lyricscribe transcribe inspect --job-dir ./jobs/whisper_vocals
 Options:
 
 - `--job-dir`: Path to job directory (required)
+
+</details>
+
+<details>
+<summary><h3>lyricscribe evaluate</h3></summary>
+
+The `evaluate` commands compute Word Error Rate (WER) and other metrics to check transcription quality against ground truth lyrics.
+
+#### `lyricscribe evaluate run`
+
+Evaluates a single transcription job directory against the dataset's ground truth lyrics.
+
+```bash
+uv run lyricscribe evaluate run --job-dir ./jobs/whisper_vocals
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+
+#### `lyricscribe evaluate summarize`
+
+Recursively evaluates all complete transcription subdirectories inside a base jobs directory, computes their statistics, and aggregates the results into a single CSV file sorted by the best Mean WER.
+
+```bash
+uv run lyricscribe evaluate summarize --jobs-dir ./jobs --output evaluation_summary.csv
+```
+
+Options:
+
+- `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
+- `--output`: Output CSV file path (default: `evaluation_summary.csv`)
 
 </details>
