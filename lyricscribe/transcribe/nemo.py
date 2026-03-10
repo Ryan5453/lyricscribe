@@ -16,23 +16,6 @@ from lyricscribe.transcribe.base import Transcriber
 logger = logging.getLogger(__name__)
 
 
-def _load_mono(audio_path: str) -> tuple[np.ndarray, int]:
-    """
-    Load an audio file, average channels to mono, and resample to 16 kHz.
-
-    NeMo models expect 16 kHz input when given raw numpy arrays.
-
-    :param audio_path: Path to the audio file.
-    :return: Tuple of (mono 16 kHz samples as float32 ndarray, sample rate).
-    """
-    wav, sr = torchaudio.load(audio_path)
-    if wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-    if sr != 16000:
-        wav = torchaudio.functional.resample(wav, sr, 16000)
-        sr = 16000
-    return wav.squeeze(0).numpy(), sr
-
 
 class NemoTranscriber(Transcriber):
     """
@@ -117,16 +100,6 @@ class NemoTranscriber(Transcriber):
         else:
             timestamps = [{"start": 0.0, "end": total_duration}]
 
-        if not use_chunked and not use_vad:
-            # Optimize: use direct array via original code path if no VAD/chunking
-            audio = wav.squeeze(0).numpy()
-            kwargs: dict = {"batch_size": self.batch_size}
-            if language and self.is_multitask:
-                kwargs["source_lang"] = language
-                kwargs["target_lang"] = language
-            output = self.model.transcribe(audio, **kwargs)
-            return output[0].text.strip()
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             mono_path = str(Path(tmp_dir) / "mono.wav")
             torchaudio.save(mono_path, wav, sr)
@@ -150,11 +123,11 @@ class NemoTranscriber(Transcriber):
                                 "offset": round(offset, 3),
                                 "duration": round(duration, 3),
                             }
-                            if language and self.is_multitask:
-                                entry["source_lang"] = language
-                                entry["target_lang"] = language
+                            if self.is_multitask:
                                 entry["taskname"] = "asr"
                                 entry["pnc"] = "yes"
+                                entry["source_lang"] = language or "en"
+                                entry["target_lang"] = language or "en"
                             manifest_file.write(json.dumps(entry) + "\n")
                             offset += STEP_S
                     else:
@@ -163,17 +136,17 @@ class NemoTranscriber(Transcriber):
                             "offset": round(start, 3),
                             "duration": round(end - start, 3),
                         }
-                        if language and self.is_multitask:
-                            entry["source_lang"] = language
-                            entry["target_lang"] = language
+                        if self.is_multitask:
                             entry["taskname"] = "asr"
                             entry["pnc"] = "yes"
+                            entry["source_lang"] = language or "en"
+                            entry["target_lang"] = language or "en"
                         manifest_file.write(json.dumps(entry) + "\n")
 
             kwargs = {"batch_size": self.batch_size}
-            if language and self.is_multitask:
-                kwargs["source_lang"] = language
-                kwargs["target_lang"] = language
+            if self.is_multitask:
+                kwargs["source_lang"] = language or "en"
+                kwargs["target_lang"] = language or "en"
             outputs = self.model.transcribe(
                 str(manifest_path),
                 **kwargs,
