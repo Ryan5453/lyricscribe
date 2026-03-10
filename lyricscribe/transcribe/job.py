@@ -78,6 +78,7 @@ def setup_job(
     vad: bool,
     chunked: bool = False,
     lyrics_filename: str | None = None,
+    vad_filename: str | None = None,
 ) -> None:
     """
     Initialize a transcription job by scanning directories and writing
@@ -93,6 +94,8 @@ def setup_job(
     :param chunked: Whether to use fixed-length chunked inference.
     :param lyrics_filename: Optional JSON filename (e.g. ``lyrics.json``)
         to read ``detected_language`` from in each subdirectory.
+    :param vad_filename: Optional audio filename to use as VAD source
+        (timestamps from this file, transcription from ``filename``).
     """
     subdirs = []
     for directory in directories:
@@ -121,6 +124,7 @@ def setup_job(
         "vad": vad,
         "chunked": chunked,
         "lyrics_filename": lyrics_filename,
+        "vad_filename": vad_filename,
         "num_chunks": num_chunks,
         "total_files": total,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -153,10 +157,17 @@ def setup_job(
                             f"{name}: failed to read {lyrics_filename}: {e}"
                         )
 
+            vad_path = None
+            if vad_filename:
+                vad_file = subdir / vad_filename
+                if vad_file.exists():
+                    vad_path = str(vad_file)
+
             files.append(
                 {
                     "name": name,
                     "input_path": str(input_file),
+                    "vad_path": vad_path,
                     "language": language,
                     "status": "pending",
                     "duration_seconds": None,
@@ -180,6 +191,7 @@ def _transcribe_with_oom_retry(
     use_chunked: bool,
     vad_model: ScriptModule | None,
     language: str | None = None,
+    vad_source: str | None = None,
 ) -> str:
     """
     Attempt transcription with automatic OOM recovery.
@@ -194,6 +206,7 @@ def _transcribe_with_oom_retry(
     :param use_chunked: Whether to use chunked inference.
     :param vad_model: Loaded Silero VAD model, or ``None``.
     :param language: Optional language code.
+    :param vad_source: Optional path to VAD source audio file.
     :return: Transcribed text.
     :raises torch.cuda.OutOfMemoryError: If OOM persists at batch_size=1.
     """
@@ -205,6 +218,7 @@ def _transcribe_with_oom_retry(
                 vad_model=vad_model,
                 use_chunked=use_chunked,
                 language=language,
+                vad_source=vad_source,
             )
         except torch.cuda.OutOfMemoryError:
             if transcriber.batch_size <= 1:
@@ -289,6 +303,7 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
                 use_chunked,
                 vad_model,
                 language=entry.get("language"),
+                vad_source=entry.get("vad_path"),
             )
 
             duration = time.time() - start_time

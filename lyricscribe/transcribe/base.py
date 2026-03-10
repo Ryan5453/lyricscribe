@@ -44,6 +44,7 @@ class Transcriber(ABC):
         vad_model: ScriptModule | None = None,
         use_chunked: bool = False,
         language: str | None = None,
+        vad_source: str | None = None,
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
@@ -53,6 +54,8 @@ class Transcriber(ABC):
         :param vad_model: Loaded Silero VAD model instance (required if use_vad=True).
         :param use_chunked: Whether to use fixed-length chunked inference.
         :param language: Optional language code hint.
+        :param vad_source: Optional path to an audio file to use as VAD source
+            (timestamps from this file, transcription from audio_path).
         :return: Transcribed text.
         """
         ...

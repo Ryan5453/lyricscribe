@@ -69,6 +69,7 @@ class WhisperTranscriber(Transcriber):
         vad_model: ScriptModule | None = None,
         use_chunked: bool = False,
         language: str | None = None,
+        vad_source: str | None = None,
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
@@ -88,6 +89,7 @@ class WhisperTranscriber(Transcriber):
         if use_vad:
             if vad_model is None:
                 raise ValueError("vad_model must be provided when use_vad=True")
+
             wav, sample_rate = torchaudio.load(audio_path)
             if wav.shape[0] > 1:
                 wav = wav.mean(dim=0, keepdim=True)
@@ -95,21 +97,43 @@ class WhisperTranscriber(Transcriber):
                 wav = torchaudio.functional.resample(wav, sample_rate, 16000)
                 sample_rate = 16000
 
-            wav_1d = wav.squeeze(0)
+            if vad_source is not None:
+                vad_wav, vad_sr = torchaudio.load(vad_source)
+                if vad_wav.shape[0] > 1:
+                    vad_wav = vad_wav.mean(dim=0, keepdim=True)
+                if vad_sr != 16000:
+                    vad_wav = torchaudio.functional.resample(vad_wav, vad_sr, 16000)
+                vad_1d = vad_wav.squeeze(0)
+            else:
+                vad_1d = wav.squeeze(0)
+
             timestamps = get_speech_timestamps(
-                wav_1d,
+                vad_1d,
                 vad_model,
-                sampling_rate=sample_rate,
+                sampling_rate=16000,
                 return_seconds=False,
             )
 
             if not timestamps:
                 return ""
 
+            wav_1d = wav.squeeze(0)
+
+            # Clamp timestamps to the length of the transcription audio
+            max_samples = wav_1d.shape[0]
+            timestamps = [
+                {
+                    "start": min(seg["start"], max_samples),
+                    "end": min(seg["end"], max_samples),
+                }
+                for seg in timestamps
+                if seg["start"] < max_samples
+            ]
+
             segments = [
                 {
                     "raw": wav_1d[seg["start"] : seg["end"]].numpy(),
-                    "sampling_rate": sample_rate,
+                    "sampling_rate": 16000,
                 }
                 for seg in timestamps
             ]

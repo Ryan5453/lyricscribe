@@ -122,6 +122,12 @@ def transcribe_setup(
         "--lyrics-file",
         help="JSON file in each subdirectory to read detected_language from (e.g. lyrics.json)",
     ),
+    vad_source_file: str | None = typer.Option(
+        None,
+        "--vad-source",
+        help="Audio filename to use as VAD source (e.g. htdemucs_ft_vocals.wav). "
+             "VAD runs on this file, transcription runs on --filename.",
+    ),
 ):
     """
     Initialize a transcription job by registering files into chunks.
@@ -136,6 +142,7 @@ def transcribe_setup(
         vad=vad,
         chunked=chunked,
         lyrics_filename=lyrics_file,
+        vad_filename=vad_source_file,
     )
 
 

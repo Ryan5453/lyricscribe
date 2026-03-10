@@ -72,6 +72,7 @@ class NemoTranscriber(Transcriber):
         vad_model: ScriptModule | None = None,
         use_chunked: bool = False,
         language: str | None = None,
+        vad_source: str | None = None,
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
@@ -88,11 +89,19 @@ class NemoTranscriber(Transcriber):
         if use_vad:
             if vad_model is None:
                 raise ValueError("vad_model must be provided when use_vad=True")
-            wav_1d = wav.squeeze(0)
+            if vad_source is not None:
+                vad_wav, vad_sr = torchaudio.load(vad_source)
+                if vad_wav.shape[0] > 1:
+                    vad_wav = vad_wav.mean(dim=0, keepdim=True)
+                if vad_sr != 16000:
+                    vad_wav = torchaudio.functional.resample(vad_wav, vad_sr, 16000)
+                vad_1d = vad_wav.squeeze(0)
+            else:
+                vad_1d = wav.squeeze(0)
             timestamps = get_speech_timestamps(
-                wav_1d,
+                vad_1d,
                 vad_model,
-                sampling_rate=sr,
+                sampling_rate=16000,
                 return_seconds=True,
             )
             if not timestamps:
