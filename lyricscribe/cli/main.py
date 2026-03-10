@@ -107,9 +107,9 @@ def transcribe_setup(
     ),
     chunks: int = typer.Option(1, "--chunks", help="Number of chunks to split into"),
     batch_size: int = typer.Option(
-        0,
+        1,
         "--batch-size",
-        help="Batch size for inference. 0 = auto-calibrate from GPU memory.",
+        help="Batch size for inference.",
     ),
     vad: bool = typer.Option(
         False, "--vad", help="Enable VAD-based segmentation with Silero"

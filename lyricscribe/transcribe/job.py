@@ -231,9 +231,8 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     Process one chunk of the transcription job.
 
     Loads the appropriate model and transcribes all pending files
-    assigned to the given chunk. If ``batch_size`` is ``0`` (auto),
-    calibrates by profiling GPU memory on the first pending file.
-    Results are appended to a JSONL file in the job directory.
+    assigned to the given chunk. Results are appended to a JSONL file
+    in the job directory.
 
     On ``torch.cuda.OutOfMemoryError`` during transcription, the
     batch size is halved and the file is retried automatically.
@@ -244,12 +243,16 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     with open(job_dir / "config.json") as f:
         config = json.load(f)
     model_name = config["model"]
-    batch_size = config.get("batch_size", 0)
+    batch_size = config.get("batch_size", 1)
+    if batch_size == 0:
+        batch_size = 1  # Legacy: treat old "auto" (0) as default (1)
     use_vad = config.get("vad", False)
     use_chunked = config.get("chunked", False)
 
     transcriber = _create_transcriber(model_name, batch_size)
     transcriber.load()
+
+    logger.info(f"Using batch_size={transcriber.batch_size}")
 
     vad_model = None
     if use_vad:
@@ -263,12 +266,6 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     if not pending:
         logger.info(f"Chunk {chunk_id}: no pending files")
         return
-
-    # Auto-calibrate batch size using first pending file
-    first_path = pending[0]["input_path"]
-    first_language = pending[0].get("language")
-    if Path(first_path).exists():
-        transcriber.calibrate_batch_size(first_path, language=first_language)
 
     output_path = job_dir / "results.jsonl"
 
