@@ -11,6 +11,13 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+fields = [
+        "song_id", "model_name", "word", "word_idx", "start", "end",
+        "error_type",
+        "artifact_rms", "vocal_rms", "artifact_to_signal_ratio",
+        "spectral_centroid", "spectral_flatness",
+    ]
+
 def _load_alignments(alignments_dir: Path) -> dict[str, list[dict]]:
     alignments = {}
     for path in  (sorted(alignments_dir.glob("*.json"))):
@@ -115,12 +122,6 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
 
     common_songs = set(alignments) & set(features) & set(results)
 
-    csv_fields = [
-        "song_id", "model_name", "word", "word_idx", "start", "end",
-        "error_type",
-        "artifact_rms", "vocal_rms", "artifact_to_signal_ratio",
-        "spectral_centroid", "spectral_flatness",
-    ]
 
     rows = []
     songs_processed = 0
@@ -162,7 +163,7 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
 
         output_dir.parent.mkdir(parents=True, exist_ok=True)
         with open(output_dir, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=csv_fields)
+            writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
 
@@ -170,4 +171,49 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
 
 
 
-            
+def analyse(dataset_path: Path, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    with open(dataset_path) as f:
+        for row in csv.DictReader(f):
+            for field in fields:
+                row[field] = float(row[field])
+        rows.append(row)
+
+    models = sorted(r["model_name"] for r in rows)
+
+    asr_values = [r["artifact_to_signal_ratio"] for r in rows]
+
+    q25, q50, q75 = np.percentile(asr_values, [25, 50, 75])
+
+    def get_quartile(val):
+        if val <= q25: return "Q1"
+        if val <= q50: return "Q2"
+        if val <= q75: return "Q3"
+        return "Q4"
+    
+    quartile_rows = []
+    for model_name in models:
+        model_rows = [r for r in rows if r["model_name"] == model_name]
+        for q_label in ["Q1", "Q2", "Q3", "Q4"]:
+            q_rows = [r for r in rows if get_quartile(r["artifact_to_signal_ratio"]) == q_label]
+            if not q_rows:
+                continue
+            n = len(q_rows)
+            quartile_rows.append({
+                "model":    model_name,
+                "quartile": q_label,
+                "n_words":  n,
+                "error_rate":         round(sum(1 for r in q_rows if r["error_type"] != "correct") / n, 4),
+                "deletion_rate":      round(sum(1 for r in q_rows if r["error_type"] == "deletion") / n, 4),
+                "substitution_rate":  round(sum(1 for r in q_rows if r["error_type"] == "substitution") / n, 4),
+                "mean_artifact_to_signal": round(float(np.mean([r["artifact_to_signal_ratio"] for r in q_rows])), 4),
+            })
+
+    with open(output_dir / "error_rates_by_artifact_quartile.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "model", "quartile", "n_words", "error_rate",
+            "deletion_rate", "substitution_rate", "mean_artifact_to_signal"
+        ])
+        writer.writeheader()
+        writer.writerows(quartile_rows)
