@@ -11,7 +11,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def _load_attributes(alignments_dir: Path) -> dict[str, list[dict]]:
+def _load_alignments(alignments_dir: Path) -> dict[str, list[dict]]:
     alignments = {}
     for path in  (sorted(alignments_dir.glob("*.json"))):
         with open(path) as f:
@@ -65,7 +65,7 @@ def _load_ground_truth(musedb_dir: Path) -> dict[str, str]:
                      
 
 
-def _get_artifacts_features_for_window(features: dict, start_s: float, end_s: float) -> dict[str]:
+def _get_artifact_features_for_window(features: dict, start_s: float, end_s: float) -> dict[str]:
     hop = features["hop"]
     sample_rate = features["sample_rate"]
     n_frames = features["n_frames"]
@@ -103,5 +103,71 @@ def _get_word_error(reference: str, hypothesis: str) -> dict:
                     word_errors[i] = "substitution"
 
         return word_errors
+
+
+def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, musbd_dir: Path,   output_dir: Path) -> None:
+    alignments = _load_alignments(alignment_dir)
+    features = _load_artifact_features(features_dir)
+    results = _load_results(results_file)
+    ground_truth = _load_ground_truth(ground_truth)
+
+    models = sorted(set(model for _, model in results.keys()))
+
+    common_songs = set(alignments) & set(features) & set(results)
+
+    csv_fields = [
+        "song_id", "model_name", "word", "word_idx", "start", "end",
+        "error_type",
+        "artifact_rms", "vocal_rms", "artifact_to_signal_ratio",
+        "spectral_centroid", "spectral_flatness",
+    ]
+
+    rows = []
+    songs_processed = 0
+
+    for song_id in sorted(common_songs):
+        words = alignments[song_id]
+        song_features = features[song_id]
+        reference = ground_truth[song_id]
+
+        for model_name in models:
+            if (song_id, model_name) not in results:
+                continue
+
+            hypothesis = results[(song_id, model_name)]
+
+            try:
+                word_errors = _get_word_error(reference, hypothesis)
+            except Exception as e:
+                logger.warning(f"JiWER failed: {e}")
+                continue
+
+            for word_index, word_info in enumerate(words):
+                artifact_features = _get_artifact_features_for_window(
+                    song_features, word_info["start"], word_info["end"]
+                )
+
+                rows.append({
+                    "song_id":    song_id,
+                    "model_name": model_name,
+                    "word":       word_info["word"],
+                    "word_idx":   word_index,
+                    "start":      round(word_info["start"], 4),
+                    "end":        round(word_info["end"], 4),
+                    "error_type": word_errors.get(word_index, "unknown"),
+                    **artifact_features,
+                })
+            songs_processed += 1
+            logger.info(f"Processed {song_id} ({songs_processed}/{len(common_songs)})")
+
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_dir, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        logger.info(f"Wrote {len(rows)} rows to {output_dir}")
+
+
 
             
