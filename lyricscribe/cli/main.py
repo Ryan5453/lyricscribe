@@ -9,7 +9,7 @@ import typer
 from lyricscribe import demucs, jobs
 from lyricscribe.dataset import download_jam_alt, download_musdb_alt
 from lyricscribe.transcribe import job as transcribe_job
-from lyricscribe.transcribe.artifacts import extraction
+from lyricscribe.transcribe.artifacts import extractor, processor
 
 logger = logging.getLogger(__name__)
 
@@ -411,7 +411,30 @@ def evaluate_summarize(
 @artifacts_app.command("extract")
 def artifact_extract(musdb_dir: Path = typer.Option(..., "--musdb-dir"),
     output_dir: Path = typer.Option(..., "--output-dir")):
-    extraction.process_dataset(musdb_dir, output_dir)
+    extractor.process_dataset(musdb_dir, output_dir)
+
+
+
+@artifacts_app.command("prepare")
+def montreal_alignment_prepare(musdb_dir: Path = typer.Option(
+        ..., "--musdb-dir", help="Root MUSDB directory"
+    ),
+    prep_dir: Path = typer.Option(
+        ..., "--prep-dir", help="Output directory for Montreal Force Alignment input files"
+    )):
+    processor.prepare_mfa_inputs(musdb_dir, prep_dir)
+    
+
+@artifacts_app.command("parse")
+def montreal_alignment_parse(textgrid_dir: Path = typer.Option(
+        ..., "--textgrid-dir", help="Directory containing MFA TextGrid output files"
+    ),
+    output_dir: Path = typer.Option(
+        ..., "--output-dir", help="Directory to write per-song alignment JSON files"
+    )):
+    processor.parse_textgrid(textgrid_dir, output_dir)
+
+
 
 if __name__ == "__main__":
     cli()

@@ -57,13 +57,17 @@ def extract_artifact_features(song_dir: Path) -> dict:
     separated = _load_audio(separated_path)
 
     min_len = min(len(stems), len(separated))
+    stems = stems[:min_len]
+    separated = separated[:min_len]
 
     artifacts = separated - stems
 
     artifacts_mag = _compute_mag_spectrogram(artifacts)
     stems_mag = _compute_mag_spectrogram(stems)
 
-    n_frames, n_bins = artifacts.shape()
+
+    n_frames, n_bins = artifacts_mag.shape
+ 
 
     freqs = np.fft.rfftfreq(n_ftt, d=1.0 / sample_rate)
 
@@ -97,7 +101,7 @@ def extract_artifact_features(song_dir: Path) -> dict:
 
 def process_dataset(musdb_dir: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    song_dirs = sorted([d for d in musdb_dir.iterdir() if d.is_dir])
+    song_dirs = sorted([d for d in musdb_dir.iterdir() if d.is_dir()])
     logger.info(f"Found {len(song_dirs)} songs in {musdb_dir}")
 
     success= skipped= failed = 0
@@ -111,7 +115,7 @@ def process_dataset(musdb_dir: Path, output_dir: Path) -> None:
 
         try:
             features = extract_artifact_features(song_dir)
-            output_path.write_text(json.dump(features, indent=2))
+            output_path.write_text(json.dumps(features, indent=2))
             success += 1
         except Exception as e:
             logger.error(f"Failed on {song_dir.name}: {e}")
