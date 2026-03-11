@@ -9,6 +9,7 @@ import typer
 from lyricscribe import demucs, jobs
 from lyricscribe.dataset import download_jam_alt, download_musdb_alt
 from lyricscribe.transcribe import job as transcribe_job
+from lyricscribe.transcribe.artifacts import extraction
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ transcribe_app = typer.Typer(help="ASR transcription commands")
 cli.add_typer(transcribe_app, name="transcribe")
 evaluate_app = typer.Typer(help="ASR evaluation commands")
 cli.add_typer(evaluate_app, name="evaluate")
+artifacts_app = typer.Typer(help = "Artifacts feature extraction commands")
+cli.add_typer(artifacts_app, name="artifacts")
 
 
 @cli.callback()
@@ -403,6 +406,12 @@ def evaluate_summarize(
         writer.writerows(all_stats)
 
     logger.info(f"Successfully summarized {len(all_stats)} jobs -> {output}")
+
+
+@artifacts_app.command("extract")
+def artifact_extract(musdb_dir: Path = typer.Option(..., "--musdb-dir"),
+    output_dir: Path = typer.Option(..., "--output-dir")):
+    extraction.process_dataset(musdb_dir, output_dir)
 
 if __name__ == "__main__":
     cli()

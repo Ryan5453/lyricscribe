@@ -95,12 +95,12 @@ def extract_artifact_features(song_dir: Path) -> dict:
     }
 
 
-def process_database(musdb_dir: Path, output_dir: Path) -> None:
+def process_dataset(musdb_dir: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     song_dirs = sorted([d for d in musdb_dir.iterdir() if d.is_dir])
     logger.info(f"Found {len(song_dirs)} songs in {musdb_dir}")
 
-    success, skipped, failed = 0
+    success= skipped= failed = 0
 
     for song_dir in song_dirs:
         output_path = output_dir / f"{song_dir.name}.json"
