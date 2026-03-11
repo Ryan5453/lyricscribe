@@ -22,7 +22,7 @@ def prepare_mfa_inputs(musdb_dir: Path, prep_dir: Path) -> None:
         vocals_path  = song_dir/ "vocals.wav"
         lyrics_path = song_dir / "lyrics.json"
 
-        if not vocals_path.exists() or lyrics_path.exists():
+        if not vocals_path.exists() or not lyrics_path.exists():
             logger.warning(f"Missing paths")
             failed += 1
             continue
