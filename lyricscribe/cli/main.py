@@ -9,7 +9,7 @@ import typer
 from lyricscribe import demucs, jobs
 from lyricscribe.dataset import download_jam_alt, download_musdb_alt
 from lyricscribe.transcribe import job as transcribe_job
-from lyricscribe.transcribe.artifacts import extractor, processor
+from lyricscribe.transcribe.artifacts import extractor, processor, correlation
 
 logger = logging.getLogger(__name__)
 
@@ -433,6 +433,42 @@ def montreal_alignment_parse(textgrid_dir: Path = typer.Option(
         ..., "--output-dir", help="Directory to write per-song alignment JSON files"
     )):
     processor.parse_textgrid(textgrid_dir, output_dir)
+
+
+@artifacts_app.command("build-dataset")
+def correlate_build(
+    alignments_dir: Path = typer.Option(
+        ..., "--alignments-dir", help="Directory of MFA alignment JSON files"
+    ),
+    features_dir: Path = typer.Option(
+        ..., "--features-dir", help="Directory of artifact feature JSON files"
+    ),
+    results_file: Path = typer.Option(
+        ..., "--results-file", help="Path to results.jsonl with model transcriptions"
+    ),
+    musdb_dir: Path = typer.Option(
+        ..., "--musdb-dir", help="Root MUSDB directory for ground truth lyrics"
+    ),
+    output: Path = typer.Option(
+        ..., "--output", help="Path to write the output word-level CSV dataset"
+    ),
+):
+    """Build the word-level dataset combining alignments, artifacts, and errors."""
+    correlation.build_dataset(
+        alignments_dir, features_dir, results_file, musdb_dir, output
+    )
+
+@artifacts_app.command("analyse")
+def correlate_analyze(
+    dataset: Path = typer.Option(
+        ..., "--dataset", help="Path to word_dataset.csv from build-dataset"
+    ),
+    output_dir: Path = typer.Option(
+        ..., "--output-dir", help="Directory to write analysis output files"
+    ),
+):
+    """Run correlation analysis on the word-level dataset."""
+    correlation.analyse(dataset, output_dir)
 
 
 
