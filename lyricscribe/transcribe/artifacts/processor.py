@@ -1,16 +1,25 @@
-
-
 import json 
 import logging
 from pathlib import Path
 import shutil
 import re
 
-
 logger = logging.getLogger(__name__)
 
-
 def prepare_mfa_inputs(musdb_dir: Path, prep_dir: Path) -> None:
+    """
+    Prepare input files for Montreal Forced Aligner from the MUSDB dataset.
+
+    For each song, copies vocals.wav and writes a cleaned .lab lyrics file
+    into a flat directory that MFA expects. The .lab file contains lowercased
+    lyrics with punctuation removed, keeping only letters, digits, spaces,
+    and apostrophes.
+
+    :param musdb_dir: root MUSDB directory containing one subdirectory per song,
+                      each with vocals.wav and lyrics.json.
+    :param prep_dir: output directory where MFA input files will be written.
+                     Each song produces a .wav and .lab file with the same stem.
+    """
     prep_dir.mkdir(parents=True, exist_ok=True)
 
     song_dirs = sorted([d for d in musdb_dir.iterdir() if d.is_dir()])
@@ -32,6 +41,7 @@ def prepare_mfa_inputs(musdb_dir: Path, prep_dir: Path) -> None:
         out_lab = prep_dir / f"{name}.lab"
 
         if out_wav.exists() and out_lab.exists():
+            logger.info(f"File already exists for {name}, skipping")
             skipped += 1
             continue
 
@@ -45,7 +55,8 @@ def prepare_mfa_inputs(musdb_dir: Path, prep_dir: Path) -> None:
         if not text:
             failed += 1
             continue
-
+        
+        # the MFA package expects lyrics stipped of punctuation
         text = text.lower()
         text = re.sub(r"[^\w\s']", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
@@ -56,12 +67,20 @@ def prepare_mfa_inputs(musdb_dir: Path, prep_dir: Path) -> None:
 
     logger.info(f"Done: {success} prepared, {skipped} skipped, {failed} failed")
     logger.info(f"\nNow run MFA:")
-    logger.info(f"  mfa align {prep_dir} english_us_arpa english_us_arpa <output-dir> --clean")
 
 
 
 
 def _parse_textgrid(textgrid_path: Path) -> list[dict]:
+    """
+    Parse a single MFA TextGrid file and extract word-level timestamps.
+
+    Reads the 'words' interval tier and returns all non-silence intervals
+    as a list of word dicts. Silence markers ('sp', 'sil', '<eps>') are skipped.
+
+    :param textgrid_path: absolute path to the .TextGrid file produced by MFA.
+    :returns: list of dicts, each containing 'word', 'start', and 'end' keys where start and end are times in seconds.
+    """
     text = textgrid_path.read_text(encoding="utf-8")
 
     words = []
@@ -102,6 +121,16 @@ def _parse_textgrid(textgrid_path: Path) -> list[dict]:
     return words
 
 def parse_textgrid(textgrid_dir : Path, output_dir: Path) -> None:
+    """
+    Parse all MFA TextGrid files in a directory and write word timestamps as JSON.
+
+    Recursively searches textgrid_dir for .TextGrid files, parses each one,
+    and writes a .json file per song containing the song_id and list of
+    word timestamps.
+
+    :param textgrid_dir: Directory containing .TextGrid files produced by MFA, searched recursively.
+    :param output_dir: Directory to write one .json alignment file per song.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     textgrid_files = sorted(textgrid_dir.glob("**/*.TextGrid"))
