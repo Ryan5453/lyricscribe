@@ -91,7 +91,7 @@ def _parse_textgrid(textgrid_path: Path) -> list[dict]:
     for line in text.splitlines():
         line = line.strip()
 
-        if "name = words" in line:
+        if 'name = "words"' in line:
             in_words_tier = True
             continue
 

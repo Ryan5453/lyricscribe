@@ -47,7 +47,7 @@ def _load_artifact_features(features_dir: Path) -> dict[str, dict]:
     features = {}
     for path in (sorted(features_dir.glob("*.json"))):
         with open(path) as f:
-            data = json.load(path)
+            data = json.load(f)
         features[data["song_id"]] = data
     logger.info(f"Loaded alignment features for {len(features)} songs")
     return features
@@ -65,9 +65,9 @@ def _load_results(result_file: Path) -> dict[tuple[str, str], str]:
             line = line.strip()        
             if not line:
                 continue    
-            r = json.load(line)
+            r = json.loads(line)
             if r.get("transcription") and not r.get("error"):
-                results[(r["song_id"], r["model"])] = r["transcription"]
+                results[(r["song_id"], r["model_name"])] = r["transcription"]
     logger.info(f"Loaded {len(results)} transcription results")
     return results
 
@@ -109,7 +109,7 @@ def _get_artifact_features_for_window(features: dict, start_s: float, end_s: flo
     :param end_s: end of the time window in seconds.
     :returns: dictionary containing the mean value of each artifact feature (artifact_rms, vocal_rms, artifact_to_signal_ratio, spectral_centroid, spectral_flatness) over the given window.
     """
-    hop = features["hop"]
+    hop = features["hop_length"]
     sample_rate = features["sample_rate"]
     n_frames = features["n_frames"]
 
@@ -170,11 +170,12 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
     alignments = _load_alignments(alignment_dir)
     features = _load_artifact_features(features_dir)
     results = _load_results(results_file)
-    ground_truth = _load_ground_truth(ground_truth)
+    ground_truth = _load_ground_truth(musbd_dir)
 
     models = sorted(set(model for _, model in results.keys()))
 
-    common_songs = set(alignments) & set(features) & set(results)
+    result_songs = set(song_id for song_id, _ in results.keys())
+    common_songs = set(alignments) & set(features) & result_songs
 
 
     rows = []
@@ -182,19 +183,22 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
 
     for song_id in sorted(common_songs):
         words = alignments[song_id]
+        logger.info(f"{song_id} has {len(words)} aligned words")
         song_features = features[song_id]
         reference = ground_truth[song_id]
 
         for model_name in models:
             if (song_id, model_name) not in results:
+                logger.warning(f"No results for {song_id} / {model_name}")
                 continue
 
             hypothesis = results[(song_id, model_name)]
 
             try:
                 word_errors = _get_word_error(reference, hypothesis)
+                logger.info(f"word_errors sample: {list(word_errors.items())[:3]}")
             except Exception as e:
-                logger.warning(f"JiWER failed: {e}")
+                logger.warning(f"JiWER failed for {song_id}: {e}")
                 continue
 
             for word_index, word_info in enumerate(words):
@@ -245,6 +249,7 @@ def analyse(dataset_path: Path, output_dir: Path) -> None:
         rows.append(row)
 
     models = sorted(r["model_name"] for r in rows)
+    logger.info(f"Models found: {models}")
 
     asr_values = [r["artifact_to_signal_ratio"] for r in rows]
 
