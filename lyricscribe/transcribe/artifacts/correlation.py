@@ -117,7 +117,9 @@ def _get_artifact_features_for_window(features: dict, start_s: float, end_s: flo
     end_frame   = max(start_frame + 1, min(int(end_s * sample_rate / hop) + 1, n_frames))
 
     result = {}
-    for key in fields:
+    for key in (
+    "artifact_rms", "vocal_rms", "artifact_to_signal_ratio",
+    "spectral_centroid", "spectral_flatness"):
         values = features[key][start_frame:end_frame]
         result[key] = float(np.mean(values)) if values else 0.0
 
@@ -149,7 +151,7 @@ def _get_word_error(reference: str, hypothesis: str) -> dict:
                 for i in range(op.ref_start_idx, op.ref_end_idx):
                     word_errors[i] = "substitution"
 
-        return word_errors
+    return word_errors
 
 
 def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, musbd_dir: Path,   output_dir: Path) -> None:
@@ -219,13 +221,13 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
             songs_processed += 1
             logger.info(f"Processed {song_id} ({songs_processed}/{len(common_songs)})")
 
-        output_dir.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_dir, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows(rows)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_dir, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
-        logger.info(f"Wrote {len(rows)} rows to {output_dir}")
+    logger.info(f"Wrote {len(rows)} rows to {output_dir}")
 
 
 
@@ -244,11 +246,13 @@ def analyse(dataset_path: Path, output_dir: Path) -> None:
     rows = []
     with open(dataset_path) as f:
         for row in csv.DictReader(f):
-            for field in fields:
+            for field in ("artifact_rms", "vocal_rms", "artifact_to_signal_ratio", "spectral_centroid", "spectral_flatness"):
                 row[field] = float(row[field])
-        rows.append(row)
+            rows.append(row)
 
-    models = sorted(r["model_name"] for r in rows)
+        rows = [r for r in rows if r["artifact_to_signal_ratio"] != float("inf")]
+
+    models = sorted(set(r["model_name"] for r in rows))
     logger.info(f"Models found: {models}")
 
     asr_values = [r["artifact_to_signal_ratio"] for r in rows]
