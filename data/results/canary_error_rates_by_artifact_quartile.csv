@@ -1,0 +1,5 @@
+model,quartile,n_words,error_rate,deletion_rate,substitution_rate,mean_artifact_to_signal
+nvidia/canary-1b-v2,Q1,1296,0.4715,0.0725,0.2971,0.326
+nvidia/canary-1b-v2,Q2,1295,0.4973,0.0772,0.2988,0.5748
+nvidia/canary-1b-v2,Q3,1295,0.5066,0.0965,0.2857,0.7627
+nvidia/canary-1b-v2,Q4,1295,0.5521,0.078,0.3058,10.1495
