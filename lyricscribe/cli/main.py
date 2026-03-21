@@ -89,6 +89,18 @@ def separate_inspect(
     jobs.show_stats(job_dir)
 
 
+@separate_app.command("reset")
+def separate_reset(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+):
+    """
+    Reset a separation job so it can be re-run from scratch.
+
+    Deletes separated output files and resets all chunk statuses to pending.
+    """
+    demucs.reset_job(job_dir)
+
+
 @transcribe_app.command("setup")
 def transcribe_setup(
     directories: list[Path] = typer.Argument(

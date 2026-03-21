@@ -34,6 +34,31 @@ def _load_model(model_name: str, stem: str | None) -> Separator:
     return separator
 
 
+def _get_expected_output_paths(
+    model_name: str,
+    stem: str | None,
+    output_path: str,
+    model: Separator | None = None,
+) -> list[Path]:
+    """
+    Return the output file paths expected for one separation entry.
+
+    :param model_name: Name of the Demucs model used for filenames.
+    :param stem: Stem to isolate, or ``None`` for all stems.
+    :param output_path: Stored manifest output path.
+    :param model: Loaded separator, required when ``stem`` is ``None``.
+    :return: Expected output file paths.
+    """
+    output = Path(output_path)
+    if stem:
+        return [output]
+
+    if model is None:
+        model = _load_model(model_name, None)
+
+    return [output / f"{model_name}_{stem_name}.wav" for stem_name in model.model.sources]
+
+
 def _process_file(
     job_dir: Path,
     chunk_id: int,
@@ -61,7 +86,13 @@ def _process_file(
     :param output_path: Path for the output file or directory.
     :return: One of ``'success'``, ``'failed'``, or ``'skipped'``.
     """
-    if Path(output_path).exists():
+    expected_outputs = _get_expected_output_paths(
+        model_name=model_name,
+        stem=stem,
+        output_path=output_path,
+        model=model,
+    )
+    if expected_outputs and all(path.exists() for path in expected_outputs):
         update_status(job_dir, chunk_id, chunk_data, name, "success", 0.0, None)
         return "skipped"
 
@@ -222,3 +253,52 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     logger.info(
         f"Chunk {chunk_id}: {success_count} success, {failed_count} failed, {skipped_count} skipped"
     )
+
+
+def reset_job(job_dir: Path) -> None:
+    """
+    Reset a separation job so it can be re-run from scratch.
+
+    Deletes any existing output files tracked by the job config and resets all
+    chunk entries to ``pending``.
+
+    :param job_dir: Path to the job directory.
+    """
+    with open(job_dir / "config.json") as f:
+        config = json.load(f)
+
+    model_name = config["model"]
+    stem = config.get("stem")
+    model = None if stem else _load_model(model_name, None)
+
+    deleted_outputs = 0
+    reset_count = 0
+
+    for chunk_path in sorted(job_dir.glob("chunk_*.json")):
+        with open(chunk_path) as f:
+            chunk_data = json.load(f)
+
+        for entry in chunk_data["files"]:
+            for path in _get_expected_output_paths(
+                model_name=model_name,
+                stem=stem,
+                output_path=entry["output_path"],
+                model=model,
+            ):
+                if path.exists():
+                    path.unlink()
+                    deleted_outputs += 1
+
+            if entry["status"] != "pending":
+                reset_count += 1
+
+            entry["status"] = "pending"
+            entry["duration_seconds"] = None
+            entry["error_message"] = None
+            entry["processed_at"] = None
+
+        with open(chunk_path, "w") as f:
+            json.dump(chunk_data, f, indent=2)
+
+    logger.info(f"Deleted {deleted_outputs} output file(s)")
+    logger.info(f"Reset {reset_count} entries to pending")

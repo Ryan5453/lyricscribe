@@ -146,6 +146,18 @@ Options:
 
 - `--job-dir`: Path to job directory (required)
 
+#### `lyricscribe separate reset`
+
+This command resets a separation job so it can be re-run from scratch. It deletes the tracked Demucs outputs for the job and resets all chunk entries back to `pending`.
+
+```bash
+uv run lyricscribe separate reset --job-dir ./jobs/htdemucs_ft
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+
 </details>
 
 <details>
