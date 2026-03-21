@@ -12,6 +12,8 @@ dependencies = [
     "transformers",
     "nemo_toolkit[asr]",
     "silero-vad",
+    "matplotlib",
+    "pandas",
 ]
 
 [project.scripts]
