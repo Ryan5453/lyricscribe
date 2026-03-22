@@ -18,6 +18,7 @@ CHUNK_ID=$2
 echo "Job directory: $JOB_DIR"
 echo "Chunk ID: $CHUNK_ID"
 
+module load cuda/12.8.0
 module load FFmpeg/7.1.1
 
 cd /projects/fahey.rya/music2text/lyricscribe
