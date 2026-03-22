@@ -24,9 +24,9 @@ def _load_model(model_name: str, stem: str | None) -> Separator:
     """
     logger.info(f"CUDA available: {torch.cuda.is_available()}")
     if stem:
-        separator = Separator(model=model_name, only_load=stem, device="cpu")
+        separator = Separator(model=model_name, only_load=stem)
     else:
-        separator = Separator(model=model_name, device="cpu")
+        separator = Separator(model=model_name)
     logger.info(
         f"Loaded model {model_name} on {separator.device}, "
         f"isolating {stem or 'all stems'}"
