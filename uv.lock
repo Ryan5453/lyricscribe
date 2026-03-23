@@ -1758,6 +1758,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "demucs-next" },
+    { name = "jiwer" },
     { name = "matplotlib" },
     { name = "nemo-toolkit", extra = ["asr"] },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.14'" },
@@ -1777,6 +1778,7 @@ dev = [
 requires-dist = [
     { name = "datasets" },
     { name = "demucs-next", git = "https://github.com/Ryan5453/demucs-next.git" },
+    { name = "jiwer" },
     { name = "matplotlib" },
     { name = "nemo-toolkit", extras = ["asr"] },
     { name = "pandas" },

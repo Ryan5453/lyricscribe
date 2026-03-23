@@ -324,20 +324,35 @@ Options:
 
 #### `lyricscribe artifacts align`
 
-Runs Montreal Forced Aligner on the MUSDB dataset to produce word-level alignments. Handles corpus preparation, alignment, and JSON export in a single step using MFA's Python API.
+Runs Montreal Forced Aligner via Singularity/Apptainer to produce word-level alignments. MFA does not need to be installed in your Python environment.
+
+**Setup** — pull the MFA image and download models once:
+
+```bash
+singularity pull mfa.sif docker://mmcauliffe/montreal-forced-aligner:latest
+mkdir -p /path/to/mfa_cache
+singularity exec --env MFA_ROOT_DIR=/mfa_root -B /path/to/mfa_cache:/mfa_root mfa.sif \
+    mfa model download acoustic english_mfa
+singularity exec --env MFA_ROOT_DIR=/mfa_root -B /path/to/mfa_cache:/mfa_root mfa.sif \
+    mfa model download dictionary english_mfa
+```
+
+**Usage:**
 
 ```bash
 uv run lyricscribe artifacts align \
     --musdb-dir ./dataset/musdb_alt \
-    --output-dir ./alignments
+    --output-dir ./alignments \
+    --container ./mfa.sif \
+    --mfa-root /path/to/mfa_cache
 ```
 
 Options:
 
 - `--musdb-dir`: Root MUSDB directory containing song subdirectories (required)
 - `--output-dir`: Directory to write per-song alignment JSON files (required)
-- `--dictionary`: MFA dictionary name or path (default: `english_mfa`)
-- `--acoustic-model`: MFA acoustic model name or path (default: `english_mfa`)
+- `--container` / `-c`: Path to `.sif` file (or set env `LYRICSCRIBE_MFA_CONTAINER`)
+- `--mfa-root`: Host directory for cached MFA pretrained models (recommended)
 
 #### `lyricscribe artifacts build`
 

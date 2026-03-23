@@ -351,15 +351,26 @@ def artifact_align(
     output_dir: Path = typer.Option(
         ..., "--output-dir", help="Directory to write per-song alignment JSON files"
     ),
-    dictionary: str = typer.Option(
-        "english_mfa", "--dictionary", help="MFA dictionary name or path"
+    container: str | None = typer.Option(
+        None,
+        "--container",
+        "-c",
+        envvar="LYRICSCRIBE_MFA_CONTAINER",
+        help="Path to MFA .sif container image (or set LYRICSCRIBE_MFA_CONTAINER)",
     ),
-    acoustic_model: str = typer.Option(
-        "english_mfa", "--acoustic-model", help="MFA acoustic model name or path"
+    mfa_root: Path | None = typer.Option(
+        None,
+        "--mfa-root",
+        help="Host directory for cached MFA pretrained models",
     ),
 ):
-    """Run Montreal Forced Aligner to produce word-level alignments."""
-    processor.align(musdb_dir, output_dir, dictionary=dictionary, acoustic_model=acoustic_model)
+    """Run Montreal Forced Aligner (via Singularity/Apptainer) for word-level alignments."""
+    processor.align(
+        musdb_dir,
+        output_dir,
+        container=container,
+        mfa_root=mfa_root,
+    )
 
 
 @artifacts_app.command("build")
