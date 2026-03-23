@@ -16,6 +16,7 @@ dependencies = [
     "matplotlib",
     "pandas",
     "Montreal-Forced-Aligner==3.3.9",
+    "kalpy-kaldi",
 ]
 
 [project.scripts]
