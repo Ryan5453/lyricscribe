@@ -4,13 +4,15 @@
 
 ## Installation
 
-Assuming you have `uv` installed, you can install the dependencies with the following commands:
+Install [uv](https://docs.astral.sh/uv/) and [kaldi](https://kaldi-asr.org/).
 
+Afterwards, run:
 ```bash
 git clone https://github.com/Ryan5453/lyricscribe
 cd lyricscribe
 uv venv
 source .venv/bin/activate
+export KALDI_ROOT= ????
 uv pip install -e . --torch-backend=auto
 ```
 
