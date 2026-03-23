@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 fields = [
         "song_id", "model_name", "word", "word_idx", "start", "end",
-        "error_type",
+        "error_type", "insertion_count",
         "artifact_rms", "vocal_rms", "artifact_to_signal_ratio",
         "spectral_centroid", "spectral_flatness",
     ]
@@ -125,62 +125,74 @@ def _get_artifact_features_for_window(features: dict, start_s: float, end_s: flo
 
     return result
 
-def _get_word_error(reference: str, hypothesis: str) -> dict:
+def _get_word_error(reference: str, hypothesis: str) -> tuple[dict[int, str], dict[int, int]]:
     """
     Compute the error type for each reference word using jiwer word alignment.
 
     :param reference: Ground truth lyrics string.
     :param hypothesis: Model transcription string.
-    :returns: dictionary mapping reference word index to error type.
+    :returns: tuple of (word_errors, insertion_counts) where word_errors maps
+        reference word index to error type, and insertion_counts maps each
+        reference word index to the number of hypothesis words inserted
+        adjacent to it.
     """
-    ouput = jiwer.process_words(reference, hypothesis)
-    word_errors = {}
+    output = jiwer.process_words(reference, hypothesis)
+    word_errors: dict[int, str] = {}
+    insertion_counts: dict[int, int] = {}
 
-    for chunk in ouput.alignments:
+    for chunk in output.alignments:
         for op in chunk:
             if op.type == "equal":
                 for i in range(op.ref_start_idx, op.ref_end_idx):
-                    word_errors[i] = 'correct'
-            if op.type == "insert":
-                for i in range(op.ref_start_idx, op.ref_end_idx):
-                    word_errors[i] = "insertion"
-            if op.type == "delete":
+                    word_errors[i] = "correct"
+            elif op.type == "insert":
+                n_inserted = op.hyp_end_idx - op.hyp_start_idx
+                target_idx = max(0, op.ref_start_idx - 1)
+                insertion_counts[target_idx] = insertion_counts.get(target_idx, 0) + n_inserted
+            elif op.type == "delete":
                 for i in range(op.ref_start_idx, op.ref_end_idx):
                     word_errors[i] = "deletion"
-            if op.type == "substitute":
+            elif op.type == "substitute":
                 for i in range(op.ref_start_idx, op.ref_end_idx):
                     word_errors[i] = "substitution"
 
-    return word_errors
+    return word_errors, insertion_counts
 
 
-def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, musbd_dir: Path,   output_dir: Path) -> None:
+def build_dataset(
+    alignment_dir: Path,
+    features_dir: Path,
+    results_file: Path,
+    musdb_dir: Path,
+    *,
+    csv_output: Path | None = None,
+) -> list[dict]:
     """
     Build the word-level dataset combining MFA alignments, artifact features,
-    and model transcription results into a single CSV.
+    and model transcription results.
 
     For each song, each model, and each aligned word, looks up the artifact
     features during that word's time window and the model's error type for
-    that word. Writes one row per (word, model) pair.
+    that word.  Returns one dict per (word, model) pair.
 
     :param alignment_dir: directory containing MFA alignment .json files.
     :param features_dir: directory containing artifact feature .json files.
     :param results_file: path to the .jsonl transcription results file.
     :param musdb_dir: root MUSDB directory, used to load ground truth lyrics.
-    :param output_path: path to write the output CSV file.
+    :param csv_output: optional path to also write the dataset as CSV.
+    :returns: list of row dicts.
     """
     alignments = _load_alignments(alignment_dir)
     features = _load_artifact_features(features_dir)
     results = _load_results(results_file)
-    ground_truth = _load_ground_truth(musbd_dir)
+    ground_truth = _load_ground_truth(musdb_dir)
 
     models = sorted(set(model for _, model in results.keys()))
 
     result_songs = set(song_id for song_id, _ in results.keys())
     common_songs = set(alignments) & set(features) & result_songs
 
-
-    rows = []
+    rows: list[dict] = []
     songs_processed = 0
 
     for song_id in sorted(common_songs):
@@ -197,7 +209,7 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
             hypothesis = results[(song_id, model_name)]
 
             try:
-                word_errors = _get_word_error(reference, hypothesis)
+                word_errors, insertion_counts = _get_word_error(reference, hypothesis)
                 logger.info(f"word_errors sample: {list(word_errors.items())[:3]}")
             except Exception as e:
                 logger.warning(f"JiWER failed for {song_id}: {e}")
@@ -216,47 +228,53 @@ def build_dataset(alignment_dir: Path,features_dir: Path, results_file: Path, mu
                     "start":      round(word_info["start"], 4),
                     "end":        round(word_info["end"], 4),
                     "error_type": word_errors.get(word_index, "unknown"),
+                    "insertion_count": insertion_counts.get(word_index, 0),
                     **artifact_features,
                 })
             songs_processed += 1
             logger.info(f"Processed {song_id} ({songs_processed}/{len(common_songs)})")
 
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_dir, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(rows)
+    if csv_output is not None:
+        csv_output.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info(f"Wrote {len(rows)} rows to {csv_output}")
 
-    logger.info(f"Wrote {len(rows)} rows to {output_dir}")
+    return rows
 
 
 
-def analyse(dataset_path: Path, output_dir: Path) -> None:
+_QUARTILE_FIELDS = [
+    "model", "quartile", "n_words", "error_rate",
+    "deletion_rate", "substitution_rate", "mean_insertions_per_word",
+    "mean_artifact_to_signal",
+]
+
+
+def analyse(
+    rows: list[dict],
+    *,
+    csv_output: Path | None = None,
+) -> list[dict]:
     """
-    Run correlation analysis on the word-level dataset and write results.
+    Run correlation analysis on the word-level dataset.
 
     Splits words into artifact energy quartiles and computes error rate,
-    deletion rate, and substitution rate per quartile per model. Results
-    are written to error_rates_by_artifact_quartile.csv in output_dir.
+    deletion rate, substitution rate, and mean insertions per word per
+    quartile per model.
 
-    :param dataset_path: absolute path to the word-level CSV produced by build_dataset.
-    :param output_dir: directory to write analysis output files.
+    :param rows: word-level dataset as returned by :func:`build_dataset`.
+    :param csv_output: optional path to write quartile summary CSV.
+    :returns: list of quartile summary dicts.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
-    with open(dataset_path) as f:
-        for row in csv.DictReader(f):
-            for field in ("artifact_rms", "vocal_rms", "artifact_to_signal_ratio", "spectral_centroid", "spectral_flatness"):
-                row[field] = float(row[field])
-            rows.append(row)
-
-        rows = [r for r in rows if r["artifact_to_signal_ratio"] != float("inf")]
+    rows = [r for r in rows if r["artifact_to_signal_ratio"] != float("inf")]
 
     models = sorted(set(r["model_name"] for r in rows))
     logger.info(f"Models found: {models}")
 
     asr_values = [r["artifact_to_signal_ratio"] for r in rows]
-
     q25, q50, q75 = np.percentile(asr_values, [25, 50, 75])
 
     def get_quartile(val):
@@ -264,7 +282,7 @@ def analyse(dataset_path: Path, output_dir: Path) -> None:
         if val <= q50: return "Q2"
         if val <= q75: return "Q3"
         return "Q4"
-    
+
     quartile_rows = []
     for model_name in models:
         model_rows = [r for r in rows if r["model_name"] == model_name]
@@ -280,13 +298,16 @@ def analyse(dataset_path: Path, output_dir: Path) -> None:
                 "error_rate":         round(sum(1 for r in q_rows if r["error_type"] != "correct") / n, 4),
                 "deletion_rate":      round(sum(1 for r in q_rows if r["error_type"] == "deletion") / n, 4),
                 "substitution_rate":  round(sum(1 for r in q_rows if r["error_type"] == "substitution") / n, 4),
+                "mean_insertions_per_word": round(sum(r["insertion_count"] for r in q_rows) / n, 4),
                 "mean_artifact_to_signal": round(float(np.mean([r["artifact_to_signal_ratio"] for r in q_rows])), 4),
             })
 
-    with open(output_dir / "error_rates_by_artifact_quartile.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "model", "quartile", "n_words", "error_rate",
-            "deletion_rate", "substitution_rate", "mean_artifact_to_signal"
-        ])
-        writer.writeheader()
-        writer.writerows(quartile_rows)
+    if csv_output is not None:
+        csv_output.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_QUARTILE_FIELDS)
+            writer.writeheader()
+            writer.writerows(quartile_rows)
+        logger.info(f"Wrote quartile analysis to {csv_output}")
+
+    return quartile_rows

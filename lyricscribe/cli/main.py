@@ -3,13 +3,13 @@ import json
 import logging
 from pathlib import Path
 
-import jiwer
 import typer
 
-from lyricscribe import demucs, jobs
+from lyricscribe import demucs, jobs, plots
 from lyricscribe.dataset import download_jam_alt, download_musdb_alt
+from lyricscribe.evaluate import collect_evaluation_data, evaluate_job
 from lyricscribe.transcribe import job as transcribe_job
-from lyricscribe.transcribe.artifacts import extractor, processor, correlation
+from lyricscribe.transcribe.artifacts import correlation, extractor, processor
 
 logger = logging.getLogger(__name__)
 
@@ -246,105 +246,6 @@ def dataset_musdb_alt(
     download_musdb_alt(output_dir)
 
 
-def _evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
-    config_path = job_dir / "config.json"
-    if not config_path.exists():
-        return None
-
-    with open(config_path) as f:
-        config = json.load(f)
-
-    directories = [Path(d) for d in config.get("directories", [])]
-    if not directories:
-        if verbose:
-            logger.warning("Job config has no directories")
-        return None
-
-    references: dict[str, str] = {}
-    for directory in directories:
-        for song_dir in directory.iterdir():
-            if not song_dir.is_dir():
-                continue
-            lyrics_path = song_dir / "lyrics.json"
-            if lyrics_path.exists():
-                with open(lyrics_path) as f:
-                    lyrics_data = json.load(f)
-                references[song_dir.name] = lyrics_data["unsynced"]["data"]
-
-    if not references:
-        if verbose:
-            logger.warning("No ground-truth lyrics found in dataset directories")
-        return None
-
-    results_map = {}
-    # Read from either results.jsonl or results_*.jsonl
-    for results_path in job_dir.glob("results*.jsonl"):
-        with open(results_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                    results_map[r["song_id"]] = r
-                except json.JSONDecodeError:
-                    if verbose:
-                        logger.warning(f"Skipping invalid JSON line in {results_path}")
-                    continue
-
-    results = list(results_map.values())
-
-    if not results:
-        if verbose:
-            logger.warning("No results found in job directory")
-        return None
-
-    totals = {"wer": [], "insertions": [], "deletions": [], "substitutions": []}
-    for r in results:
-        song_id = r["song_id"]
-        hypothesis = r["transcription"]
-
-        if hypothesis is None:
-            if verbose:
-                logger.warning(f"{song_id}: skipped (no transcription)")
-            continue
-
-        if song_id not in references:
-            if verbose:
-                logger.warning(f"{song_id}: skipped (no ground truth)")
-            continue
-
-        measures = jiwer.compute_measures(references[song_id], hypothesis)
-
-        if verbose:
-            logger.debug(
-                f"{song_id}: WER={measures['wer']:.2%}  "
-                f"I={measures['insertions']}  "
-                f"D={measures['deletions']}  "
-                f"S={measures['substitutions']}"
-            )
-
-        totals["wer"].append(measures["wer"])
-        totals["insertions"].append(measures["insertions"])
-        totals["deletions"].append(measures["deletions"])
-        totals["substitutions"].append(measures["substitutions"])
-
-    n = len(totals["wer"])
-    if n == 0:
-        if verbose:
-            logger.warning("No songs could be evaluated")
-        return None
-
-    return {
-        "n_songs": n,
-        "mean_wer": sum(totals["wer"]) / n,
-        "insertions": sum(totals["insertions"]),
-        "deletions": sum(totals["deletions"]),
-        "substitutions": sum(totals["substitutions"]),
-        "config": config,
-    }
-
-
 @evaluate_app.command("run")
 def evaluate(
     job_dir: Path = typer.Option(
@@ -352,7 +253,7 @@ def evaluate(
     ),
 ):
     """Evaluate transcription quality against ground-truth lyrics."""
-    stats = _evaluate_job(job_dir, verbose=True)
+    stats = evaluate_job(job_dir, verbose=True)
     if not stats:
         return
 
@@ -373,44 +274,17 @@ def evaluate_summarize(
     ),
 ):
     """Aggregate evaluation results across all jobs into a CSV file."""
-    all_stats = []
-    
-    for config_path in jobs_dir.glob("**/config.json"):
-        job_dir = config_path.parent
-        stats = _evaluate_job(job_dir, verbose=False)
-        if stats:
-            config = stats["config"]
-            model = config.get("model", "unknown")
-            dataset = ", ".join([Path(d).name for d in config.get("directories", [])])
-            vad = config.get("vad", False)
-            chunked = config.get("chunked", False)
-            filename = config.get("filename", "")
-            
-            all_stats.append({
-                "job_dir": str(job_dir.relative_to(jobs_dir)),
-                "model": model,
-                "dataset": dataset,
-                "filename": filename,
-                "vad": vad,
-                "chunked": chunked,
-                "mean_wer": stats["mean_wer"],
-                "n_songs": stats["n_songs"],
-                "insertions": stats["insertions"],
-                "deletions": stats["deletions"],
-                "substitutions": stats["substitutions"],
-            })
+    all_stats = collect_evaluation_data(jobs_dir)
 
     if not all_stats:
         logger.error("No successful evaluations found to summarize.")
         return
 
-    all_stats.sort(key=lambda x: x["mean_wer"])
-
     with open(output, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, 
+            f,
             fieldnames=[
-                "job_dir", "model", "dataset", "filename", "vad", "chunked", 
+                "job_dir", "model", "dataset", "filename", "vad", "chunked",
                 "mean_wer", "n_songs", "insertions", "deletions", "substitutions"
             ]
         )
@@ -420,35 +294,76 @@ def evaluate_summarize(
     logger.info(f"Successfully summarized {len(all_stats)} jobs -> {output}")
 
 
+@evaluate_app.command("plot")
+def evaluate_plot(
+    jobs_dir: Path = typer.Option(
+        ..., "--jobs-dir", help="Path to base jobs directory containing model subdirectories"
+    ),
+    output_dir: Path = typer.Option(
+        ..., "--output-dir", help="Directory to save the generated SVG plots"
+    ),
+    alignments_dir: Path | None = typer.Option(
+        None, "--alignments-dir", help="Directory of MFA alignment JSON files (enables artifact chart)"
+    ),
+    features_dir: Path | None = typer.Option(
+        None, "--features-dir", help="Directory of artifact feature JSON files (enables artifact chart)"
+    ),
+    results_file: Path | None = typer.Option(
+        None, "--results-file", help="Path to results.jsonl with model transcriptions (enables artifact chart)"
+    ),
+    musdb_dir: Path | None = typer.Option(
+        None, "--musdb-dir", help="Root MUSDB directory for ground truth lyrics (enables artifact chart)"
+    ),
+):
+    """Generate evaluation plots from job directories.
+
+    To include the artifact quartile chart, pass --alignments-dir, --features-dir,
+    --results-file, and --musdb-dir. The word-level dataset is built in memory.
+    """
+    word_dataset = None
+    artifact_opts = [alignments_dir, features_dir, results_file, musdb_dir]
+    if all(opt is not None for opt in artifact_opts):
+        word_dataset = correlation.build_dataset(
+            alignments_dir, features_dir, results_file, musdb_dir
+        )
+    elif any(opt is not None for opt in artifact_opts):
+        logger.warning(
+            "Artifact chart requires all four options: --alignments-dir, --features-dir, "
+            "--results-file, and --musdb-dir. Skipping artifact chart."
+        )
+    plots.generate_all_plots(jobs_dir, output_dir, word_dataset=word_dataset)
+
+
 @artifacts_app.command("extract")
-def artifact_extract(musdb_dir: Path = typer.Option(..., "--musdb-dir"),
-    output_dir: Path = typer.Option(..., "--output-dir")):
+def artifact_extract(
+    musdb_dir: Path = typer.Option(..., "--musdb-dir", help="Root MUSDB directory"),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Directory to write artifact feature JSON files"),
+):
+    """Extract per-frame artifact features for each song."""
     extractor.process_dataset(musdb_dir, output_dir)
 
 
-
-@artifacts_app.command("prepare")
-def montreal_alignment_prepare(musdb_dir: Path = typer.Option(
-        ..., "--musdb-dir", help="Root MUSDB directory"
-    ),
-    prep_dir: Path = typer.Option(
-        ..., "--prep-dir", help="Output directory for Montreal Force Alignment input files"
-    )):
-    processor.prepare_mfa_inputs(musdb_dir, prep_dir)
-    
-
-@artifacts_app.command("parse")
-def montreal_alignment_parse(textgrid_dir: Path = typer.Option(
-        ..., "--textgrid-dir", help="Directory containing MFA TextGrid output files"
+@artifacts_app.command("align")
+def artifact_align(
+    musdb_dir: Path = typer.Option(
+        ..., "--musdb-dir", help="Root MUSDB directory containing song subdirectories"
     ),
     output_dir: Path = typer.Option(
         ..., "--output-dir", help="Directory to write per-song alignment JSON files"
-    )):
-    processor.parse_textgrid(textgrid_dir, output_dir)
+    ),
+    dictionary: str = typer.Option(
+        "english_mfa", "--dictionary", help="MFA dictionary name or path"
+    ),
+    acoustic_model: str = typer.Option(
+        "english_mfa", "--acoustic-model", help="MFA acoustic model name or path"
+    ),
+):
+    """Run Montreal Forced Aligner to produce word-level alignments."""
+    processor.align(musdb_dir, output_dir, dictionary=dictionary, acoustic_model=acoustic_model)
 
 
-@artifacts_app.command("build-dataset")
-def correlate_build(
+@artifacts_app.command("build")
+def artifact_build(
     alignments_dir: Path = typer.Option(
         ..., "--alignments-dir", help="Directory of MFA alignment JSON files"
     ),
@@ -462,25 +377,13 @@ def correlate_build(
         ..., "--musdb-dir", help="Root MUSDB directory for ground truth lyrics"
     ),
     output: Path = typer.Option(
-        ..., "--output", help="Path to write the output word-level CSV dataset"
+        ..., "--output", help="Path to write the word-level CSV dataset"
     ),
 ):
     """Build the word-level dataset combining alignments, artifacts, and errors."""
     correlation.build_dataset(
-        alignments_dir, features_dir, results_file, musdb_dir, output
+        alignments_dir, features_dir, results_file, musdb_dir, csv_output=output
     )
-
-@artifacts_app.command("analyse")
-def correlate_analyze(
-    dataset: Path = typer.Option(
-        ..., "--dataset", help="Path to word_dataset.csv from build-dataset"
-    ),
-    output_dir: Path = typer.Option(
-        ..., "--output-dir", help="Directory to write analysis output files"
-    ),
-):
-    """Run correlation analysis on the word-level dataset."""
-    correlation.analyse(dataset, output_dir)
 
 
 

@@ -12,8 +12,10 @@ dependencies = [
     "transformers",
     "nemo_toolkit[asr]",
     "silero-vad",
+    "jiwer",
     "matplotlib",
     "pandas",
+    "Montreal-Forced-Aligner==3.3.9",
 ]
 
 [project.scripts]

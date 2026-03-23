@@ -16,7 +16,7 @@ uv pip install -e . --torch-backend=auto
 
 ## CLI Usage
 
-The LyricScribe CLI contains four subcommands: `lyricscribe dataset` for downloading public ALT datasets, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), `lyricscribe transcribe` for batch ASR transcription, and `lyricscribe evaluate` for transcription quality evaluation.
+The LyricScribe CLI contains five subcommands: `lyricscribe dataset` for downloading public ALT datasets, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), `lyricscribe transcribe` for batch ASR transcription, `lyricscribe evaluate` for transcription quality evaluation and plotting, and `lyricscribe artifacts` for artifact feature extraction and correlation analysis.
 
 <details>
 <summary><h3>lyricscribe dataset</h3></summary>
@@ -256,5 +256,106 @@ Options:
 
 - `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
 - `--output`: Output CSV file path (default: `evaluation_summary.csv`)
+
+#### `lyricscribe evaluate plot`
+
+Generates analysis SVG plots by reading evaluation data directly from job directories. Produces six charts covering baseline WER comparisons, error type breakdowns, error distribution by dataset, and pipeline error-profile shifts.
+
+```bash
+# Core evaluation plots
+uv run lyricscribe evaluate plot \
+    --jobs-dir ./jobs \
+    --output-dir ./plots
+
+# Include the artifact quartile chart (builds word-level data in memory)
+uv run lyricscribe evaluate plot \
+    --jobs-dir ./jobs \
+    --output-dir ./plots \
+    --alignments-dir ./alignments \
+    --features-dir ./features \
+    --results-file ./jobs/whisper_vocals/results.jsonl \
+    --musdb-dir ./dataset/musdb_alt
+```
+
+Options:
+
+- `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
+- `--output-dir`: Directory to save the generated SVG plots (required)
+- `--alignments-dir`: Directory of MFA alignment JSON files (enables artifact chart)
+- `--features-dir`: Directory of artifact feature JSON files (enables artifact chart)
+- `--results-file`: Path to results.jsonl with model transcriptions (enables artifact chart)
+- `--musdb-dir`: Root MUSDB directory for ground truth lyrics (enables artifact chart)
+
+Output files:
+
+| File | Description |
+|------|-------------|
+| `baseline_wer.svg` | Grouped bar chart of WER by dataset configuration & model |
+| `error_type_rates.svg` | Grouped bar chart of normalised insertion/deletion/substitution rates per model |
+| `error_distribution.svg` | Stacked bar chart of error type distribution by model and dataset |
+| `wer_heatmap.svg` | Heatmap of WER across all models × pipeline configurations |
+| `error_type_breakdown.svg` | Stacked percentage bar chart of error type breakdown per model |
+| `pipeline_shift.svg` | Per-model scatter of pipeline error-profile shift vs clean-stems baseline |
+| `artifact_quartile_error.svg` | Line chart of error rate across artifact noise quartiles (requires artifact options) |
+
+</details>
+
+<details>
+<summary><h3>lyricscribe artifacts</h3></summary>
+
+The `artifacts` commands handle artifact feature extraction, Montreal Forced Alignment (MFA) processing, and correlation analysis between audio artifacts and transcription errors. These are used to investigate how separation artifacts (residual instruments bleeding into the vocal stem) affect ASR accuracy.
+
+#### `lyricscribe artifacts extract`
+
+Extracts per-frame artifact features from MUSDB songs by comparing separated vocals against the ground-truth vocal stems. Computes artifact RMS, vocal RMS, artifact-to-signal ratio, spectral centroid, and spectral flatness.
+
+```bash
+uv run lyricscribe artifacts extract \
+    --musdb-dir ./dataset/musdb_alt \
+    --output-dir ./features
+```
+
+Options:
+
+- `--musdb-dir`: Root MUSDB directory (required)
+- `--output-dir`: Directory to write per-song feature JSON files (required)
+
+#### `lyricscribe artifacts align`
+
+Runs Montreal Forced Aligner on the MUSDB dataset to produce word-level alignments. Handles corpus preparation, alignment, and JSON export in a single step using MFA's Python API.
+
+```bash
+uv run lyricscribe artifacts align \
+    --musdb-dir ./dataset/musdb_alt \
+    --output-dir ./alignments
+```
+
+Options:
+
+- `--musdb-dir`: Root MUSDB directory containing song subdirectories (required)
+- `--output-dir`: Directory to write per-song alignment JSON files (required)
+- `--dictionary`: MFA dictionary name or path (default: `english_mfa`)
+- `--acoustic-model`: MFA acoustic model name or path (default: `english_mfa`)
+
+#### `lyricscribe artifacts build`
+
+Builds a word-level CSV dataset that combines MFA alignments, artifact features, ground-truth lyrics, and model transcription errors. Each row represents one word for one model, with the artifact features averaged over that word's time window, the error type (correct, deletion, substitution) from jiwer alignment, and the count of hypothesis words inserted adjacent to this reference word. This CSV is useful for notebook exploration; plotting is handled by `evaluate plot`.
+
+```bash
+uv run lyricscribe artifacts build \
+    --alignments-dir ./alignments \
+    --features-dir ./features \
+    --results-file ./jobs/whisper_vocals/results.jsonl \
+    --musdb-dir ./dataset/musdb_alt \
+    --output ./word_dataset.csv
+```
+
+Options:
+
+- `--alignments-dir`: Directory of MFA alignment JSON files (required)
+- `--features-dir`: Directory of artifact feature JSON files (required)
+- `--results-file`: Path to results.jsonl with model transcriptions (required)
+- `--musdb-dir`: Root MUSDB directory for ground truth lyrics (required)
+- `--output`: Path to write the word-level CSV (required)
 
 </details>

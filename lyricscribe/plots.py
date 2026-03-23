@@ -1,0 +1,697 @@
+import logging
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from lyricscribe.evaluate import collect_evaluation_data
+
+logger = logging.getLogger(__name__)
+
+_MODEL_PALETTE = ["#378ADD", "#1D9E75", "#D85A30", "#7F77DD", "#E24B4A", "#6B6B6B"]
+_ERROR_COLORS = {"sub": "#7F77DD", "del": "#D85A30", "ins": "#1D9E75"}
+
+
+def _apply_style() -> None:
+    """
+    Apply a consistent matplotlib style to all plots.
+
+    Sets font, hides top/right spines, and enables a subtle dashed grid.
+    """
+    plt.rcParams.update(
+        {
+            "font.family": "DejaVu Sans",
+            "font.size": 11,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": True,
+            "grid.alpha": 0.25,
+            "grid.linestyle": "--",
+        }
+    )
+
+
+def _model_label(full_name: str) -> str:
+    """
+    Derive a human-readable label from a HuggingFace model ID.
+
+    Short alphabetic segments (<=3 chars) are uppercased, everything else
+    is title-cased, and hyphens become spaces.
+
+    :param full_name: full model identifier, e.g. ``'openai/whisper-large-v3'``.
+    :returns: readable label, e.g. ``'Whisper Large V3'``.
+    """
+    name = full_name.rsplit("/", 1)[-1]
+    parts = name.split("-")
+    return " ".join(p.upper() if p.isalpha() and len(p) <= 3 else p.title() for p in parts)
+
+
+def _model_colors(models: list[str]) -> dict[str, str]:
+    """
+    Assign a colour from :data:`_MODEL_PALETTE` to each model.
+
+    :param models: ordered list of model identifiers.
+    :returns: mapping of model identifier to hex colour string.
+    """
+    return {m: _MODEL_PALETTE[i % len(_MODEL_PALETTE)] for i, m in enumerate(models)}
+
+
+def _config_label(row: pd.Series) -> str:
+    """
+    Build a multi-line label describing a pipeline configuration.
+
+    The label contains the dataset name and audio filename stem, with
+    ``+vad`` / ``+chunked`` suffixes when those options are enabled.
+
+    :param row: a single row from the evaluation summary DataFrame.
+    :returns: newline-separated label string suitable for tick labels.
+    """
+    stem = Path(row["filename"]).stem
+    label = f"{row['dataset']}\n({stem})"
+    if row.get("vad"):
+        label += "\n+vad"
+    if row.get("chunked"):
+        label += "\n+chunked"
+    return label
+
+
+def plot_baseline_wer(df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Generate a grouped bar chart of WER by dataset configuration and model.
+
+    Each unique (dataset, filename, vad, chunked) combination becomes an
+    x-axis category, and each model gets one bar per category with the WER
+    value annotated above.
+
+    :param df: evaluation summary DataFrame as returned by
+        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
+    :param output_path: file path to write the plot image to.
+    """
+    _apply_style()
+    df = df.copy()
+
+    models = sorted(df["model"].unique())
+    colors = _model_colors(models)
+
+    df["config"] = df.apply(_config_label, axis=1)
+    configs = list(dict.fromkeys(df["config"]))
+
+    x = np.arange(len(configs))
+    n_models = len(models)
+    w = 0.8 / max(n_models, 1)
+
+    fig, ax = plt.subplots(figsize=(max(9, 2 * len(configs)), 5))
+
+    for i, model in enumerate(models):
+        model_df = df[df["model"] == model]
+        wer_map = model_df.groupby("config")["mean_wer"].mean()
+        vals = [wer_map.get(c, 0) for c in configs]
+
+        offset = (i - (n_models - 1) / 2) * w
+        bars = ax.bar(
+            x + offset,
+            [v * 100 for v in vals],
+            w,
+            label=_model_label(model),
+            color=colors[model],
+            edgecolor="white",
+            linewidth=0.5,
+            zorder=3,
+        )
+        for bar, v in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.5,
+                f"{v * 100:.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=colors[model],
+                fontweight="bold",
+            )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(configs, fontsize=10)
+    ax.set_ylabel("Word Error Rate (%)", fontsize=11)
+    ax.set_title(
+        "Baseline WER by Dataset & Model", fontsize=13, fontweight="bold", pad=12
+    )
+    ax.set_ylim(0, 105)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax.legend(frameon=False, fontsize=10)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    logger.info(f"Saved baseline WER plot -> {output_path}")
+
+
+def plot_artifact_quartile_error(
+    quartile_data: list[dict], output_path: Path
+) -> None:
+    """
+    Generate a line chart of error rate across artifact noise quartiles.
+
+    Plots one line per model showing how error rate changes from the
+    cleanest (Q1) to noisiest (Q4) artifact quartile.  The Q4 region is
+    highlighted with a subtle shaded band.
+
+    :param quartile_data: list of quartile summary dicts as returned by
+        :func:`~lyricscribe.transcribe.artifacts.correlation.analyse`.
+    :param output_path: file path to write the plot image to.
+    """
+    _apply_style()
+
+    rows = quartile_data
+    if not rows:
+        logger.warning("No quartile data found, skipping chart")
+        return
+
+    models = sorted(set(r["model"] for r in rows))
+    colors = _model_colors(models)
+    quartile_labels = ["Q1\n(cleanest)", "Q2", "Q3", "Q4\n(noisiest)"]
+    quartile_keys = ["Q1", "Q2", "Q3", "Q4"]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    x = np.arange(len(quartile_keys))
+
+    for model in models:
+        model_rows = {r["quartile"]: r for r in rows if r["model"] == model}
+        vals = [
+            float(model_rows[q]["error_rate"]) if q in model_rows else 0
+            for q in quartile_keys
+        ]
+
+        ax.plot(
+            x,
+            [v * 100 for v in vals],
+            "-o",
+            color=colors[model],
+            label=_model_label(model),
+            linewidth=2.5,
+            markersize=8,
+            zorder=3,
+        )
+        if vals[0] > 0 and vals[-1] > 0:
+            delta = (vals[-1] - vals[0]) * 100
+            sign = "+" if delta >= 0 else ""
+            ax.annotate(
+                f"{sign}{delta:.1f}pp",
+                xy=(3, vals[-1] * 100),
+                xytext=(3.08, vals[-1] * 100),
+                va="center",
+                fontsize=8.5,
+                color=colors[model],
+                fontweight="bold",
+            )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(quartile_labels, fontsize=10)
+    ax.set_ylabel("Error Rate (%)", fontsize=11)
+    ax.set_title(
+        "Error Rate Across Artifact Noise Quartiles",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+    )
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax.legend(frameon=False, fontsize=10)
+    ax.set_axisbelow(True)
+
+    ax.axvspan(2.5, 3.5, alpha=0.06, color="#E24B4A", zorder=0)
+    ax.text(
+        3.42,
+        ax.get_ylim()[0] + 1,
+        "high noise",
+        fontsize=8,
+        color="#E24B4A",
+        va="bottom",
+        ha="right",
+    )
+
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    logger.info(f"Saved artifact quartile error plot -> {output_path}")
+
+
+def plot_error_type_rates(df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Generate a grouped bar chart of normalised error type rates per model.
+
+    For each model the mean insertion, deletion, and substitution rates
+    (each as a fraction of total errors) are shown as side-by-side bars
+    with the numeric value annotated above each bar.
+
+    :param df: evaluation summary DataFrame as returned by
+        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
+    :param output_path: file path to write the plot image to.
+    """
+    _apply_style()
+    df = df.copy()
+
+    total_errors = df["substitutions"] + df["insertions"] + df["deletions"]
+    df["insertion_rate"] = df["insertions"] / total_errors
+    df["deletion_rate"] = df["deletions"] / total_errors
+    df["substitution_rate"] = df["substitutions"] / total_errors
+
+    models = sorted(df["model"].unique())
+    colors = _model_colors(models)
+
+    rate_cols = ["insertion_rate", "deletion_rate", "substitution_rate"]
+    rate_labels = ["Insertions", "Deletions", "Substitutions"]
+    rate_colors = [_ERROR_COLORS["ins"], _ERROR_COLORS["del"], _ERROR_COLORS["sub"]]
+
+    agg = df.groupby("model")[rate_cols].mean().reindex(models)
+
+    x = np.arange(len(models))
+    n_bars = len(rate_cols)
+    w = 0.8 / n_bars
+
+    fig, ax = plt.subplots(figsize=(max(8, 2.5 * len(models)), 5))
+
+    for j, (col, label, color) in enumerate(zip(rate_cols, rate_labels, rate_colors)):
+        offset = (j - (n_bars - 1) / 2) * w
+        vals = agg[col].values
+        bars = ax.bar(
+            x + offset,
+            vals,
+            w,
+            label=label,
+            color=color,
+            edgecolor="white",
+            linewidth=0.5,
+            zorder=3,
+        )
+        for bar, v in zip(bars, vals):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + 0.005,
+                f"{v:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                fontweight="bold",
+                color=color,
+            )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([_model_label(m) for m in models], fontsize=10)
+    ax.set_ylabel("Error Type Share", fontsize=11)
+    ax.set_title(
+        "Normalised Insertion, Deletion & Substitution Rates",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+    )
+    ax.legend(frameon=False, fontsize=10)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    logger.info(f"Saved error type rates plot -> {output_path}")
+
+
+def plot_error_distribution(df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Generate a grouped stacked bar chart of error types by model and dataset.
+
+    For every (model, dataset) pair a stacked bar is drawn with insertion,
+    deletion, and substitution rates.  Different datasets are distinguished
+    by varying alpha transparency so multiple datasets can be compared
+    within the same model column.
+
+    :param df: evaluation summary DataFrame as returned by
+        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
+    :param output_path: file path to write the plot image to.
+    """
+    _apply_style()
+    df = df.copy()
+
+    total_errors = df["substitutions"] + df["insertions"] + df["deletions"]
+    df["insertion_rate"] = df["insertions"] / total_errors
+    df["deletion_rate"] = df["deletions"] / total_errors
+    df["substitution_rate"] = df["substitutions"] / total_errors
+
+    grouped = df.groupby(["model", "dataset"])[
+        ["insertion_rate", "deletion_rate", "substitution_rate"]
+    ].mean()
+
+    models = grouped.index.get_level_values("model").unique()
+    datasets = grouped.index.get_level_values("dataset").unique()
+    model_labels = [_model_label(m) for m in models]
+
+    stack_colors = {
+        "ins": "#a90000",
+        "del": "#004a8b",
+        "sub": "#009639",
+    }
+
+    fig, ax = plt.subplots(figsize=(max(10, 3 * len(models)), 6))
+    x = np.arange(len(models))
+    width = 0.8 / max(len(datasets), 1)
+
+    for i, dataset in enumerate(datasets):
+        subset = grouped.xs(dataset, level="dataset").reindex(models)
+        alpha = 0.3 + i * (0.7 / max(len(datasets) - 1, 1))
+        ins = subset["insertion_rate"].values
+        dels = subset["deletion_rate"].values
+        subs = subset["substitution_rate"].values
+
+        ax.bar(
+            x + i * width, ins, width,
+            label=f"{dataset} - insertions",
+            color=stack_colors["ins"], alpha=alpha, zorder=3,
+        )
+        ax.bar(
+            x + i * width, dels, width,
+            label=f"{dataset} - deletions",
+            color=stack_colors["del"], alpha=alpha, bottom=ins, zorder=3,
+        )
+        ax.bar(
+            x + i * width, subs, width,
+            label=f"{dataset} - substitutions",
+            color=stack_colors["sub"], alpha=alpha, bottom=ins + dels, zorder=3,
+        )
+
+    ax.set_xticks(x + width * (len(datasets) - 1) / 2)
+    ax.set_xticklabels(model_labels, fontsize=12)
+    ax.set_ylabel("Error Type Share", fontsize=11)
+    ax.set_title(
+        "Error Type Distribution by Model and Dataset",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+    )
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    logger.info(f"Saved error distribution plot -> {output_path}")
+
+
+def plot_wer_heatmap(df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Generate a heatmap of WER across models and pipeline configurations.
+
+    Models are placed on the y-axis and pipeline configurations on the
+    x-axis.  Each cell is colour-coded on a red-yellow-green scale
+    (green = low WER, red = high WER) with the numeric WER annotated
+    inside the cell.
+
+    :param df: evaluation summary DataFrame as returned by
+        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
+    :param output_path: file path to write the plot image to.
+    """
+    _apply_style()
+    df = df.copy()
+
+    def _compact_config(row: pd.Series) -> str:
+        """
+        Build a single-line config label for heatmap columns.
+
+        :param row: a single row from the evaluation summary DataFrame.
+        :returns: compact label string, e.g. ``'jam-alt / mix (+vad)'``.
+        """
+        stem = Path(row["filename"]).stem
+        label = f"{row['dataset']} / {stem}"
+        flags = []
+        if row.get("vad"):
+            flags.append("vad")
+        if row.get("chunked"):
+            flags.append("chunked")
+        if flags:
+            label += f" (+{', '.join(flags)})"
+        return label
+
+    df["config"] = df.apply(_compact_config, axis=1)
+
+    models = sorted(df["model"].unique())
+    configs = list(dict.fromkeys(df["config"]))
+
+    pivot = df.pivot_table(
+        values="mean_wer", index="model", columns="config", aggfunc="mean"
+    )
+    pivot = pivot.reindex(index=models, columns=configs)
+    matrix = pivot.values * 100
+
+    model_labels = [_model_label(m) for m in models]
+
+    fig_width = max(8, 1.4 * len(configs))
+    fig_height = max(4, 0.8 * len(models) + 2)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    cmap = plt.cm.RdYlGn_r
+    im = ax.imshow(matrix, cmap=cmap, aspect="auto")
+
+    for i in range(len(models)):
+        for j in range(len(configs)):
+            val = matrix[i, j]
+            if np.isnan(val):
+                continue
+            text_color = "white" if val > 70 or val < 30 else "black"
+            ax.text(
+                j,
+                i,
+                f"{val:.1f}%",
+                ha="center",
+                va="center",
+                fontsize=9,
+                fontweight="bold",
+                color=text_color,
+            )
+
+    ax.set_xticks(np.arange(len(configs)))
+    ax.set_xticklabels(configs, fontsize=9, rotation=35, ha="right")
+    ax.set_yticks(np.arange(len(models)))
+    ax.set_yticklabels(model_labels, fontsize=10)
+    ax.set_title(
+        "WER Across Models & Pipeline Configurations",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+    )
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+    cbar.set_label("WER (%)", fontsize=10)
+    cbar.ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    logger.info(f"Saved WER heatmap -> {output_path}")
+
+
+def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Generate a stacked bar chart of error type percentages per model.
+
+    Aggregates insertions, deletions, and substitutions across all jobs
+    for each model and displays them as a single 100% stacked bar with
+    percentage labels inside each segment.
+
+    :param df: evaluation summary DataFrame as returned by
+        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
+    :param output_path: file path to write the plot image to.
+    """
+    _apply_style()
+
+    agg = df.groupby("model")[["insertions", "deletions", "substitutions"]].sum()
+    models = agg.index.tolist()
+
+    ins = agg["insertions"].values.astype(float)
+    dels = agg["deletions"].values.astype(float)
+    subs = agg["substitutions"].values.astype(float)
+    totals = ins + dels + subs
+
+    ins_p = ins / totals * 100
+    dels_p = dels / totals * 100
+    subs_p = subs / totals * 100
+
+    model_labels = [_model_label(m).replace(" ", "\n", 1) for m in models]
+    x = np.arange(len(models))
+    bar_w = min(0.45, 0.8 / max(len(models), 1))
+
+    fig, ax = plt.subplots(figsize=(max(6.5, 2 * len(models)), 5))
+    ax.bar(
+        x, subs_p, bar_w, label="Substitutions", color=_ERROR_COLORS["sub"], zorder=3
+    )
+    ax.bar(
+        x,
+        dels_p,
+        bar_w,
+        bottom=subs_p,
+        label="Deletions",
+        color=_ERROR_COLORS["del"],
+        zorder=3,
+    )
+    ax.bar(
+        x,
+        ins_p,
+        bar_w,
+        bottom=subs_p + dels_p,
+        label="Insertions",
+        color=_ERROR_COLORS["ins"],
+        zorder=3,
+        linewidth=0,
+    )
+
+    for i in range(len(models)):
+        mid_sub = subs_p[i] / 2
+        mid_del = subs_p[i] + dels_p[i] / 2
+        mid_ins = subs_p[i] + dels_p[i] + ins_p[i] / 2
+        for mid, val in [
+            (mid_sub, subs_p[i]),
+            (mid_del, dels_p[i]),
+            (mid_ins, ins_p[i]),
+        ]:
+            if val > 5:
+                ax.text(
+                    i,
+                    mid,
+                    f"{val:.0f}%",
+                    ha="center",
+                    va="center",
+                    fontsize=9.5,
+                    fontweight="bold",
+                    color="white",
+                )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_labels, fontsize=10)
+    ax.set_ylabel("% of total errors", fontsize=11)
+    ax.set_title(
+        "Error Type Breakdown by Model", fontsize=13, fontweight="bold", pad=12
+    )
+    ax.set_ylim(0, 108)
+    ax.legend(frameon=False, fontsize=10, loc="upper right")
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    logger.info(f"Saved error type breakdown plot -> {output_path}")
+
+
+def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Generate per-model scatter plots of pipeline error-profile shifts.
+
+    For each model a scatter plot shows how every pipeline configuration
+    shifts the insertion and deletion proportions relative to a baseline
+    (clean stems, no VAD, no chunking).  Each point is annotated with
+    its pipeline descriptor, and dashed cross-hairs mark the zero-delta
+    axes.
+
+    :param df: evaluation summary DataFrame as returned by
+        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
+    :param output_path: file path to write the plot image to.
+    """
+    _apply_style()
+    df = df.copy()
+    total_errors = df["substitutions"] + df["insertions"] + df["deletions"]
+    df["insertion_prop"] = df["insertions"] / total_errors
+    df["deletion_prop"] = df["deletions"] / total_errors
+
+    models = sorted(df["model"].unique())
+    colors = _model_colors(models)
+    fig, axes = plt.subplots(
+        len(models), 1, figsize=(12, 6 * len(models)), squeeze=False
+    )
+
+    for ax_row, model_id in zip(axes, models):
+        ax = ax_row[0]
+        m = df[df["model"] == model_id].copy()
+
+        baseline_mask = (
+            (m["filename"] == "vocals.wav") & (~m["vad"]) & (~m["chunked"])
+        )
+        if not baseline_mask.any():
+            baseline_mask = m.index == m.index[0]
+
+        baseline = m.loc[baseline_mask].iloc[0]
+        m["d_insertion"] = m["insertion_prop"] - baseline["insertion_prop"]
+        m["d_deletion"] = m["deletion_prop"] - baseline["deletion_prop"]
+
+        m["pipeline"] = (
+            m["filename"]
+            + " | vad:"
+            + m["vad"].astype(str)
+            + " | chunked:"
+            + m["chunked"].astype(str)
+        )
+
+        ax.scatter(m["d_insertion"], m["d_deletion"], s=60, color=colors[model_id])
+        for _, row in m.iterrows():
+            ax.annotate(
+                row["pipeline"],
+                (row["d_insertion"], row["d_deletion"]),
+                fontsize=6,
+                textcoords="offset points",
+                xytext=(4, 4),
+            )
+
+        ax.axhline(0, color="black", linewidth=0.7, linestyle="--")
+        ax.axvline(0, color="black", linewidth=0.7, linestyle="--")
+        ax.set_title(_model_label(model_id), fontsize=12, fontweight="bold")
+        ax.set_xlabel("Δ Insertion Proportion")
+        ax.set_ylabel("Δ Deletion Proportion")
+
+    fig.suptitle(
+        "How each pipeline shifts the error profile vs. clean-stems baseline",
+        fontsize=13,
+        fontweight="bold",
+    )
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    logger.info(f"Saved pipeline shift plot -> {output_path}")
+
+
+def generate_all_plots(
+    jobs_dir: Path,
+    output_dir: Path,
+    word_dataset: list[dict] | None = None,
+) -> None:
+    """
+    Collect evaluation data from job directories and produce all analysis plots.
+
+    Reads transcription job results from *jobs_dir*, computes evaluation
+    metrics, and writes SVG plots into *output_dir*.  If *word_dataset*
+    is provided, quartile analysis is computed in-memory and an additional
+    artifact quartile error chart is generated.
+
+    :param jobs_dir: root directory containing transcription job
+        subdirectories with ``config.json`` and ``results*.jsonl`` files.
+    :param output_dir: directory to write the generated SVG plot files
+        into.  Created if it does not exist.
+    :param word_dataset: optional word-level dataset as returned by
+        :func:`~lyricscribe.transcribe.artifacts.correlation.build_dataset`.
+        When provided, the artifact quartile error chart is included.
+    """
+    from lyricscribe.transcribe.artifacts.correlation import analyse
+
+    all_stats = collect_evaluation_data(jobs_dir)
+    if not all_stats:
+        logger.error("No evaluation data found in job directories.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(all_stats)
+
+    plot_baseline_wer(df, output_dir / "baseline_wer.svg")
+    plot_error_type_rates(df, output_dir / "error_type_rates.svg")
+    plot_error_distribution(df, output_dir / "error_distribution.svg")
+    plot_wer_heatmap(df, output_dir / "wer_heatmap.svg")
+    plot_error_type_breakdown(df, output_dir / "error_type_breakdown.svg")
+    plot_pipeline_shift(df, output_dir / "pipeline_shift.svg")
+
+    if word_dataset is not None:
+        quartile_data = analyse(word_dataset)
+        plot_artifact_quartile_error(
+            quartile_data, output_dir / "artifact_quartile_error.svg"
+        )
+
+    logger.info(f"All plots saved to {output_dir}")
