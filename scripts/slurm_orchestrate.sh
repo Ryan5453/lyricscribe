@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/bin/bash -l
+# Login shell: ensure `module` exists on batch compute nodes (see slurm_transcribe.sh).
 #SBATCH --job-name=lyricscribe_orchestrate
 #SBATCH --output=/projects/fahey.rya/music2text/logs/transcription/orchestrate_%j.out
 #SBATCH --time=48:00:00

@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/bin/bash -l
+# Login shell: ensure `module` exists on batch compute nodes (see slurm_transcribe.sh).
 #SBATCH --job-name=lyricscribe_separate
 #SBATCH --output=/projects/fahey.rya/music2text/logs/separation/separate_%j.out
 #SBATCH --time=8:00:00

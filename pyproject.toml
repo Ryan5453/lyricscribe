@@ -11,6 +11,8 @@ dependencies = [
     "pydantic",
     "transformers",
     "nemo_toolkit[asr]",
+    "lhotse>=1.32",
+    "numpy<2",
     "antlr4-python3-runtime==4.9.3",
     "silero-vad",
     "jiwer",

@@ -1,4 +1,8 @@
-#!/bin/bash
+#!/bin/bash -l
+# Use a login shell so Environment Modules are initialized (same as
+# `srun ... bash -l -c 'module load ...'`). Plain `#!/bin/bash` jobs often
+# have no `module` function on compute nodes, so `module load FFmpeg` does
+# nothing and ffmpeg is missing from PATH for Transformers/pydub.
 #SBATCH --job-name=lyricscribe_transcribe
 #SBATCH --output=/projects/fahey.rya/music2text/logs/transcription/transcribe_%j.out
 #SBATCH --time=8:00:00
