@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "typer",
     "demucs-next @ git+https://github.com/Ryan5453/demucs-next.git",
-    "datasets",
+    "datasets>=3.0",
     "pydantic",
     "transformers",
     "nemo_toolkit[asr]",
