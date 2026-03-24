@@ -43,6 +43,11 @@ package = true
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+torchaudio = { index = "pytorch-cu129" }
 
 [tool.ruff]
 lint.extend-select = ["I"]
