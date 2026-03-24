@@ -36,5 +36,9 @@ dev = [
 [tool.uv]
 package = true
 
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+
 [tool.ruff]
 lint.extend-select = ["I"]

@@ -4,14 +4,16 @@
 
 ## Installation
 
+
 Assuming you have [uv](https://docs.astral.sh/uv/) installed, run:
 ```bash
 git clone https://github.com/Ryan5453/lyricscribe
 cd lyricscribe
-uv venv
+uv sync
 source .venv/bin/activate
-uv pip install -e . --torch-backend=auto
 ```
+
+Note: The project is configured for CUDA 12.9 (`cu129`). If you need a different CUDA version, update the `[[tool.uv.index]]` URL in `pyproject.toml` (e.g. `cu126` for CUDA 12.6).
 
 ## CLI Usage
 
