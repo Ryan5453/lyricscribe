@@ -80,6 +80,11 @@ while true; do
         JOB_DIR="${JOB_DIRS[$NEXT]}"
         CHUNK_ID="${CHUNK_IDS[$NEXT]}"
 
+        if [ -z "${RESET_DIRS[$JOB_DIR]+x}" ]; then
+            lyricscribe transcribe reset --job-dir "$JOB_DIR"
+            RESET_DIRS[$JOB_DIR]=1
+        fi
+
         # Submit with retries for transient SLURM errors
         MAX_RETRIES=5
         RETRY_COUNT=0
