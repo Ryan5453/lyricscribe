@@ -219,17 +219,6 @@ def plot_artifact_quartile_error(
     ax.legend(frameon=False, fontsize=10)
     ax.set_axisbelow(True)
 
-    ax.axvspan(2.5, 3.5, alpha=0.06, color="#E24B4A", zorder=0)
-    ax.text(
-        3.42,
-        ax.get_ylim()[0] + 1,
-        "high noise",
-        fontsize=8,
-        color="#E24B4A",
-        va="bottom",
-        ha="right",
-    )
-
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)

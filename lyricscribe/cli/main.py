@@ -26,6 +26,43 @@ artifacts_app = typer.Typer(help = "Artifacts feature extraction commands")
 cli.add_typer(artifacts_app, name="artifacts")
 
 
+def _collect_result_files(
+    explicit_results: list[Path] | None,
+    *,
+    jobs_dir: Path | None = None,
+    job_name: str | None = None,
+) -> list[Path]:
+    """
+    Resolve one or more result files from explicit paths and/or a shared job name.
+
+    When ``job_name`` is provided, discovers ``results*.jsonl`` files from
+    ``jobs_dir/*/<job_name>/`` and returns them in sorted order.
+    """
+    result_files: list[Path] = list(explicit_results or [])
+
+    if job_name:
+        if jobs_dir is None:
+            raise ValueError("--results-job-name requires --results-jobs-dir or --jobs-dir")
+        discovered = sorted(jobs_dir.glob(f"*/{job_name}/results*.jsonl"))
+        if not discovered:
+            raise ValueError(
+                f"No result files found for job '{job_name}' under {jobs_dir}"
+            )
+        result_files.extend(discovered)
+
+    # Preserve order while deduplicating.
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in result_files:
+        resolved = path.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(resolved)
+
+    return unique
+
+
 @cli.callback()
 def _setup_logging():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -308,8 +345,13 @@ def evaluate_plot(
     features_dir: Path | None = typer.Option(
         None, "--features-dir", help="Directory of artifact feature JSON files (enables artifact chart)"
     ),
-    results_file: Path | None = typer.Option(
-        None, "--results-file", help="Path to results.jsonl with model transcriptions (enables artifact chart)"
+    results_file: list[Path] = typer.Option(
+        None, "--results-file", help="Path to results.jsonl with model transcriptions; repeat to include multiple models (enables artifact chart)"
+    ),
+    results_job_name: str | None = typer.Option(
+        None,
+        "--results-job-name",
+        help="Job subdirectory name to auto-discover results*.jsonl across all model directories under --jobs-dir",
     ),
     musdb_dir: Path | None = typer.Option(
         None, "--musdb-dir", help="Root MUSDB directory for ground truth lyrics (enables artifact chart)"
@@ -318,18 +360,26 @@ def evaluate_plot(
     """Generate evaluation plots from job directories.
 
     To include the artifact quartile chart, pass --alignments-dir, --features-dir,
-    --results-file, and --musdb-dir. The word-level dataset is built in memory.
+    --results-file, and --musdb-dir. Repeat --results-file to include multiple
+    model result files. The word-level dataset is built in memory.
     """
     word_dataset = None
-    artifact_opts = [alignments_dir, features_dir, results_file, musdb_dir]
-    if all(opt is not None for opt in artifact_opts):
+    result_files = _collect_result_files(
+        results_file,
+        jobs_dir=jobs_dir,
+        job_name=results_job_name,
+    )
+    if alignments_dir is not None and features_dir is not None and musdb_dir is not None and result_files:
         word_dataset = correlation.build_dataset(
-            alignments_dir, features_dir, results_file, musdb_dir
+            alignments_dir, features_dir, result_files, musdb_dir
         )
-    elif any(opt is not None for opt in artifact_opts):
+    elif any(
+        opt is not None for opt in [alignments_dir, features_dir, musdb_dir]
+    ) or result_files or results_job_name:
         logger.warning(
-            "Artifact chart requires all four options: --alignments-dir, --features-dir, "
-            "--results-file, and --musdb-dir. Skipping artifact chart."
+            "Artifact chart requires --alignments-dir, --features-dir, --musdb-dir, "
+            "and either one or more --results-file values or --results-job-name. "
+            "Skipping artifact chart."
         )
     plots.generate_all_plots(jobs_dir, output_dir, word_dataset=word_dataset)
 
@@ -381,8 +431,18 @@ def artifact_build(
     features_dir: Path = typer.Option(
         ..., "--features-dir", help="Directory of artifact feature JSON files"
     ),
-    results_file: Path = typer.Option(
-        ..., "--results-file", help="Path to results.jsonl with model transcriptions"
+    results_file: list[Path] = typer.Option(
+        ..., "--results-file", help="Path to results.jsonl with model transcriptions; repeat to include multiple models"
+    ),
+    results_jobs_dir: Path | None = typer.Option(
+        None,
+        "--results-jobs-dir",
+        help="Jobs root used with --results-job-name to auto-discover results*.jsonl across model directories",
+    ),
+    results_job_name: str | None = typer.Option(
+        None,
+        "--results-job-name",
+        help="Job subdirectory name to auto-discover results*.jsonl across model directories",
     ),
     musdb_dir: Path = typer.Option(
         ..., "--musdb-dir", help="Root MUSDB directory for ground truth lyrics"
@@ -392,8 +452,13 @@ def artifact_build(
     ),
 ):
     """Build the word-level dataset combining alignments, artifacts, and errors."""
+    result_files = _collect_result_files(
+        results_file,
+        jobs_dir=results_jobs_dir,
+        job_name=results_job_name,
+    )
     correlation.build_dataset(
-        alignments_dir, features_dir, results_file, musdb_dir, csv_output=output
+        alignments_dir, features_dir, result_files, musdb_dir, csv_output=output
     )
 
 

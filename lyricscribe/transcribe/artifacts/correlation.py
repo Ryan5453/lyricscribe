@@ -52,23 +52,29 @@ def _load_artifact_features(features_dir: Path) -> dict[str, dict]:
     logger.info(f"Loaded alignment features for {len(features)} songs")
     return features
 
-def _load_results(result_file: Path) -> dict[tuple[str, str], str]:
+def _load_results(result_files: list[Path]) -> dict[tuple[str, str], str]:
     """
-    Load model transcription results from a .jsonl results file.
+    Load model transcription results from one or more .jsonl results files.
 
-    :param result_file: absolute path to a .jsonl file where each line is a JSON object containing song_id, model_name, transcription, and error fields.
+    :param result_files: absolute paths to .jsonl files where each line is a
+        JSON object containing song_id, model_name, transcription, and error fields.
     :returns: Dictionary mapping (song_id, model_name) tuples to transcription strings. Entries with errors or missing transcriptions are skipped.
     """
     results = {}
-    with open(result_file) as f:
-        for line in f:
-            line = line.strip()        
-            if not line:
-                continue    
-            r = json.loads(line)
-            if r.get("transcription") and not r.get("error"):
-                results[(r["song_id"], r["model_name"])] = r["transcription"]
-    logger.info(f"Loaded {len(results)} transcription results")
+    for result_file in result_files:
+        with open(result_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                if r.get("transcription") and not r.get("error"):
+                    results[(r["song_id"], r["model_name"])] = r["transcription"]
+    logger.info(
+        "Loaded %s transcription results from %s result file(s)",
+        len(results),
+        len(result_files),
+    )
     return results
 
 
@@ -162,7 +168,7 @@ def _get_word_error(reference: str, hypothesis: str) -> tuple[dict[int, str], di
 def build_dataset(
     alignment_dir: Path,
     features_dir: Path,
-    results_file: Path,
+    results_files: list[Path],
     musdb_dir: Path,
     *,
     csv_output: Path | None = None,
@@ -177,14 +183,14 @@ def build_dataset(
 
     :param alignment_dir: directory containing MFA alignment .json files.
     :param features_dir: directory containing artifact feature .json files.
-    :param results_file: path to the .jsonl transcription results file.
+    :param results_files: paths to one or more .jsonl transcription results files.
     :param musdb_dir: root MUSDB directory, used to load ground truth lyrics.
     :param csv_output: optional path to also write the dataset as CSV.
     :returns: list of row dicts.
     """
     alignments = _load_alignments(alignment_dir)
     features = _load_artifact_features(features_dir)
-    results = _load_results(results_file)
+    results = _load_results(results_files)
     ground_truth = _load_ground_truth(musdb_dir)
 
     models = sorted(set(model for _, model in results.keys()))

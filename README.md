@@ -275,6 +275,8 @@ uv run lyricscribe evaluate plot \
     --alignments-dir ./alignments \
     --features-dir ./features \
     --results-file ./jobs/whisper_vocals/results.jsonl \
+    --results-file ./jobs/parakeet_vocals/results.jsonl \
+    --results-file ./jobs/canary_vocals/results.jsonl \
     --musdb-dir ./dataset/musdb_alt
 ```
 
@@ -284,7 +286,7 @@ Options:
 - `--output-dir`: Directory to save the generated SVG plots (required)
 - `--alignments-dir`: Directory of MFA alignment JSON files (enables artifact chart)
 - `--features-dir`: Directory of artifact feature JSON files (enables artifact chart)
-- `--results-file`: Path to results.jsonl with model transcriptions (enables artifact chart)
+- `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (enables artifact chart)
 - `--musdb-dir`: Root MUSDB directory for ground truth lyrics (enables artifact chart)
 
 Output files:
@@ -362,6 +364,8 @@ uv run lyricscribe artifacts build \
     --alignments-dir ./alignments \
     --features-dir ./features \
     --results-file ./jobs/whisper_vocals/results.jsonl \
+    --results-file ./jobs/parakeet_vocals/results.jsonl \
+    --results-file ./jobs/canary_vocals/results.jsonl \
     --musdb-dir ./dataset/musdb_alt \
     --output ./word_dataset.csv
 ```
@@ -370,7 +374,7 @@ Options:
 
 - `--alignments-dir`: Directory of MFA alignment JSON files (required)
 - `--features-dir`: Directory of artifact feature JSON files (required)
-- `--results-file`: Path to results.jsonl with model transcriptions (required)
+- `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (required)
 - `--musdb-dir`: Root MUSDB directory for ground truth lyrics (required)
 - `--output`: Path to write the word-level CSV (required)
 
