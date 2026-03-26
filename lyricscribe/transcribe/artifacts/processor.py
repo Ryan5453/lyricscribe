@@ -188,13 +188,10 @@ def align(
             logger.info(f"Running: {runtime} exec ... mfa align ...")
             result = subprocess.run(
                 cmd,
-                capture_output=True,
                 text=True,
                 check=False,
             )
             if result.returncode != 0:
-                logger.error("MFA stderr:\n%s", result.stderr)
-                logger.error("MFA stdout:\n%s", result.stdout)
                 raise RuntimeError(
                     f"MFA align failed with exit code {result.returncode}. "
                     "Check that english_mfa acoustic model and dictionary are "
