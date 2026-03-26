@@ -183,7 +183,6 @@ def align(
                 "--output_format",
                 "json",
                 "--clean",
-                "--quiet",
             ]
 
             logger.info(f"Running: {runtime} exec ... mfa align ...")
