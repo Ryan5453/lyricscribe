@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import torchaudio
+
 logger = logging.getLogger(__name__)
 
 _SILENCE_LABELS = {"", "sp", "sil", "<eps>"}
@@ -17,6 +19,8 @@ _DICTIONARY = "english_mfa"
 _ACOUSTIC_MODEL = "english_mfa"
 _WORK_MOUNT = "/mfa_work"
 _MFA_ROOT_MOUNT = "/mfa_root"
+_SEGMENT_PADDING_S = 0.15
+_MIN_SEGMENT_S = 0.2
 
 
 def _clean_lyrics(text: str) -> str:
@@ -71,6 +75,50 @@ def _find_container_runtime() -> str:
         "Neither 'apptainer' nor 'singularity' was found in PATH. "
         "Load the Singularity/Apptainer module on your cluster, or install Singularity."
     )
+
+
+def _iter_synced_segments(lyrics_data: dict) -> list[dict]:
+    """
+    Return cleaned line-level segments from lyrics.json synced entries.
+
+    Expected input shape is ``lyrics_data["synced"]["data"]`` where each item
+    has ``text``, ``start``, and ``duration`` in milliseconds.
+    """
+    synced = lyrics_data.get("synced", {}).get("data", [])
+    if not isinstance(synced, list):
+        return []
+
+    segments: list[dict] = []
+    for i, entry in enumerate(synced):
+        if not isinstance(entry, dict):
+            continue
+        text = _clean_lyrics(str(entry.get("text", "")))
+        if not text:
+            continue
+
+        try:
+            start_ms = float(entry.get("start", 0))
+            duration_ms = float(entry.get("duration", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if duration_ms <= 0:
+            continue
+
+        start_s = start_ms / 1000.0
+        end_s = (start_ms + duration_ms) / 1000.0
+        if end_s - start_s < _MIN_SEGMENT_S:
+            continue
+
+        segments.append(
+            {
+                "index": i,
+                "text": text,
+                "start_s": start_s,
+                "end_s": end_s,
+            }
+        )
+    return segments
 
 
 def align(
@@ -139,6 +187,8 @@ def align(
             mfa_output.mkdir()
 
             prepared = 0
+            prepared_segments = 0
+            segment_index: dict[str, dict] = {}
             for song_dir in song_dirs:
                 vocals_path = song_dir / "vocals.wav"
                 lyrics_path = song_dir / "lyrics.json"
@@ -152,17 +202,50 @@ def align(
                 with open(lyrics_path) as f:
                     lyrics_data = json.load(f)
 
-                text = lyrics_data.get("unsynced", {}).get("data", "")
-                if not text:
-                    logger.warning(f"Empty lyrics for {song_dir.name}")
+                segments = _iter_synced_segments(lyrics_data)
+                if not segments:
+                    logger.warning(f"No usable synced lyric segments for {song_dir.name}")
                     continue
 
                 name = song_dir.name
-                shutil.copy2(vocals_path, corpus_dir / f"{name}.wav")
-                (corpus_dir / f"{name}.lab").write_text(_clean_lyrics(text))
+                waveform, sample_rate = torchaudio.load(vocals_path)
+                num_frames = waveform.shape[1]
+
+                for segment in segments:
+                    start_s = max(0.0, segment["start_s"] - _SEGMENT_PADDING_S)
+                    end_s = min(
+                        num_frames / sample_rate,
+                        segment["end_s"] + _SEGMENT_PADDING_S,
+                    )
+                    if end_s - start_s < _MIN_SEGMENT_S:
+                        continue
+
+                    start_frame = max(0, int(start_s * sample_rate))
+                    end_frame = min(num_frames, int(end_s * sample_rate))
+                    if end_frame <= start_frame:
+                        continue
+
+                    utterance_id = f"{name}__seg{segment['index']:04d}"
+                    segment_waveform = waveform[:, start_frame:end_frame]
+                    torchaudio.save(
+                        str(corpus_dir / f"{utterance_id}.wav"),
+                        segment_waveform,
+                        sample_rate,
+                    )
+                    (corpus_dir / f"{utterance_id}.lab").write_text(segment["text"])
+                    segment_index[utterance_id] = {
+                        "song_id": name,
+                        "offset_s": start_s,
+                    }
+                    prepared_segments += 1
+
                 prepared += 1
 
-            logger.info(f"Prepared {prepared} songs for MFA alignment")
+            logger.info(
+                "Prepared %s songs and %s synced lyric segments for MFA alignment",
+                prepared,
+                prepared_segments,
+            )
 
             cmd: list[str] = [
                 runtime,
@@ -198,10 +281,29 @@ def align(
                     "downloaded in your --mfa-root directory."
                 )
 
-            success = 0
+            song_words: dict[str, list[dict]] = {}
             for json_path in sorted(mfa_output.glob("**/*.json")):
-                song_id = json_path.stem
+                utterance_id = json_path.stem
+                if utterance_id not in segment_index:
+                    logger.warning("Skipping unexpected MFA output: %s", utterance_id)
+                    continue
+
                 words = _parse_mfa_json(json_path)
+                mapping = segment_index[utterance_id]
+                song_id = mapping["song_id"]
+                offset_s = mapping["offset_s"]
+                song_words.setdefault(song_id, []).extend(
+                    {
+                        "word": word["word"],
+                        "start": word["start"] + offset_s,
+                        "end": word["end"] + offset_s,
+                    }
+                    for word in words
+                )
+
+            success = 0
+            for song_id, words in sorted(song_words.items()):
+                words.sort(key=lambda x: (x["start"], x["end"]))
                 out_path = output_dir / f"{song_id}.json"
                 out_path.write_text(
                     json.dumps(
