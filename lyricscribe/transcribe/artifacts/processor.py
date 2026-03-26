@@ -38,7 +38,21 @@ def _parse_mfa_json(json_path: Path) -> list[dict]:
         data = json.load(f)
 
     words: list[dict] = []
-    for tier in data.get("tiers", []):
+    tiers = data.get("tiers", [])
+
+    # MFA JSON has appeared in two shapes:
+    # 1) a list of tier objects with {"name": ..., "entries": ...}
+    # 2) a dict keyed by tier name, e.g. {"words": {"entries": ...}, ...}
+    if isinstance(tiers, dict):
+        word_tier = tiers.get("words", {})
+        entries = word_tier.get("entries", [])
+        for entry in entries:
+            start, end, label = entry[0], entry[1], entry[2]
+            if label not in _SILENCE_LABELS:
+                words.append({"word": label, "start": start, "end": end})
+        return words
+
+    for tier in tiers:
         if tier.get("name") != "words":
             continue
         for entry in tier.get("entries", []):
