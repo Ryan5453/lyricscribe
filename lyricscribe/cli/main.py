@@ -337,7 +337,7 @@ def evaluate_plot(
         ..., "--jobs-dir", help="Path to base jobs directory containing model subdirectories"
     ),
     output_dir: Path = typer.Option(
-        ..., "--output-dir", help="Directory to save the generated SVG plots"
+        ..., "--output-dir", help="Directory to save the generated PDF plots"
     ),
     alignments_dir: Path | None = typer.Option(
         None, "--alignments-dir", help="Directory of MFA alignment JSON files (enables artifact chart)"

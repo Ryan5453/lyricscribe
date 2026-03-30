@@ -260,7 +260,7 @@ Options:
 
 #### `lyricscribe evaluate plot`
 
-Generates analysis SVG plots by reading evaluation data directly from job directories. Produces six charts covering baseline WER comparisons, error type breakdowns, error distribution by dataset, and pipeline error-profile shifts.
+Generates analysis PDF plots by reading evaluation data directly from job directories. Produces six charts covering baseline WER comparisons, error type breakdowns, error distribution by dataset, and pipeline error-profile shifts.
 
 ```bash
 # Core evaluation plots
@@ -283,7 +283,7 @@ uv run lyricscribe evaluate plot \
 Options:
 
 - `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
-- `--output-dir`: Directory to save the generated SVG plots (required)
+- `--output-dir`: Directory to save the generated PDF plots (required)
 - `--alignments-dir`: Directory of MFA alignment JSON files (enables artifact chart)
 - `--features-dir`: Directory of artifact feature JSON files (enables artifact chart)
 - `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (enables artifact chart)
@@ -293,13 +293,13 @@ Output files:
 
 | File | Description |
 |------|-------------|
-| `baseline_wer.svg` | Grouped bar chart of WER by dataset configuration & model |
-| `error_type_rates.svg` | Grouped bar chart of normalised insertion/deletion/substitution rates per model |
-| `error_distribution.svg` | Stacked bar chart of error type distribution by model and dataset |
-| `wer_heatmap.svg` | Heatmap of WER across all models × pipeline configurations |
-| `error_type_breakdown.svg` | Stacked percentage bar chart of error type breakdown per model |
-| `pipeline_shift.svg` | Per-model scatter of pipeline error-profile shift vs clean-stems baseline |
-| `artifact_quartile_error.svg` | Line chart of error rate across artifact noise quartiles (requires artifact options) |
+| `baseline_wer.pdf` | Grouped bar chart of WER by dataset configuration & model |
+| `error_type_rates.pdf` | Grouped bar chart of normalised insertion/deletion/substitution rates per model |
+| `error_distribution.pdf` | Stacked bar chart of error type distribution by model and dataset |
+| `wer_heatmap.pdf` | Heatmap of WER across all models × pipeline configurations |
+| `error_type_breakdown.pdf` | Stacked percentage bar chart of error type breakdown per model |
+| `pipeline_shift.pdf` | Per-model scatter of pipeline error-profile shift vs clean-stems baseline |
+| `artifact_quartile_error.pdf` | Line chart of error rate across artifact noise quartiles (requires artifact options) |
 
 </details>
 

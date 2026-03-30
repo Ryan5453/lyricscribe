@@ -648,13 +648,13 @@ def generate_all_plots(
     Collect evaluation data from job directories and produce all analysis plots.
 
     Reads transcription job results from *jobs_dir*, computes evaluation
-    metrics, and writes SVG plots into *output_dir*.  If *word_dataset*
+    metrics, and writes PDF plots into *output_dir*.  If *word_dataset*
     is provided, quartile analysis is computed in-memory and an additional
     artifact quartile error chart is generated.
 
     :param jobs_dir: root directory containing transcription job
         subdirectories with ``config.json`` and ``results*.jsonl`` files.
-    :param output_dir: directory to write the generated SVG plot files
+    :param output_dir: directory to write the generated PDF plot files
         into.  Created if it does not exist.
     :param word_dataset: optional word-level dataset as returned by
         :func:`~lyricscribe.transcribe.artifacts.correlation.build_dataset`.
@@ -670,17 +670,17 @@ def generate_all_plots(
     output_dir.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(all_stats)
 
-    plot_baseline_wer(df, output_dir / "baseline_wer.svg")
-    plot_error_type_rates(df, output_dir / "error_type_rates.svg")
-    plot_error_distribution(df, output_dir / "error_distribution.svg")
-    plot_wer_heatmap(df, output_dir / "wer_heatmap.svg")
-    plot_error_type_breakdown(df, output_dir / "error_type_breakdown.svg")
-    plot_pipeline_shift(df, output_dir / "pipeline_shift.svg")
+    plot_baseline_wer(df, output_dir / "baseline_wer.pdf")
+    plot_error_type_rates(df, output_dir / "error_type_rates.pdf")
+    plot_error_distribution(df, output_dir / "error_distribution.pdf")
+    plot_wer_heatmap(df, output_dir / "wer_heatmap.pdf")
+    plot_error_type_breakdown(df, output_dir / "error_type_breakdown.pdf")
+    plot_pipeline_shift(df, output_dir / "pipeline_shift.pdf")
 
     if word_dataset is not None:
         quartile_data = analyse(word_dataset)
         plot_artifact_quartile_error(
-            quartile_data, output_dir / "artifact_quartile_error.svg"
+            quartile_data, output_dir / "artifact_quartile_error.pdf"
         )
 
     logger.info(f"All plots saved to {output_dir}")
