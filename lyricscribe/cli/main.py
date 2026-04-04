@@ -551,8 +551,13 @@ def finetune_setup(
     job_dir = Path(config['output_dir']) / config['exp_name']
     job_dir.mkdir(parents=True, exist_ok=True)
     train_manifest = job_dir / "train_manifest.jsonl"
-    n_train = finetune_data.create_nemo_manifest(train_dataset, train_manifest)
-    logger.info(f"Training: {n_train} songs")
+
+    if config['architecture'] == 'whisper':
+        n_train = finetune_data.create_whisper_manifest(train_dataset, train_manifest)
+        logger.info(f"Training: {n_train} chunks (Whisper 30s segments)")
+    else:
+        n_train = finetune_data.create_manifest(train_dataset, train_manifest)
+        logger.info(f"Training: {n_train} songs")
 
     val_manifest = None
     if val_dir:
@@ -561,8 +566,12 @@ def finetune_setup(
             filenames=config['filenames'],
         )
         val_manifest = job_dir / "val_manifest.jsonl"
-        n_val = finetune_data.create_nemo_manifest(val_dataset, val_manifest)
-        logger.info(f"Validation: {n_val} songs")
+        if config['architecture'] == 'whisper':
+            n_val = finetune_data.create_whisper_manifest(val_dataset, val_manifest)
+            logger.info(f"Validation: {n_val} chunks")
+        else:
+            n_val = finetune_data.create_manifest(val_dataset, val_manifest)
+            logger.info(f"Validation: {n_val} songs")
     
     finetune_jobs.setup_finetune_job(config, train_manifest, val_manifest)
 

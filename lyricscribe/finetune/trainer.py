@@ -56,37 +56,37 @@ class NeMoTrainer:
 
         cfg = self.model.cfg
 
-        with OmegaConf.read_write(cfg):
-            with OmegaConf.open_dict(cfg):
-                cfg.train_ds.manifest_filepath = str(train_manifest)
-                cfg.train_ds.batch_size = self.config["batch_size"]
-                cfg.train_ds.shuffle = True
-                cfg.train_ds.num_workers = 4
+        # Use struct override to allow setting keys that may not exist in the config
+        OmegaConf.set_struct(cfg, False)
 
-                if val_manifest:
-                    cfg.validation_ds.manifest_filepath = str(val_manifest)
-                    cfg.validation_ds.batch_size = self.config["batch_size"]
-                    cfg.validation_ds.num_workers = 4
+        cfg.train_ds.manifest_filepath = str(train_manifest)
+        cfg.train_ds.batch_size = self.config["batch_size"]
+        cfg.train_ds.shuffle = True
+        cfg.train_ds.num_workers = 4
 
-                if self.config.get("use_augmentation", True):
-                    cfg.spec_augment.freq_masks = 2
-                    cfg.spec_augment.freq_width = 27
-                    cfg.spec_augment.time_masks = 10
-                    cfg.spec_augment.time_width = 0.05
-                else:
-                    cfg.spec_augment.freq_masks = 0
-                    cfg.spec_augment.time_masks = 0
+        if val_manifest:
+            cfg.validation_ds.manifest_filepath = str(val_manifest)
+            cfg.validation_ds.batch_size = self.config["batch_size"]
+            cfg.validation_ds.num_workers = 4
+
+        if self.config.get("use_augmentation", True):
+            cfg.spec_augment.freq_masks = 2
+            cfg.spec_augment.freq_width = 27
+            cfg.spec_augment.time_masks = 10
+            cfg.spec_augment.time_width = 0.05
+        else:
+            cfg.spec_augment.freq_masks = 0
+            cfg.spec_augment.time_masks = 0
 
         self.model.setup_training_data(cfg.train_ds)
         if val_manifest:
             self.model.setup_validation_data(cfg.validation_ds)
 
         # Configure optimizer and scheduler once across all chunks
-        with OmegaConf.read_write(cfg):
-            cfg.optim.name = "adamw"
-            cfg.optim.lr = self.config["learning_rate"]
-            cfg.optim.weight_decay = 0.01
-            cfg.optim.sched.name = "CosineAnnealing"
+        cfg.optim.name = "adamw"
+        cfg.optim.lr = self.config["learning_rate"]
+        cfg.optim.weight_decay = 0.01
+        cfg.optim.sched.name = "CosineAnnealing"
 
         num_train_samples = _count_manifest_lines(self.train_manifest)
         steps_per_epoch = math.ceil(num_train_samples / self.config["batch_size"])
@@ -156,7 +156,24 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         entry = self.entries[idx]
-        audio, sr = torchaudio.load(entry["audio_filepath"])
+
+        # Load audio slice if offset/duration are present (chunked manifest)
+        offset = entry.get("offset", 0)
+        duration = entry.get("duration")
+
+        if offset > 0 or duration is not None:
+            # Get sample rate first to compute frame offsets
+            info = torchaudio.info(entry["audio_filepath"])
+            frame_offset = int(offset * info.sample_rate)
+            num_frames = int(duration * info.sample_rate) if duration else -1
+            audio, sr = torchaudio.load(
+                entry["audio_filepath"],
+                frame_offset=frame_offset,
+                num_frames=num_frames,
+            )
+        else:
+            audio, sr = torchaudio.load(entry["audio_filepath"])
+
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0)
         else:
