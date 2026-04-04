@@ -6,6 +6,7 @@ from pathlib import Path
 
 import jiwer
 import nemo.collections.asr as nemo_asr
+from omegaconf import OmegaConf
 import pytorch_lightning as pl
 import torch
 import torchaudio
@@ -54,34 +55,38 @@ class NeMoTrainer:
             computer.cuda_graphs_mode = None
 
         cfg = self.model.cfg
-        cfg.train_ds.manifest_filepath = str(train_manifest)
-        cfg.train_ds.batch_size = self.config["batch_size"]
-        cfg.train_ds.shuffle = True
-        cfg.train_ds.num_workers = 4
 
-        if val_manifest:
-            cfg.validation_ds.manifest_filepath = str(val_manifest)
-            cfg.validation_ds.batch_size = self.config["batch_size"]
-            cfg.validation_ds.num_workers = 4
+        with OmegaConf.read_write(cfg):
+            with OmegaConf.open_dict(cfg):
+                cfg.train_ds.manifest_filepath = str(train_manifest)
+                cfg.train_ds.batch_size = self.config["batch_size"]
+                cfg.train_ds.shuffle = True
+                cfg.train_ds.num_workers = 4
 
-        if self.config.get("use_augmentation", True):
-            cfg.spec_augment.freq_masks = 2
-            cfg.spec_augment.freq_width = 27
-            cfg.spec_augment.time_masks = 10
-            cfg.spec_augment.time_width = 0.05
-        else:
-            cfg.spec_augment.freq_masks = 0
-            cfg.spec_augment.time_masks = 0
+                if val_manifest:
+                    cfg.validation_ds.manifest_filepath = str(val_manifest)
+                    cfg.validation_ds.batch_size = self.config["batch_size"]
+                    cfg.validation_ds.num_workers = 4
+
+                if self.config.get("use_augmentation", True):
+                    cfg.spec_augment.freq_masks = 2
+                    cfg.spec_augment.freq_width = 27
+                    cfg.spec_augment.time_masks = 10
+                    cfg.spec_augment.time_width = 0.05
+                else:
+                    cfg.spec_augment.freq_masks = 0
+                    cfg.spec_augment.time_masks = 0
 
         self.model.setup_training_data(cfg.train_ds)
         if val_manifest:
             self.model.setup_validation_data(cfg.validation_ds)
 
         # Configure optimizer and scheduler once across all chunks
-        cfg.optim.name = "adamw"
-        cfg.optim.lr = self.config["learning_rate"]
-        cfg.optim.weight_decay = 0.01
-        cfg.optim.sched.name = "CosineAnnealing"
+        with OmegaConf.read_write(cfg):
+            cfg.optim.name = "adamw"
+            cfg.optim.lr = self.config["learning_rate"]
+            cfg.optim.weight_decay = 0.01
+            cfg.optim.sched.name = "CosineAnnealing"
 
         num_train_samples = _count_manifest_lines(self.train_manifest)
         steps_per_epoch = math.ceil(num_train_samples / self.config["batch_size"])
@@ -265,6 +270,7 @@ class WhisperTrainer:
                 max_grad_norm=1.0,
                 dataloader_num_workers=4,
                 predict_with_generate=True,
+                report_to="none",
             )
 
             self.hf_trainer = Seq2SeqTrainer(

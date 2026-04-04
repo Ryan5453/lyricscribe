@@ -318,7 +318,6 @@ with open(sys.argv[1] + '/chunks/chunk_' + sys.argv[2] + '.json') as f:
         echo "---"
         echo "All $NUM_EXPERIMENTS experiments complete!"
         echo ""
-        # Print final summary
         for exp in "${EXPERIMENTS[@]}"; do
             local_status=$(python3 -c "
 import json, sys
@@ -329,6 +328,23 @@ with open(sys.argv[1] + '/status.json') as f:
             echo "  $(basename "$exp"): $local_status"
         done
         exit 0
+    fi
+
+    # Check if all experiments are blocked (no active jobs, nothing to submit)
+    ALL_BLOCKED=true
+    for exp in "${EXPERIMENTS[@]}"; do
+        [ "${ACTIVE_JOB[$exp]}" != "0" ] && ALL_BLOCKED=false && break
+        NEXT=$(next_actionable_chunk "$exp")
+        [ -z "$NEXT" ] && continue  # done
+        [[ "$NEXT" == failed:* ]] && continue  # blocked
+        ALL_BLOCKED=false
+        break
+    done
+    if $ALL_BLOCKED && ! $ALL_DONE; then
+        echo "---"
+        echo "All experiments are blocked by failed chunks. Exiting."
+        echo "Fix the failures, then retry chunks and relaunch the orchestrator."
+        exit 1
     fi
 
     sleep "$POLL_INTERVAL"
