@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import shutil
 from pathlib import Path
 
 import typer
@@ -8,6 +9,16 @@ import typer
 from lyricscribe import demucs, jobs, plots
 from lyricscribe.dataset import download_jam_alt, download_musdb_alt
 from lyricscribe.evaluate import collect_evaluation_data, evaluate_job
+from lyricscribe.finetune import data as finetune_data
+from lyricscribe.finetune import jobs as finetune_jobs
+from lyricscribe.finetune import trainer as finetune_trainer
+from lyricscribe.finetune.config import (
+    create_finetune_config,
+    get_checkpoint_for_epoch,
+    get_latest_checkpoint,
+    list_checkpoints,
+    load_finetune_config,
+)
 from lyricscribe.transcribe import job as transcribe_job
 from lyricscribe.transcribe.artifacts import correlation, extractor, processor
 
@@ -24,6 +35,8 @@ evaluate_app = typer.Typer(help="ASR evaluation commands")
 cli.add_typer(evaluate_app, name="evaluate")
 artifacts_app = typer.Typer(help = "Artifacts feature extraction commands")
 cli.add_typer(artifacts_app, name="artifacts")
+finetune_app = typer.Typer(help="Model finetuning commands")
+cli.add_typer(finetune_app, name="finetune")
 
 
 def _collect_result_files(
@@ -461,6 +474,255 @@ def artifact_build(
         alignments_dir, features_dir, result_files, musdb_dir, csv_output=output
     )
 
+
+@finetune_app.command("setup")
+def finetune_setup(
+    train_dir: Path = typer.Argument(
+        ..., help="Directory containing training songs (subdirectories with lyrics.json and audio)"
+    ),
+    output_dir: Path = typer.Option(
+        ..., "--output-dir", help="Directory to save experiment outputs"
+    ),
+    model: str = typer.Option(
+        ..., "--model", help="Model identifier (e.g., nvidia/parakeet-tdt-0.6b-v3, openai/whisper-large-v3)"
+    ),
+    filename: list[str] = typer.Option(
+        ..., "--filename", help="Audio filename(s) to train on (repeat for multi-file training)"
+    ),
+    val_dir: Path = typer.Option(
+        None, "--val-dir", help="Directory containing validation songs (optional but recommended)"
+    ),
+    batch_size: int = typer.Option(
+        8, "--batch-size", help="Training batch size"
+    ),
+    max_epochs: int = typer.Option(
+        50, "--max-epochs", help="Maximum training epochs"
+    ),
+    epochs_per_job: int = typer.Option(
+        5, "--epochs-per-job", help="Epochs to train per SLURM job (default: 5)"
+    ),
+    learning_rate: float = typer.Option(
+        1e-5, "--learning-rate", help="Peak learning rate"
+    ),
+    no_augment: bool = typer.Option(
+        False, "--no-augment", help="Disable SpecAugment"
+    ),
+):
+    """
+    Setup a finetuning experiment with epoch-level checkpointing.
+
+    Creates job directory with manifests and chunk files for SLURM processing.
+    Architecture is auto-detected from model name.
+
+    Pass multiple --filename flags to train on a random mix of audio types.
+    """
+    try:
+        config = create_finetune_config(
+            base_model=model,
+            train_dir=train_dir,
+            output_dir=output_dir,
+            filenames=filename,
+            val_dir=val_dir,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            epochs_per_job=epochs_per_job,
+            learning_rate=learning_rate,
+            use_augmentation=not no_augment,
+        )
+    except ValueError as e:
+        logger.error(f"Invalid configuration: {e}")
+        return
+
+    logger.info(f"Experiment: {config['exp_name']}")
+    logger.info(f"Architecture: {config['architecture']} (auto-detected)")
+    logger.info(f"Model: {config['base_model']}")
+    logger.info(f"Filenames: {', '.join(config['filenames'])}")
+    logger.info(f"Epochs: {config['max_epochs']} (per job: {config['epochs_per_job']})")
+
+    train_dataset = finetune_data.LyricsDataset(
+        dataset_dir=train_dir,
+        filenames=config['filenames'],
+    )
+
+    if len(train_dataset) == 0:
+        logger.error("No valid songs found in training directory!")
+        return
+
+    job_dir = Path(config['output_dir']) / config['exp_name']
+    job_dir.mkdir(parents=True, exist_ok=True)
+    train_manifest = job_dir / "train_manifest.jsonl"
+    n_train = finetune_data.create_nemo_manifest(train_dataset, train_manifest)
+    logger.info(f"Training: {n_train} songs")
+
+    val_manifest = None
+    if val_dir:
+        val_dataset = finetune_data.LyricsDataset(
+            dataset_dir=val_dir,
+            filenames=config['filenames'],
+        )
+        val_manifest = job_dir / "val_manifest.jsonl"
+        n_val = finetune_data.create_nemo_manifest(val_dataset, val_manifest)
+        logger.info(f"Validation: {n_val} songs")
+    
+    finetune_jobs.setup_finetune_job(config, train_manifest, val_manifest)
+    
+    num_chunks = (config['max_epochs'] + config['epochs_per_job'] - 1) // config['epochs_per_job']
+    logger.info(f"Job ready: {num_chunks} chunks for SLURM processing")
+    logger.info(f"Directory: {job_dir}")
+    logger.info(f"\nTo run on SLURM:")
+    logger.info(f"  sbatch scripts/slurm_finetune.sh {job_dir} 1")
+    logger.info(f"\nTo run locally (for testing):")
+    logger.info(f"  lyricscribe finetune run --job-dir {job_dir} --chunk-id 1")
+
+
+@finetune_app.command("run")
+def finetune_run(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+    chunk_id: int = typer.Option(..., "--chunk-id", help="Chunk to process (1-based, for SLURM)"),
+):
+    """
+    Process one chunk (block of epochs) of a finetuning job.
+    
+    This is typically called by the SLURM script, not run directly.
+    """
+    config_path = job_dir / "config.json"
+    if not config_path.exists():
+        logger.error(f"No config found at {config_path}")
+        return
+    
+    # status.json is the source of truth for current_epoch
+    config = load_finetune_config(job_dir)
+    status = finetune_jobs.load_job_status(job_dir)
+    config["current_epoch"] = status["current_epoch"]
+
+    chunk_data = finetune_jobs.load_chunk_status(job_dir, chunk_id)
+    if chunk_data["status"] == "success":
+        logger.info(f"Chunk {chunk_id} already complete, skipping")
+        return
+
+    logger.info(f"Processing chunk {chunk_id}: epochs {chunk_data['start_epoch']} to {chunk_data['end_epoch']}")
+
+    train_manifest = job_dir / "train_manifest.jsonl"
+    val_manifest = job_dir / "val_manifest.jsonl" if (job_dir / "val_manifest.jsonl").exists() else None
+
+    try:
+        result = finetune_trainer.run_training_job(
+            config, train_manifest, val_manifest,
+            chunk_end_epoch=chunk_data["end_epoch"],
+        )
+        
+        if result["status"] == "complete":
+            logger.info("Training already complete!")
+            finetune_jobs.update_chunk_status(job_dir, chunk_id, "success")
+        else:
+            checkpoint_path = result.get("checkpoint_path")
+            finetune_jobs.update_chunk_status(job_dir, chunk_id, "success")
+            logger.info(f"Chunk {chunk_id} complete: checkpoint at {checkpoint_path}")
+    
+    except Exception as e:
+        logger.error(f"Chunk {chunk_id} failed: {e}")
+        finetune_jobs.update_chunk_status(job_dir, chunk_id, "failed")
+        raise
+
+
+@finetune_app.command("inspect")
+def finetune_inspect(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+):
+    """Inspect finetuning job details and processing statistics."""
+    if not (job_dir / "status.json").exists():
+        logger.error(f"No job found at {job_dir}")
+        return
+    
+    finetune_jobs.show_job_stats(job_dir)
+
+
+@finetune_app.command("reset")
+def finetune_reset(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+):
+    """
+    Reset a finetuning job to start from scratch.
+    
+    Deletes all checkpoints and resets chunk statuses.
+    """
+    if not (job_dir / "status.json").exists():
+        logger.error(f"No job found at {job_dir}")
+        return
+    
+    finetune_jobs.reset_job(job_dir)
+    logger.info(f"Job reset: {job_dir}")
+    logger.info(f"Run training again with: sbatch scripts/slurm_finetune.sh {job_dir} 1")
+
+
+@finetune_app.command("retry")
+def finetune_retry(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+    chunk_id: int = typer.Option(..., "--chunk-id", help="Chunk to retry"),
+):
+    """
+    Reset a single failed chunk back to pending so it can be resubmitted.
+
+    Use this when a chunk fails (OOM, bug, timeout) and you want the
+    orchestrator to pick it up again without resetting the whole experiment.
+    """
+    chunk_path = job_dir / "chunks" / f"chunk_{chunk_id}.json"
+    if not chunk_path.exists():
+        logger.error(f"Chunk {chunk_id} not found at {chunk_path}")
+        return
+
+    chunk_data = finetune_jobs.load_chunk_status(job_dir, chunk_id)
+    if chunk_data["status"] == "success":
+        logger.error(f"Chunk {chunk_id} already succeeded — use 'reset' to start over")
+        return
+
+    finetune_jobs.update_chunk_status(job_dir, chunk_id, "pending")
+    logger.info(f"Chunk {chunk_id} reset to pending — orchestrator will resubmit it")
+
+
+@finetune_app.command("export-model")
+def finetune_export(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+    output_path: Path = typer.Option(..., "--output", help="Path to save exported model"),
+    epoch: int = typer.Option(None, "--epoch", help="Epoch to export (default: latest)"),
+):
+    """
+    Export a checkpoint for use in transcription.
+
+    Defaults to the latest checkpoint. Use --epoch to pick a specific one.
+    Use 'lyricscribe finetune inspect' to see available checkpoints and metrics.
+    """
+    config = load_finetune_config(job_dir)
+
+    if epoch is not None:
+        checkpoint = get_checkpoint_for_epoch(job_dir, config, epoch)
+        if not checkpoint:
+            logger.error(f"No checkpoint found for epoch {epoch}")
+            available = list_checkpoints(job_dir, config)
+            if available:
+                epochs_str = ", ".join(str(e) for e, _ in available)
+                logger.error(f"Available epochs: {epochs_str}")
+            return
+    else:
+        checkpoint = get_latest_checkpoint(job_dir, config)
+        if not checkpoint:
+            logger.error("No checkpoints found!")
+            return
+
+    if output_path.exists():
+        logger.error(f"Output path already exists: {output_path}")
+        logger.error("Remove it manually before exporting.")
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if checkpoint.suffix == ".nemo":
+        shutil.copy(checkpoint, output_path)
+    else:
+        shutil.copytree(checkpoint, output_path)
+
+    logger.info(f"Model exported: {checkpoint} -> {output_path}")
+    logger.info(f"Use with: lyricscribe transcribe setup --model {output_path}")
 
 
 if __name__ == "__main__":

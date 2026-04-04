@@ -379,3 +379,109 @@ Options:
 - `--output`: Path to write the word-level CSV (required)
 
 </details>
+
+<details>
+<summary><h3>lyricscribe finetune</h3></summary>
+
+The `finetune` commands finetune ASR models (Whisper, Canary, or Parakeet) using epoch-level checkpointing for SLURM cluster training. Training is split into chunks (blocks of epochs) with checkpoints saved after every epoch. Each song directory must contain a `lyrics.json` file and at least one of the audio files specified via `--filename`.
+
+#### `lyricscribe finetune setup`
+
+Set up a finetuning experiment by scanning dataset directories and creating manifests and chunk files.
+
+```bash
+# Train on separated vocals
+lyricscribe finetune setup /path/to/final_train \
+    --output-dir ./experiments \
+    --val-dir /path/to/final_validation \
+    --model nvidia/parakeet-tdt-0.6b-v3 \
+    --filename htdemucs_ft_vocals.wav
+
+# Train on both (randomly picks one per sample each epoch)
+lyricscribe finetune setup /path/to/final_train \
+    --output-dir ./experiments \
+    --val-dir /path/to/final_validation \
+    --model nvidia/canary-1b-v2 \
+    --filename htdemucs_ft_vocals.wav \
+    --filename audio.mp3
+```
+
+Options:
+
+- `--output-dir`: Directory to save experiment outputs (required)
+- `--model`: Model identifier on HuggingFace/NeMo hub (required)
+- `--filename`: Audio filename to train on, repeat for multi-file training (required)
+- `--val-dir`: Directory with validation songs (strongly recommended)
+- `--batch-size`: Training batch size (default: 8)
+- `--max-epochs`: Maximum training epochs (default: 50)
+- `--epochs-per-job`: Epochs per SLURM job chunk (default: 5)
+- `--learning-rate`: Peak learning rate (default: 1e-5)
+- `--no-augment`: Disable SpecAugment (enabled by default)
+
+#### `lyricscribe finetune run`
+
+Process one chunk of a finetuning job. Typically called by the SLURM script, not run directly.
+
+```bash
+lyricscribe finetune run --job-dir ./experiments/my_experiment --chunk-id 1
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+- `--chunk-id`: Chunk to process, 1-indexed (required)
+
+#### `lyricscribe finetune inspect`
+
+Inspect job progress, chunk statuses, checkpoints, and training metrics.
+
+```bash
+lyricscribe finetune inspect --job-dir ./experiments/my_experiment
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+
+#### `lyricscribe finetune reset`
+
+Reset a job to start from scratch. Deletes all checkpoints and metrics.
+
+```bash
+lyricscribe finetune reset --job-dir ./experiments/my_experiment
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+
+#### `lyricscribe finetune retry`
+
+Reset a single failed chunk back to pending so the orchestrator can resubmit it.
+
+```bash
+lyricscribe finetune retry --job-dir ./experiments/my_experiment --chunk-id 3
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+- `--chunk-id`: Chunk to retry (required)
+
+#### `lyricscribe finetune export-model`
+
+Export a checkpoint for use in transcription. Defaults to the latest checkpoint.
+
+```bash
+lyricscribe finetune export-model \
+    --job-dir ./experiments/my_experiment \
+    --output ./models/my_finetuned_model.nemo \
+    --epoch 25
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+- `--output`: Path to save exported model (required)
+- `--epoch`: Epoch to export (default: latest)
+

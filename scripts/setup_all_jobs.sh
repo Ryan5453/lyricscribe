@@ -96,4 +96,4 @@ for model_info in "${MODELS[@]}"; do
 done
 
 echo "Setup complete! Run list generated at $RUN_FILE"
-echo "To orchestrate: sbatch scripts/slurm_orchestrate.sh $RUN_FILE"
+echo "To orchestrate: sbatch scripts/slurm_transcribe_orchestrate.sh $RUN_FILE"

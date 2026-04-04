@@ -10,7 +10,7 @@
 # Orchestrator: submits GPU transcription jobs while respecting queue limits.
 #
 # Usage:
-#   sbatch scripts/slurm_orchestrate.sh jobs.txt
+#   sbatch scripts/slurm_transcribe_orchestrate.sh jobs.txt
 #
 # Where jobs.txt has one job per line:
 #   /path/to/job_dir <chunk_id>
@@ -29,7 +29,7 @@ TRANSCRIBE_SCRIPT="/projects/fahey.rya/music2text/lyricscribe/scripts/slurm_tran
 
 if [ -z "${1:-}" ]; then
     echo "Error: jobs file required"
-    echo "Usage: sbatch scripts/slurm_orchestrate.sh <jobs.txt>"
+    echo "Usage: sbatch scripts/slurm_transcribe_orchestrate.sh <jobs.txt>"
     exit 1
 fi
 
