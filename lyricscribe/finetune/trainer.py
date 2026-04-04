@@ -7,8 +7,8 @@ from pathlib import Path
 import jiwer
 import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf
-import pytorch_lightning as pl
-from pytorch_lightning.loggers import WandbLogger
+import lightning.pytorch as pl
+from lightning.pytorch.loggers import WandbLogger
 import torch
 import torchaudio
 from transformers import (
@@ -92,6 +92,10 @@ class NeMoTrainer:
         self.model.setup_training_data(cfg.train_ds)
         if val_manifest:
             self.model.setup_validation_data(cfg.validation_ds)
+
+        # Re-disable struct mode — setup_training_data/setup_validation_data
+        # can re-enable it on sub-configs.
+        OmegaConf.set_struct(cfg, False)
 
         # Configure optimizer and scheduler once across all chunks
         cfg.optim.name = "adamw"
@@ -188,12 +192,20 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
             import soundfile as sf
             info = sf.info(entry["audio_filepath"])
             frame_offset = int(offset * info.samplerate)
-            num_frames = int(duration * info.samplerate) if duration else -1
-            audio, sr = torchaudio.load(
-                entry["audio_filepath"],
-                frame_offset=frame_offset,
-                num_frames=num_frames,
-            )
+            # Clamp to file bounds to avoid empty reads
+            max_frames = info.frames - frame_offset
+            if max_frames <= 0:
+                audio = torch.zeros(1, 16000)
+                sr = 16000
+            else:
+                num_frames = int(duration * info.samplerate) if duration else -1
+                if num_frames > 0:
+                    num_frames = min(num_frames, max_frames)
+                audio, sr = torchaudio.load(
+                    entry["audio_filepath"],
+                    frame_offset=frame_offset,
+                    num_frames=num_frames,
+                )
         else:
             audio, sr = torchaudio.load(entry["audio_filepath"])
 
@@ -201,6 +213,12 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
             audio = audio.mean(dim=0)
         else:
             audio = audio.squeeze(0)
+
+        # Guard against empty audio (e.g. chunk past end of file)
+        if audio.numel() == 0:
+            audio = torch.zeros(16000)
+            sr = 16000
+
         if sr != 16000:
             audio = torchaudio.functional.resample(audio, sr, 16000)
 

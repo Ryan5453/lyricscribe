@@ -223,6 +223,8 @@ def create_whisper_manifest(
                 for chunk in chunks:
                     if not chunk["text"].strip():
                         continue
+                    if chunk["duration"] < 0.1:
+                        continue
                     entry = {
                         "audio_filepath": str(audio_file),
                         "offset": chunk["offset"],
