@@ -8,6 +8,7 @@ import jiwer
 import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 import torch
 import torchaudio
 from transformers import (
@@ -99,6 +100,11 @@ class NeMoTrainer:
     def train_one_epoch(self, target_epoch: int) -> dict:
         # Reuse the same PL Trainer to preserve optimizer state across epochs
         if self.trainer is None:
+            wandb_logger = WandbLogger(
+                project="lyricscribe-finetune",
+                name=self.config["exp_name"],
+                tags=[self.config["architecture"], self.config["base_model"]],
+            )
             self.trainer = pl.Trainer(
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -106,7 +112,7 @@ class NeMoTrainer:
                 precision="16-mixed" if torch.cuda.is_available() else 32,
                 gradient_clip_val=1.0,
                 enable_progress_bar=True,
-                logger=False,
+                logger=wandb_logger,
                 enable_checkpointing=False,
             )
 
@@ -240,6 +246,9 @@ class WhisperTrainer:
         self.train_manifest = train_manifest
         self.val_manifest = val_manifest
 
+        import os
+        os.environ.setdefault("WANDB_PROJECT", "lyricscribe-finetune")
+
         if self.model is None:
             logger.info(f"Loading Whisper model: {self.config['base_model']}")
             self.model = WhisperForConditionalGeneration.from_pretrained(
@@ -287,7 +296,8 @@ class WhisperTrainer:
                 max_grad_norm=1.0,
                 dataloader_num_workers=4,
                 predict_with_generate=True,
-                report_to="none",
+                report_to="wandb",
+                run_name=self.config["exp_name"],
             )
 
             self.hf_trainer = Seq2SeqTrainer(
