@@ -73,13 +73,18 @@ class LyricsDataset:
 def create_manifest(
     dataset: LyricsDataset,
     output_path: Path,
+    architecture: str = "parakeet",
     max_duration: float = 300.0,
 ) -> int:
     """
     Create manifest JSONL file from dataset. One entry per song.
 
+    For Canary models, includes source_lang, target_lang, pnc, and answer fields
+    required by the Lhotse prompt-based data pipeline.
+
     :param dataset: LyricsDataset instance
     :param output_path: Path to write manifest
+    :param architecture: Model architecture (canary needs extra fields)
     :param max_duration: Maximum duration in seconds (songs longer are skipped)
     :return: Number of entries written
     """
@@ -107,6 +112,13 @@ def create_manifest(
                     "duration": duration,
                     "text": item["transcript"],
                 }
+
+                if architecture == "canary":
+                    entry["answer"] = item["transcript"]
+                    entry["source_lang"] = "en"
+                    entry["target_lang"] = "en"
+                    entry["pnc"] = "no"
+
                 f.write(json.dumps(entry) + "\n")
                 count += 1
 

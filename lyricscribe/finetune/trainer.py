@@ -56,8 +56,6 @@ class NeMoTrainer:
             computer.cuda_graphs_mode = None
 
         cfg = self.model.cfg
-
-        # Use struct override to allow setting keys that may not exist in the config
         OmegaConf.set_struct(cfg, False)
 
         cfg.train_ds.manifest_filepath = str(train_manifest)
@@ -65,10 +63,22 @@ class NeMoTrainer:
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
 
+        # Fix Lhotse dataloader fields that ship as None in pretrained configs
+        # but are expected to be non-None by LhotseDataLoadingConfig.
+        # See: https://github.com/NVIDIA-NeMo/NeMo/issues/14816
+        if cfg.train_ds.get("use_lhotse", False):
+            cfg.train_ds.num_buckets = cfg.train_ds.get("num_buckets") or 30
+            cfg.train_ds.min_tps = cfg.train_ds.get("min_tps") if cfg.train_ds.get("min_tps") is not None else -1
+            cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
+
         if val_manifest:
             cfg.validation_ds.manifest_filepath = str(val_manifest)
             cfg.validation_ds.batch_size = self.config["batch_size"]
             cfg.validation_ds.num_workers = 4
+            if cfg.validation_ds.get("use_lhotse", False):
+                cfg.validation_ds.num_buckets = cfg.validation_ds.get("num_buckets") or 30
+                cfg.validation_ds.min_tps = cfg.validation_ds.get("min_tps") if cfg.validation_ds.get("min_tps") is not None else -1
+                cfg.validation_ds.max_tps = cfg.validation_ds.get("max_tps") if cfg.validation_ds.get("max_tps") is not None else float("inf")
 
         if self.config.get("use_augmentation", True):
             cfg.spec_augment.freq_masks = 2
@@ -105,6 +115,11 @@ class NeMoTrainer:
                 name=self.config["exp_name"],
                 tags=[self.config["architecture"], self.config["base_model"]],
             )
+            # Lhotse iterable datasets don't have __len__, so we must set
+            # limit_train_batches to a concrete number of steps per epoch.
+            num_train_samples = _count_manifest_lines(self.train_manifest)
+            steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
+
             self.trainer = pl.Trainer(
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -114,6 +129,8 @@ class NeMoTrainer:
                 enable_progress_bar=True,
                 logger=wandb_logger,
                 enable_checkpointing=False,
+                use_distributed_sampler=False,
+                limit_train_batches=steps_per_epoch,
             )
 
         self.trainer.fit_loop.max_epochs = target_epoch
@@ -168,10 +185,10 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         duration = entry.get("duration")
 
         if offset > 0 or duration is not None:
-            # Get sample rate first to compute frame offsets
-            info = torchaudio.info(entry["audio_filepath"])
-            frame_offset = int(offset * info.sample_rate)
-            num_frames = int(duration * info.sample_rate) if duration else -1
+            import soundfile as sf
+            info = sf.info(entry["audio_filepath"])
+            frame_offset = int(offset * info.samplerate)
+            num_frames = int(duration * info.samplerate) if duration else -1
             audio, sr = torchaudio.load(
                 entry["audio_filepath"],
                 frame_offset=frame_offset,
