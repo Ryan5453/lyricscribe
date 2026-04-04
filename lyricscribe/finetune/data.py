@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 from typing import Iterator
 
-import torchaudio
+import soundfile as sf
 
 logger = logging.getLogger(__name__)
 
@@ -95,8 +95,8 @@ def create_nemo_manifest(
                 logger.info(f"  Processing manifest: {idx + 1}/{total}")
 
             try:
-                info = torchaudio.info(item["audio_path"])
-                duration = info.num_frames / info.sample_rate
+                info = sf.info(item["audio_path"])
+                duration = info.duration
                 
                 if duration > max_duration:
                     skipped_duration += 1
