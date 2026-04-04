@@ -67,13 +67,26 @@ NUM_EXPERIMENTS=${#EXPERIMENTS[@]}
 echo "Finetune orchestrator: $NUM_EXPERIMENTS experiments"
 echo "---"
 
-# For each experiment, figure out the total number of chunks
+# For each experiment, figure out the total number of chunks.
+# Filter out any invalid experiments (e.g., incomplete setup).
 declare -A TOTAL_CHUNKS
+VALID_EXPERIMENTS=()
 for exp in "${EXPERIMENTS[@]}"; do
-    count=$(ls "$exp/chunks"/chunk_*.json 2>/dev/null | wc -l)
+    if [ ! -d "$exp/chunks" ]; then
+        echo "  $(basename "$exp"): SKIPPING (no chunks/ directory)"
+        continue
+    fi
+    count=$(find "$exp/chunks" -name 'chunk_*.json' | wc -l)
+    if [ "$count" -eq 0 ]; then
+        echo "  $(basename "$exp"): SKIPPING (no chunk files)"
+        continue
+    fi
     TOTAL_CHUNKS[$exp]=$count
+    VALID_EXPERIMENTS+=("$exp")
     echo "  $(basename "$exp"): $count chunks"
 done
+EXPERIMENTS=("${VALID_EXPERIMENTS[@]}")
+NUM_EXPERIMENTS=${#EXPERIMENTS[@]}
 echo "---"
 
 # Track active SLURM job ID per experiment (0 = none active)
