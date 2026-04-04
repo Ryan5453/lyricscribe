@@ -565,14 +565,9 @@ def finetune_setup(
         logger.info(f"Validation: {n_val} songs")
     
     finetune_jobs.setup_finetune_job(config, train_manifest, val_manifest)
-    
+
     num_chunks = (config['max_epochs'] + config['epochs_per_job'] - 1) // config['epochs_per_job']
-    logger.info(f"Job ready: {num_chunks} chunks for SLURM processing")
-    logger.info(f"Directory: {job_dir}")
-    logger.info(f"\nTo run on SLURM:")
-    logger.info(f"  sbatch scripts/slurm_finetune.sh {job_dir} 1")
-    logger.info(f"\nTo run locally (for testing):")
-    logger.info(f"  lyricscribe finetune run --job-dir {job_dir} --chunk-id 1")
+    logger.info(f"Job ready at {job_dir} ({num_chunks} chunks)")
 
 
 @finetune_app.command("run")
