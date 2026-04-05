@@ -58,13 +58,20 @@ class NeMoTrainer:
         cfg = self.model.cfg
         OmegaConf.set_struct(cfg, False)
 
+        is_parakeet = self.config["architecture"] == "parakeet"
+
+        # Parakeet: disable Lhotse and use the standard NeMo dataloader.
+        # This avoids Lhotse's broken None defaults (NeMo #14816).
+        if is_parakeet:
+            cfg.train_ds.use_lhotse = False
+
         cfg.train_ds.manifest_filepath = str(train_manifest)
         cfg.train_ds.batch_size = self.config["batch_size"]
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
 
-        # Fix Lhotse dataloader fields that ship as None in pretrained configs
-        # but are expected to be non-None by LhotseDataLoadingConfig.
+        # Canary still needs Lhotse for its prompt-based pipeline.
+        # Fix Lhotse fields that ship as None but must be non-None.
         # See: https://github.com/NVIDIA-NeMo/NeMo/issues/14816
         if cfg.train_ds.get("use_lhotse", False):
             cfg.train_ds.num_buckets = cfg.train_ds.get("num_buckets") or 30
@@ -72,6 +79,8 @@ class NeMoTrainer:
             cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
 
         if val_manifest:
+            if is_parakeet:
+                cfg.validation_ds.use_lhotse = False
             cfg.validation_ds.manifest_filepath = str(val_manifest)
             cfg.validation_ds.batch_size = self.config["batch_size"]
             cfg.validation_ds.num_workers = 4
@@ -119,12 +128,10 @@ class NeMoTrainer:
                 name=self.config["exp_name"],
                 tags=[self.config["architecture"], self.config["base_model"]],
             )
-            # Lhotse iterable datasets don't have __len__, so we must set
-            # limit_train_batches to a concrete number of steps per epoch.
-            num_train_samples = _count_manifest_lines(self.train_manifest)
-            steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
 
-            self.trainer = pl.Trainer(
+            uses_lhotse = self.model.cfg.train_ds.get("use_lhotse", False)
+
+            trainer_kwargs = dict(
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices=1,
@@ -133,9 +140,17 @@ class NeMoTrainer:
                 enable_progress_bar=True,
                 logger=wandb_logger,
                 enable_checkpointing=False,
-                use_distributed_sampler=False,
-                limit_train_batches=steps_per_epoch,
             )
+
+            # Lhotse iterable datasets don't have __len__, so we must
+            # disable distributed sampler and set explicit step count.
+            if uses_lhotse:
+                num_train_samples = _count_manifest_lines(self.train_manifest)
+                steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
+                trainer_kwargs["use_distributed_sampler"] = False
+                trainer_kwargs["limit_train_batches"] = steps_per_epoch
+
+            self.trainer = pl.Trainer(**trainer_kwargs)
 
         self.trainer.fit_loop.max_epochs = target_epoch
 
@@ -227,6 +242,9 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         ).input_features[0]
 
         labels = self.processor.tokenizer(entry["text"]).input_ids
+        # Whisper's max generation length is 448 tokens
+        if len(labels) > 448:
+            labels = labels[:448]
 
         return {"input_features": input_features, "labels": labels}
 
