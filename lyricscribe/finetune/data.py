@@ -1,12 +1,31 @@
 import json
 import logging
 import random
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
 import soundfile as sf
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_mono(audio_path: str) -> str:
+    """Return path to a mono WAV copy, creating it via ffmpeg if needed."""
+    info = sf.info(audio_path)
+    if info.channels == 1:
+        return audio_path
+
+    mono_path = str(Path(audio_path).with_suffix(".mono.wav"))
+    if Path(mono_path).exists():
+        return mono_path
+
+    subprocess.run(
+        ["ffmpeg", "-i", audio_path, "-ac", "1", "-ar", "16000", "-y", mono_path],
+        capture_output=True, check=True,
+    )
+    return mono_path
 
 _RNG = random.Random(42)
 
@@ -90,6 +109,16 @@ def create_manifest(
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Canary requires mono audio. Pre-convert all files in parallel.
+    if architecture == "canary":
+        all_paths = [item["audio_path"] for item in dataset]
+        needs_convert = [p for p in all_paths if not Path(p).with_suffix(".mono.wav").exists() and sf.info(p).channels > 1]
+        if needs_convert:
+            logger.info(f"  Converting {len(needs_convert)} stereo files to mono (parallel)...")
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(_ensure_mono, needs_convert))
+            logger.info("  Mono conversion complete.")
+
     count = 0
     skipped_duration = 0
     total = len(dataset)
@@ -100,7 +129,14 @@ def create_manifest(
                 logger.info(f"  Processing manifest: {idx + 1}/{total}")
 
             try:
-                info = sf.info(item["audio_path"])
+                audio_path = item["audio_path"]
+
+                # Canary's Lhotse pipeline requires MonoCut (mono audio).
+                # Use cached .mono.wav created by the parallel pre-conversion above.
+                if architecture == "canary":
+                    audio_path = _ensure_mono(audio_path)
+
+                info = sf.info(audio_path)
                 duration = info.duration
 
                 if duration > max_duration:
@@ -108,7 +144,7 @@ def create_manifest(
                     continue
 
                 entry = {
-                    "audio_filepath": item["audio_path"],
+                    "audio_filepath": audio_path,
                     "duration": duration,
                     "text": item["transcript"],
                 }

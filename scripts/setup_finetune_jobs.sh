@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=lyricscribe_ft_setup
 #SBATCH --output=/projects/fahey.rya/music2text/logs/finetune/setup_%j.out
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --partition=short
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
