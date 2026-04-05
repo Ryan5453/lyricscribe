@@ -11,8 +11,9 @@ import soundfile as sf
 logger = logging.getLogger(__name__)
 
 
-def _ensure_mono(audio_path: str) -> str:
-    """Return path to a mono WAV copy, creating it via ffmpeg if needed."""
+def _ensure_mono(audio_path: str) -> str | None:
+    """Return path to a mono WAV copy, creating it via ffmpeg if needed.
+    Returns None if conversion fails."""
     info = sf.info(audio_path)
     if info.channels == 1:
         return audio_path
@@ -21,11 +22,17 @@ def _ensure_mono(audio_path: str) -> str:
     if Path(mono_path).exists():
         return mono_path
 
-    subprocess.run(
-        ["ffmpeg", "-i", audio_path, "-ac", "1", "-ar", "16000", "-y", mono_path],
-        capture_output=True, check=True,
-    )
-    return mono_path
+    try:
+        subprocess.run(
+            ["ffmpeg", "-i", audio_path, "-ac", "1", "-ar", "16000", "-y", mono_path],
+            capture_output=True, check=True,
+        )
+        return mono_path
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"ffmpeg mono conversion failed for {audio_path}: exit code {e.returncode}")
+        # Clean up partial output
+        Path(mono_path).unlink(missing_ok=True)
+        return None
 
 _RNG = random.Random(42)
 
@@ -116,7 +123,10 @@ def create_manifest(
         if needs_convert:
             logger.info(f"  Converting {len(needs_convert)} stereo files to mono (parallel)...")
             with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(_ensure_mono, needs_convert))
+                results = list(pool.map(_ensure_mono, needs_convert))
+            failed = sum(1 for r in results if r is None)
+            if failed:
+                logger.warning(f"  {failed}/{len(needs_convert)} files failed mono conversion")
             logger.info("  Mono conversion complete.")
 
     count = 0
@@ -135,6 +145,8 @@ def create_manifest(
                 # Use cached .mono.wav created by the parallel pre-conversion above.
                 if architecture == "canary":
                     audio_path = _ensure_mono(audio_path)
+                    if audio_path is None:
+                        continue
 
                 info = sf.info(audio_path)
                 duration = info.duration
