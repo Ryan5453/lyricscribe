@@ -4,28 +4,9 @@ import random
 from pathlib import Path
 from typing import Iterator
 
-import numpy as np
 import soundfile as sf
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_mono(audio_path: str) -> str:
-    """Return path to a mono version of the audio file, creating it if needed."""
-    info = sf.info(audio_path)
-    if info.channels == 1:
-        return audio_path
-
-    mono_path = str(Path(audio_path).with_suffix(".mono.wav"))
-    if Path(mono_path).exists():
-        return mono_path
-
-    data, sr = sf.read(audio_path)
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    sf.write(mono_path, data, sr)
-    logger.debug(f"Created mono copy: {mono_path}")
-    return mono_path
 
 _RNG = random.Random(42)
 
@@ -119,11 +100,7 @@ def create_manifest(
                 logger.info(f"  Processing manifest: {idx + 1}/{total}")
 
             try:
-                # NeMo models (Parakeet, Canary) require mono audio.
-                # Convert stereo files to mono, caching alongside the original.
-                mono_path = _ensure_mono(item["audio_path"])
-
-                info = sf.info(mono_path)
+                info = sf.info(item["audio_path"])
                 duration = info.duration
 
                 if duration > max_duration:
@@ -131,7 +108,7 @@ def create_manifest(
                     continue
 
                 entry = {
-                    "audio_filepath": mono_path,
+                    "audio_filepath": item["audio_path"],
                     "duration": duration,
                     "text": item["transcript"],
                 }
@@ -241,7 +218,6 @@ def create_whisper_manifest(
                     continue
 
                 audio_file = song["dir"] / _RNG.choice(song["available"])
-                mono_path = _ensure_mono(str(audio_file))
                 chunks = _chunk_synced_lines(synced, max_chunk_seconds)
 
                 for chunk in chunks:
@@ -250,7 +226,7 @@ def create_whisper_manifest(
                     if chunk["duration"] < 0.1:
                         continue
                     entry = {
-                        "audio_filepath": mono_path,
+                        "audio_filepath": str(audio_file),
                         "offset": chunk["offset"],
                         "duration": chunk["duration"],
                         "text": chunk["text"],
