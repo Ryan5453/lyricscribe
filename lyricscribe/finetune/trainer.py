@@ -126,7 +126,11 @@ class NeMoTrainer:
             )
             wandb_logger = WandbLogger(experiment=wandb.run)
 
-            trainer_kwargs = dict(
+            # Lhotse iterable datasets don't have __len__.
+            num_train_samples = _count_manifest_lines(self.train_manifest)
+            steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
+
+            self.trainer = pl.Trainer(
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices=1,
@@ -135,15 +139,10 @@ class NeMoTrainer:
                 enable_progress_bar=True,
                 logger=wandb_logger,
                 enable_checkpointing=False,
+                use_distributed_sampler=False,
+                limit_train_batches=steps_per_epoch,
+                log_every_n_steps=1,
             )
-
-            # Lhotse iterable datasets don't have __len__.
-            num_train_samples = _count_manifest_lines(self.train_manifest)
-            steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
-            trainer_kwargs["use_distributed_sampler"] = False
-            trainer_kwargs["limit_train_batches"] = steps_per_epoch
-
-            self.trainer = pl.Trainer(**trainer_kwargs)
 
         self.trainer.fit_loop.max_epochs = target_epoch
 
@@ -154,6 +153,14 @@ class NeMoTrainer:
         if hasattr(self.trainer, "callback_metrics"):
             for k, v in self.trainer.callback_metrics.items():
                 metrics[k] = float(v) if isinstance(v, torch.Tensor) else v
+
+        # NeMo logs with on_epoch=True which PL may not forward to wandb
+        # in our setup. Manually log to wandb so we get charts.
+        if metrics:
+            import wandb
+            if wandb.run is not None:
+                wandb.log(metrics, step=target_epoch)
+            logger.info(f"Epoch {target_epoch} metrics: {metrics}")
 
         return metrics
 
