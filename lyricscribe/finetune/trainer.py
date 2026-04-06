@@ -68,10 +68,14 @@ class NeMoTrainer:
             cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
 
         cfg.train_ds.manifest_filepath = str(train_manifest)
-        cfg.train_ds.batch_size = self.config["batch_size"]
-        cfg.train_ds.max_duration = 300.0
+        cfg.train_ds.max_duration = 400.0
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
+        # Use duration-based batching: total audio per batch (seconds),
+        # not a fixed sample count. Lhotse will fit as many songs as
+        # possible within this budget, adapting to variable lengths.
+        cfg.train_ds.batch_duration = 600
+        cfg.train_ds.batch_size = None
 
         if val_manifest:
             if cfg.validation_ds.get("use_lhotse", False):
@@ -79,8 +83,9 @@ class NeMoTrainer:
                 cfg.validation_ds.min_tps = cfg.validation_ds.get("min_tps") if cfg.validation_ds.get("min_tps") is not None else -1
                 cfg.validation_ds.max_tps = cfg.validation_ds.get("max_tps") if cfg.validation_ds.get("max_tps") is not None else float("inf")
             cfg.validation_ds.manifest_filepath = str(val_manifest)
-            cfg.validation_ds.batch_size = self.config["batch_size"]
-            cfg.validation_ds.max_duration = 300.0
+            cfg.validation_ds.max_duration = 400.0
+            cfg.validation_ds.batch_duration = 600
+            cfg.validation_ds.batch_size = None
             cfg.validation_ds.num_workers = 4
 
         if self.config.get("use_augmentation", True):
@@ -107,7 +112,10 @@ class NeMoTrainer:
         cfg.optim.sched.name = "CosineAnnealing"
 
         num_train_samples = _count_manifest_lines(self.train_manifest)
-        steps_per_epoch = math.ceil(num_train_samples / self.config["batch_size"])
+        # With duration-based batching, estimate steps from total dataset
+        # duration. Assume ~180s avg song -> ~1.5 songs per 120s batch.
+        batch_size = self.config.get("batch_size") or max(1, 120 // 180)
+        steps_per_epoch = math.ceil(num_train_samples / max(batch_size, 1))
         total_steps = self.config["max_epochs"] * steps_per_epoch
 
         warmup_epochs = self.config.get("warmup_epochs", 5)
@@ -118,19 +126,25 @@ class NeMoTrainer:
         # Reuse the same PL Trainer to preserve optimizer state across epochs
         if self.trainer is None:
             import wandb
-            wandb.init(
-                project="lyricscribe-finetune",
-                name=self.config["exp_name"],
-                id=self.config["exp_name"],
-                resume="allow",
-                tags=[self.config["architecture"], self.config["base_model"]],
-                settings=wandb.Settings(init_timeout=300),
-            )
-            wandb_logger = WandbLogger(experiment=wandb.run)
+            try:
+                wandb.init(
+                    project="lyricscribe-finetune",
+                    name=self.config["exp_name"],
+                    id=self.config["exp_name"],
+                    resume="allow",
+                    tags=[self.config["architecture"], self.config["base_model"]],
+                    settings=wandb.Settings(init_timeout=300),
+                )
+                wandb_logger = WandbLogger(experiment=wandb.run)
+            except Exception as e:
+                logger.warning(f"wandb init failed ({e}), training without wandb")
+                wandb_logger = None
 
-            # Lhotse iterable datasets don't have __len__.
+            # Lhotse iterable datasets don't have __len__. Estimate
+            # steps per epoch for limit_train_batches.
             num_train_samples = _count_manifest_lines(self.train_manifest)
-            steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
+            batch_size_est = self.config.get("batch_size") or max(1, 600 // 180)
+            steps_per_epoch = max(1, num_train_samples // max(batch_size_est, 1))
 
             self.trainer = pl.Trainer(
                 max_epochs=self.config["max_epochs"],
