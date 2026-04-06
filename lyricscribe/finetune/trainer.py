@@ -115,11 +115,14 @@ class NeMoTrainer:
     def train_one_epoch(self, target_epoch: int) -> dict:
         # Reuse the same PL Trainer to preserve optimizer state across epochs
         if self.trainer is None:
-            wandb_logger = WandbLogger(
+            import wandb
+            wandb.init(
                 project="lyricscribe-finetune",
                 name=self.config["exp_name"],
                 tags=[self.config["architecture"], self.config["base_model"]],
+                settings=wandb.Settings(init_timeout=300),
             )
+            wandb_logger = WandbLogger(experiment=wandb.run)
 
             trainer_kwargs = dict(
                 max_epochs=self.config["max_epochs"],
