@@ -36,6 +36,9 @@ module load FFmpeg/7.1.1
 export HF_HOME=/projects/fahey.rya/music2text/.cache/huggingface
 export TORCH_HOME=/projects/fahey.rya/music2text/.cache/torch
 export NEMO_CACHE_DIR=/projects/fahey.rya/music2text/.cache/nemo
+# Synchronous CUDA for debugging device-side asserts (Canary).
+# Remove once Canary is working.
+export CUDA_LAUNCH_BLOCKING=1
 
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
