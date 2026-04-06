@@ -68,7 +68,9 @@ class NeMoTrainer:
             cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
 
         cfg.train_ds.manifest_filepath = str(train_manifest)
-        cfg.train_ds.max_duration = 400.0
+        # Cap at 60s to avoid RNNT loss overflow on long sequences.
+        # The TDT forward-backward lattice overflows in fp16 with long audio.
+        cfg.train_ds.max_duration = 60.0
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
         # Use duration-based batching: total audio per batch (seconds),
@@ -83,7 +85,7 @@ class NeMoTrainer:
                 cfg.validation_ds.min_tps = cfg.validation_ds.get("min_tps") if cfg.validation_ds.get("min_tps") is not None else -1
                 cfg.validation_ds.max_tps = cfg.validation_ds.get("max_tps") if cfg.validation_ds.get("max_tps") is not None else float("inf")
             cfg.validation_ds.manifest_filepath = str(val_manifest)
-            cfg.validation_ds.max_duration = 400.0
+            cfg.validation_ds.max_duration = 60.0
             cfg.validation_ds.batch_duration = 600
             cfg.validation_ds.batch_size = None
             cfg.validation_ds.num_workers = 4
@@ -150,7 +152,7 @@ class NeMoTrainer:
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices=1,
-                precision="16-mixed" if torch.cuda.is_available() else 32,
+                precision="bf16-mixed" if torch.cuda.is_available() else 32,
                 gradient_clip_val=1.0,
                 enable_progress_bar=True,
                 logger=wandb_logger,
