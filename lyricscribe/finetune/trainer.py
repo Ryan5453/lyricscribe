@@ -9,8 +9,10 @@ import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf
 import lightning.pytorch as pl
 from lightning.pytorch.loggers import WandbLogger
+import soundfile as sf
 import torch
 import torchaudio
+import wandb
 from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
@@ -22,13 +24,28 @@ from lyricscribe.finetune.config import get_latest_checkpoint
 
 logger = logging.getLogger(__name__)
 
-
 def _count_manifest_lines(manifest_path: Path) -> int:
+    """
+    Count the number of lines in a manifest JSONL file.
+
+    :param manifest_path: Path to the manifest file.
+    :return: Number of lines.
+    """
     with open(manifest_path) as f:
         return sum(1 for _ in f)
 
 
 class NeMoTrainer:
+    """
+    Trainer for NeMo ASR models (Parakeet, Canary) using PyTorch Lightning.
+
+    Handles model loading, data configuration, per-epoch training, and
+    checkpoint management. Designed to be called once per chunk of epochs
+    by the orchestration system.
+
+    :param config: Job configuration dictionary.
+    """
+
     def __init__(self, config: dict):
         self.config = config
         self.current_epoch = config.get("current_epoch", 0)
@@ -38,6 +55,19 @@ class NeMoTrainer:
         self.val_manifest = None
 
     def setup(self, train_manifest: Path, val_manifest: Path | None) -> None:
+        """
+        Configure the model, data loaders, optimizer, and scheduler.
+
+        For Parakeet, disables Lhotse and uses the standard NeMo dataloader
+        with ``channel_selector="average"`` for stereo-to-mono conversion.
+
+        For Canary, keeps Lhotse enabled (hard requirement) with duration-based
+        batching and fixes for broken None defaults in pretrained configs.
+
+        :param train_manifest: Path to the training manifest JSONL file.
+        :param val_manifest: Path to the validation manifest JSONL file,
+            or ``None`` to skip validation.
+        """
         self.train_manifest = train_manifest
         self.val_manifest = val_manifest
 
@@ -58,36 +88,41 @@ class NeMoTrainer:
         cfg = self.model.cfg
         OmegaConf.set_struct(cfg, False)
 
-        # Both Parakeet and Canary use Lhotse for duration-based dynamic
-        # batching (required to handle variable-length songs without OOM).
-        # Audio files MUST be mono — manifests point to .mono.wav files
-        # created during setup. Fix Lhotse None defaults (NeMo #14816).
-        if cfg.train_ds.get("use_lhotse", False):
+        is_canary = self.config["architecture"] == "canary"
+
+        if is_canary:
+            # Canary hard-requires Lhotse (asserts use_lhotse=True).
+            # Fix broken None defaults in pretrained configs (NeMo #14816).
             cfg.train_ds.num_buckets = cfg.train_ds.get("num_buckets") or 30
             cfg.train_ds.min_tps = cfg.train_ds.get("min_tps") if cfg.train_ds.get("min_tps") is not None else -1
             cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
+            cfg.train_ds.batch_duration = 600
+            cfg.train_ds.batch_size = None
+        else:
+            # Parakeet: use the standard NeMo dataloader.
+            # channel_selector="average" mixes stereo to mono at load time.
+            cfg.train_ds.use_lhotse = False
+            cfg.train_ds.channel_selector = "average"
+            cfg.train_ds.batch_size = self.config["batch_size"]
 
         cfg.train_ds.manifest_filepath = str(train_manifest)
-        # Cap at 60s to avoid RNNT loss overflow on long sequences.
-        # The TDT forward-backward lattice overflows in fp16 with long audio.
-        cfg.train_ds.max_duration = 60.0
+        cfg.train_ds.max_duration = 300.0
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
-        # Use duration-based batching: total audio per batch (seconds),
-        # not a fixed sample count. Lhotse will fit as many songs as
-        # possible within this budget, adapting to variable lengths.
-        cfg.train_ds.batch_duration = 600
-        cfg.train_ds.batch_size = None
 
         if val_manifest:
-            if cfg.validation_ds.get("use_lhotse", False):
+            if is_canary:
                 cfg.validation_ds.num_buckets = cfg.validation_ds.get("num_buckets") or 30
                 cfg.validation_ds.min_tps = cfg.validation_ds.get("min_tps") if cfg.validation_ds.get("min_tps") is not None else -1
                 cfg.validation_ds.max_tps = cfg.validation_ds.get("max_tps") if cfg.validation_ds.get("max_tps") is not None else float("inf")
+                cfg.validation_ds.batch_duration = 600
+                cfg.validation_ds.batch_size = None
+            else:
+                cfg.validation_ds.use_lhotse = False
+                cfg.validation_ds.channel_selector = "average"
+                cfg.validation_ds.batch_size = self.config["batch_size"]
             cfg.validation_ds.manifest_filepath = str(val_manifest)
-            cfg.validation_ds.max_duration = 60.0
-            cfg.validation_ds.batch_duration = 600
-            cfg.validation_ds.batch_size = None
+            cfg.validation_ds.max_duration = 300.0
             cfg.validation_ds.num_workers = 4
 
         if self.config.get("use_augmentation", True):
@@ -114,9 +149,7 @@ class NeMoTrainer:
         cfg.optim.sched.name = "CosineAnnealing"
 
         num_train_samples = _count_manifest_lines(self.train_manifest)
-        # With duration-based batching, estimate steps from total dataset
-        # duration. Assume ~180s avg song -> ~1.5 songs per 120s batch.
-        batch_size = self.config.get("batch_size") or max(1, 120 // 180)
+        batch_size = self.config.get("batch_size") or max(1, 600 // 180)
         steps_per_epoch = math.ceil(num_train_samples / max(batch_size, 1))
         total_steps = self.config["max_epochs"] * steps_per_epoch
 
@@ -125,9 +158,17 @@ class NeMoTrainer:
         cfg.optim.sched.max_steps = total_steps
 
     def train_one_epoch(self, target_epoch: int) -> dict:
-        # Reuse the same PL Trainer to preserve optimizer state across epochs
+        """
+        Train the model up to *target_epoch* using PyTorch Lightning.
+
+        On the first call, initializes a wandb run (best-effort) and creates
+        the PL Trainer. Subsequent calls reuse the same Trainer to preserve
+        optimizer state across epochs.
+
+        :param target_epoch: The epoch number to train up to (1-indexed).
+        :return: Dict of metrics from ``trainer.callback_metrics``.
+        """
         if self.trainer is None:
-            import wandb
             try:
                 wandb.init(
                     project="lyricscribe-finetune",
@@ -142,13 +183,9 @@ class NeMoTrainer:
                 logger.warning(f"wandb init failed ({e}), training without wandb")
                 wandb_logger = None
 
-            # Lhotse iterable datasets don't have __len__. Estimate
-            # steps per epoch for limit_train_batches.
-            num_train_samples = _count_manifest_lines(self.train_manifest)
-            batch_size_est = self.config.get("batch_size") or max(1, 600 // 180)
-            steps_per_epoch = max(1, num_train_samples // max(batch_size_est, 1))
+            uses_lhotse = self.model.cfg.train_ds.get("use_lhotse", False)
 
-            self.trainer = pl.Trainer(
+            trainer_kwargs = dict(
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
                 devices=1,
@@ -157,10 +194,18 @@ class NeMoTrainer:
                 enable_progress_bar=True,
                 logger=wandb_logger,
                 enable_checkpointing=False,
-                use_distributed_sampler=False,
-                limit_train_batches=steps_per_epoch,
                 log_every_n_steps=1,
             )
+
+            if uses_lhotse:
+                # Lhotse iterable datasets don't have __len__.
+                num_train_samples = _count_manifest_lines(self.train_manifest)
+                batch_size_est = self.config.get("batch_size") or max(1, 600 // 180)
+                steps_per_epoch = max(1, num_train_samples // max(batch_size_est, 1))
+                trainer_kwargs["use_distributed_sampler"] = False
+                trainer_kwargs["limit_train_batches"] = steps_per_epoch
+
+            self.trainer = pl.Trainer(**trainer_kwargs)
 
         self.trainer.fit_loop.max_epochs = target_epoch
 
@@ -173,9 +218,8 @@ class NeMoTrainer:
                 metrics[k] = float(v) if isinstance(v, torch.Tensor) else v
 
         # NeMo logs with on_epoch=True which PL may not forward to wandb
-        # in our setup. Manually log to wandb so we get charts.
+        # in our setup. Manually log so we get charts.
         if metrics:
-            import wandb
             if wandb.run is not None:
                 wandb.log(metrics, step=target_epoch)
             logger.info(f"Epoch {target_epoch} metrics: {metrics}")
@@ -183,6 +227,13 @@ class NeMoTrainer:
         return metrics
 
     def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
+        """
+        Save a NeMo ``.nemo`` checkpoint.
+
+        :param epoch: Epoch number for the filename.
+        :param checkpoint_dir: Directory to save into (created if missing).
+        :return: Path to the saved checkpoint file.
+        """
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = checkpoint_dir / f"epoch_{epoch}.nemo"
         self.model.save_to(str(checkpoint_path))
@@ -190,6 +241,12 @@ class NeMoTrainer:
         return checkpoint_path
 
     def load_checkpoint(self, checkpoint_path: Path) -> int:
+        """
+        Restore a model from a ``.nemo`` checkpoint.
+
+        :param checkpoint_path: Path to the checkpoint file.
+        :return: The epoch number extracted from the filename.
+        """
         self.model = nemo_asr.models.ASRModel.restore_from(str(checkpoint_path))
 
         try:
@@ -202,7 +259,18 @@ class NeMoTrainer:
 
 
 class WhisperFinetuneDataset(torch.utils.data.Dataset):
-    """Dataset for Whisper finetuning from NeMo-format manifest."""
+    """
+    Map-style dataset for Whisper finetuning from a manifest JSONL file.
+
+    Each sample loads an audio chunk (using ``offset``/``duration`` from the
+    manifest if present), converts to mono 16 kHz, extracts log-mel features,
+    and tokenizes the transcript. Chunks are pre-sized during manifest
+    creation to fit within Whisper's 448-token decoder limit.
+
+    :param manifest_path: Path to the JSONL manifest file.
+    :param processor: A ``WhisperProcessor`` instance for feature extraction
+        and tokenization.
+    """
 
     def __init__(self, manifest_path: Path, processor: WhisperProcessor):
         self.processor = processor
@@ -211,10 +279,22 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
             for line in f:
                 self.entries.append(json.loads(line))
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """
+        Return the number of manifest entries.
+
+        :return: Entry count.
+        """
         return len(self.entries)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict:
+        """
+        Load and preprocess a single training sample.
+
+        :param idx: Index into the manifest.
+        :return: Dict with ``input_features`` (mel spectrogram tensor) and
+            ``labels`` (token ID list).
+        """
         entry = self.entries[idx]
 
         # Load audio slice if offset/duration are present (chunked manifest)
@@ -222,13 +302,12 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         duration = entry.get("duration")
 
         if offset > 0 or duration is not None:
-            import soundfile as sf
             info = sf.info(entry["audio_filepath"])
             frame_offset = int(offset * info.samplerate)
-            # Clamp to file bounds to avoid empty reads
             max_frames = info.frames - frame_offset
             if max_frames <= 0:
-                audio = torch.zeros(1, 16000)
+                # Defensive: return silence for out-of-bounds chunks
+                audio = torch.zeros(16000)
                 sr = 16000
             else:
                 num_frames = int(duration * info.samplerate) if duration else -1
@@ -239,15 +318,17 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
                     frame_offset=frame_offset,
                     num_frames=num_frames,
                 )
+                if audio.shape[0] > 1:
+                    audio = audio.mean(dim=0)
+                else:
+                    audio = audio.squeeze(0)
         else:
             audio, sr = torchaudio.load(entry["audio_filepath"])
+            if audio.shape[0] > 1:
+                audio = audio.mean(dim=0)
+            else:
+                audio = audio.squeeze(0)
 
-        if audio.shape[0] > 1:
-            audio = audio.mean(dim=0)
-        else:
-            audio = audio.squeeze(0)
-
-        # Guard against empty audio (e.g. chunk past end of file)
         if audio.numel() == 0:
             audio = torch.zeros(16000)
             sr = 16000
@@ -260,18 +341,31 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         ).input_features[0]
 
         labels = self.processor.tokenizer(entry["text"]).input_ids
-        # Whisper's max generation length is 448 tokens
-        if len(labels) > 448:
-            labels = labels[:448]
 
         return {"input_features": input_features, "labels": labels}
 
 
 @dataclass
 class WhisperDataCollator:
+    """
+    Collate function for Whisper finetuning batches.
+
+    Pads input features and label sequences, replacing label padding
+    positions with ``-100`` so they are ignored by the loss.
+
+    :param processor: A ``WhisperProcessor`` instance.
+    """
+
     processor: WhisperProcessor
 
-    def __call__(self, features):
+    def __call__(self, features: list[dict]) -> dict:
+        """
+        Collate a list of samples into a padded batch.
+
+        :param features: List of sample dicts from ``WhisperFinetuneDataset``.
+        :return: Batched dict with ``input_features`` and ``labels``.
+        """
+
         input_features = [{"input_features": f["input_features"]} for f in features]
         batch = self.processor.feature_extractor.pad(
             input_features, return_tensors="pt"
@@ -291,6 +385,15 @@ class WhisperDataCollator:
 
 
 class WhisperTrainer:
+    """
+    Trainer for Whisper models using HuggingFace's ``Seq2SeqTrainer``.
+
+    Handles model loading, dataset creation from manifests, per-epoch
+    training with WER evaluation, and checkpoint management.
+
+    :param config: Job configuration dictionary.
+    """
+
     def __init__(self, config: dict):
         self.config = config
         self.current_epoch = config.get("current_epoch", 0)
@@ -300,7 +403,13 @@ class WhisperTrainer:
         self.train_manifest = None
         self.val_manifest = None
 
-    def _compute_metrics(self, pred):
+    def _compute_metrics(self, pred: "transformers.EvalPrediction") -> dict:
+        """
+        Compute word error rate (WER) from model predictions.
+
+        :param pred: ``EvalPrediction`` from the HuggingFace trainer.
+        :return: Dict with a ``"wer"`` key.
+        """
         pred_ids = pred.predictions
         label_ids = pred.label_ids
 
@@ -314,6 +423,13 @@ class WhisperTrainer:
         return {"wer": wer}
 
     def setup(self, train_manifest: Path, val_manifest: Path | None) -> None:
+        """
+        Load the Whisper model and processor, and configure wandb.
+
+        :param train_manifest: Path to the training manifest JSONL file.
+        :param val_manifest: Path to the validation manifest JSONL file,
+            or ``None`` to skip validation.
+        """
         self.train_manifest = train_manifest
         self.val_manifest = val_manifest
 
@@ -331,6 +447,18 @@ class WhisperTrainer:
                 self.model = self.model.cuda()
 
     def train_one_epoch(self, target_epoch: int) -> dict:
+        """
+        Train the model up to *target_epoch* using HuggingFace's
+        ``Seq2SeqTrainer``.
+
+        On the first call, creates the trainer with the full LR schedule
+        spanning all epochs. Subsequent calls update ``num_train_epochs``
+        and resume training, preserving optimizer state.
+
+        :param target_epoch: The epoch number to train up to (1-indexed).
+        :return: Dict of metrics (train loss, eval WER if validation set
+            is available).
+        """
         train_dataset = WhisperFinetuneDataset(self.train_manifest, self.processor)
         eval_dataset = (
             WhisperFinetuneDataset(self.val_manifest, self.processor)
@@ -402,6 +530,13 @@ class WhisperTrainer:
         return metrics
 
     def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
+        """
+        Save model and processor weights to a directory.
+
+        :param epoch: Epoch number for the directory name.
+        :param checkpoint_dir: Parent directory for checkpoints.
+        :return: Path to the saved checkpoint directory.
+        """
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = checkpoint_dir / f"epoch_{epoch}"
         self.model.save_pretrained(checkpoint_path)
@@ -409,6 +544,12 @@ class WhisperTrainer:
         return checkpoint_path
 
     def load_checkpoint(self, checkpoint_path: Path) -> int:
+        """
+        Restore model and processor from a checkpoint directory.
+
+        :param checkpoint_path: Path to the checkpoint directory.
+        :return: The epoch number extracted from the directory name.
+        """
         self.model = WhisperForConditionalGeneration.from_pretrained(checkpoint_path)
         self.processor = WhisperProcessor.from_pretrained(checkpoint_path)
 
@@ -424,6 +565,14 @@ class WhisperTrainer:
 
 
 def create_trainer(config: dict):
+    """
+    Factory function that returns the appropriate trainer for the given
+    architecture.
+
+    :param config: Job configuration dictionary with an ``"architecture"`` key.
+    :return: A ``NeMoTrainer`` or ``WhisperTrainer`` instance.
+    :raises ValueError: If the architecture is not recognized.
+    """
     architecture = config.get("architecture", "parakeet")
 
     if architecture in ["canary", "parakeet"]:
@@ -443,11 +592,18 @@ def run_training_job(
     """
     Run one training job (one chunk of epochs).
 
-    :param config: Job configuration dictionary
-    :param train_manifest: Path to training manifest
-    :param val_manifest: Path to validation manifest (optional)
-    :param chunk_end_epoch: Hard cap from the chunk definition (if provided)
-    :return: Dict with job results
+    Loads the model (or resumes from the latest checkpoint), trains for
+    ``epochs_per_job`` epochs, saves a checkpoint after each epoch, and
+    writes metrics to ``metrics.jsonl``.
+
+    :param config: Job configuration dictionary.
+    :param train_manifest: Path to the training manifest JSONL file.
+    :param val_manifest: Path to the validation manifest JSONL file,
+        or ``None`` to skip validation.
+    :param chunk_end_epoch: Hard cap on the final epoch from the chunk
+        definition. Overrides ``max_epochs`` if lower.
+    :return: Dict with ``"status"``, ``"start_epoch"``, ``"end_epoch"``,
+        and ``"checkpoint_path"`` keys.
     """
     trainer = create_trainer(config)
 

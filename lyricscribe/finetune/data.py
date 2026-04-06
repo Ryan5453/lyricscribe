@@ -1,43 +1,30 @@
 import json
 import logging
 import random
-import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
 import soundfile as sf
+from transformers import WhisperTokenizer
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_mono(audio_path: str) -> str | None:
-    """Return path to a mono WAV copy, creating it via ffmpeg if needed.
-    Returns None if conversion fails."""
-    info = sf.info(audio_path)
-    if info.channels == 1:
-        return audio_path
-
-    mono_path = str(Path(audio_path).with_suffix(".mono.wav"))
-    if Path(mono_path).exists():
-        return mono_path
-
-    try:
-        subprocess.run(
-            ["ffmpeg", "-i", audio_path, "-ac", "1", "-ar", "16000", "-y", mono_path],
-            capture_output=True, check=True,
-        )
-        return mono_path
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"ffmpeg mono conversion failed for {audio_path}: exit code {e.returncode}")
-        # Clean up partial output
-        Path(mono_path).unlink(missing_ok=True)
-        return None
 
 _RNG = random.Random(42)
 
 
 class LyricsDataset:
+    """
+    Dataset that iterates over song directories, yielding audio paths
+    and transcripts for finetuning.
+
+    Each song directory must contain a ``lyrics.json`` file and at least one
+    of the requested audio filenames.
+
+    :param dataset_dir: Root directory containing song subdirectories.
+    :param filenames: Audio filenames to look for in each song directory.
+        When multiple are provided, one is chosen at random per iteration.
+    """
+
     def __init__(
         self,
         dataset_dir: Path,
@@ -69,9 +56,20 @@ class LyricsDataset:
         logger.info(f"Loaded {len(self.songs)} songs from {dataset_dir} ({', '.join(filenames)})")
 
     def __len__(self) -> int:
+        """
+        Return the number of songs in the dataset.
+
+        :return: Song count.
+        """
         return len(self.songs)
 
     def __iter__(self) -> Iterator[dict]:
+        """
+        Yield dicts with ``song_id``, ``audio_path``, and ``transcript``
+        for each song that has a non-empty unsynced transcript.
+
+        :return: Iterator of song dicts.
+        """
         for song in self.songs:
             lyrics_path = song["dir"] / "lyrics.json"
 
@@ -103,31 +101,22 @@ def create_manifest(
     max_duration: float = 300.0,
 ) -> int:
     """
-    Create manifest JSONL file from dataset. One entry per song.
+    Create a NeMo-format manifest JSONL file from a dataset, with one entry
+    per song.
 
-    For Canary models, includes source_lang, target_lang, pnc, and answer fields
-    required by the Lhotse prompt-based data pipeline.
+    For Canary models, each entry additionally includes ``source_lang``,
+    ``target_lang``, ``pnc``, and ``answer`` fields required by the Lhotse
+    prompt-based data pipeline.
 
-    :param dataset: LyricsDataset instance
-    :param output_path: Path to write manifest
-    :param architecture: Model architecture (canary needs extra fields)
-    :param max_duration: Maximum duration in seconds (songs longer are skipped)
-    :return: Number of entries written
+    :param dataset: Dataset instance to iterate over.
+    :param output_path: Path to write the manifest JSONL file.
+    :param architecture: Model architecture name. ``"canary"`` triggers
+        extra manifest fields.
+    :param max_duration: Maximum audio duration in seconds. Songs exceeding
+        this are skipped.
+    :return: Number of entries written.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # NeMo models (Parakeet + Canary) use Lhotse which requires mono audio.
-    # Pre-convert stereo files to mono via ffmpeg in parallel.
-    all_paths = [item["audio_path"] for item in dataset]
-    needs_convert = [p for p in all_paths if not Path(p).with_suffix(".mono.wav").exists() and sf.info(p).channels > 1]
-    if needs_convert:
-        logger.info(f"  Converting {len(needs_convert)} stereo files to mono (parallel)...")
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(_ensure_mono, needs_convert))
-        failed = sum(1 for r in results if r is None)
-        if failed:
-            logger.warning(f"  {failed}/{len(needs_convert)} files failed mono conversion")
-        logger.info("  Mono conversion complete.")
 
     count = 0
     skipped_duration = 0
@@ -140,12 +129,6 @@ def create_manifest(
 
             try:
                 audio_path = item["audio_path"]
-
-                # Lhotse requires mono audio. Use cached .mono.wav files.
-                audio_path = _ensure_mono(audio_path)
-                if audio_path is None:
-                    continue
-
                 info = sf.info(audio_path)
                 duration = info.duration
 
@@ -176,49 +159,80 @@ def create_manifest(
     return count
 
 
-def _chunk_synced_lines(lines: list[dict], max_chunk_seconds: float = 30.0) -> list[dict]:
+def _chunk_synced_lines(
+    lines: list[dict],
+    tokenizer: WhisperTokenizer,
+    max_tokens: int = 440,
+    max_chunk_seconds: float = 30.0,
+) -> list[dict]:
     """
-    Group consecutive synced lyric lines into chunks of ~max_chunk_seconds.
+    Group consecutive synced lyric lines into chunks that fit within
+    Whisper's decoder token limit.
 
-    :param lines: List of synced line dicts with 'text', 'start' (ms), 'duration' (ms)
-    :param max_chunk_seconds: Target max chunk duration in seconds
-    :return: List of chunk dicts with 'text', 'offset' (seconds), 'duration' (seconds)
+    Lines are accumulated until adding the next line would exceed
+    *max_tokens* or *max_chunk_seconds*, whichever is hit first. The
+    token limit is the primary constraint; the time limit is a secondary
+    safeguard so that Whisper's 30-second feature extractor window is
+    not wasted on silence.
+
+    :param lines: Synced line dicts, each with ``text`` (str),
+        ``start`` (ms), and ``duration`` (ms).
+    :param tokenizer: A Whisper tokenizer instance used to count tokens.
+    :param max_tokens: Maximum number of tokens per chunk. Defaults to
+        440, leaving headroom below Whisper's 448-token decoder limit for
+        special tokens.
+    :param max_chunk_seconds: Secondary time cap per chunk in seconds.
+    :return: List of chunk dicts, each with ``text`` (str),
+        ``offset`` (seconds), and ``duration`` (seconds).
     """
     max_ms = max_chunk_seconds * 1000
     chunks = []
     current_lines = []
+    current_text = ""
+    current_tokens = 0
     chunk_start_ms = None
 
     for line in lines:
-        if not line.get("text", "").strip():
+        text = line.get("text", "").strip()
+        if not text:
             continue
 
         line_start = line["start"]
         line_end = line_start + line["duration"]
 
+        # Tokenize the candidate text to get exact token count
+        candidate_text = f"{current_text} {text}".strip() if current_text else text
+        candidate_tokens = len(tokenizer(candidate_text).input_ids)
+
         if chunk_start_ms is None:
             chunk_start_ms = line_start
 
         chunk_duration_ms = line_end - chunk_start_ms
+        exceeds_tokens = candidate_tokens > max_tokens
+        exceeds_time = chunk_duration_ms > max_ms
 
-        # If adding this line would exceed the limit and we already have lines, flush
-        if chunk_duration_ms > max_ms and current_lines:
+        if (exceeds_tokens or exceeds_time) and current_lines:
+            # Flush current chunk
             last_end = current_lines[-1]["start"] + current_lines[-1]["duration"]
             chunks.append({
-                "text": " ".join(l["text"].strip() for l in current_lines),
+                "text": current_text,
                 "offset": chunk_start_ms / 1000.0,
                 "duration": (last_end - chunk_start_ms) / 1000.0,
             })
             current_lines = [line]
+            current_text = text
+            current_tokens = len(tokenizer(text).input_ids)
             chunk_start_ms = line_start
         else:
             current_lines.append(line)
+            current_text = candidate_text
+            current_tokens = candidate_tokens
 
     # Flush remaining lines
     if current_lines and chunk_start_ms is not None:
         last_end = current_lines[-1]["start"] + current_lines[-1]["duration"]
         chunks.append({
-            "text": " ".join(l["text"].strip() for l in current_lines),
+            "text": current_text,
             "offset": chunk_start_ms / 1000.0,
             "duration": (last_end - chunk_start_ms) / 1000.0,
         })
@@ -229,20 +243,32 @@ def _chunk_synced_lines(lines: list[dict], max_chunk_seconds: float = 30.0) -> l
 def create_whisper_manifest(
     dataset: LyricsDataset,
     output_path: Path,
+    model_name: str = "openai/whisper-large-v3",
+    max_tokens: int = 440,
     max_chunk_seconds: float = 30.0,
 ) -> int:
     """
-    Create manifest JSONL for Whisper finetuning, chunking songs into ~30s segments
-    using synced line-level lyrics.
+    Create a manifest JSONL for Whisper finetuning by chunking songs into
+    segments that fit within Whisper's 448-token decoder limit, using
+    synced line-level lyrics for audio boundaries.
 
-    Songs without synced lyrics are skipped.
+    The tokenizer is loaded from *model_name* to ensure chunks are sized
+    correctly for the target model. Songs without synced lyrics are
+    skipped entirely.
 
-    :param dataset: LyricsDataset instance
-    :param output_path: Path to write manifest
-    :param max_chunk_seconds: Target max chunk duration
-    :return: Number of entries written
+    :param dataset: Dataset instance to iterate over.
+    :param output_path: Path to write the manifest JSONL file.
+    :param model_name: HuggingFace model identifier for loading the
+        tokenizer (e.g. ``"openai/whisper-large-v3"``).
+    :param max_tokens: Maximum tokens per chunk (default 440, leaving
+        headroom for special tokens below Whisper's 448 limit).
+    :param max_chunk_seconds: Secondary time cap per chunk in seconds.
+    :return: Number of chunk entries written.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"  Loading tokenizer: {model_name}")
+    tokenizer = WhisperTokenizer.from_pretrained(model_name)
 
     count = 0
     skipped_no_sync = 0
@@ -264,7 +290,9 @@ def create_whisper_manifest(
                     continue
 
                 audio_file = song["dir"] / _RNG.choice(song["available"])
-                chunks = _chunk_synced_lines(synced, max_chunk_seconds)
+                chunks = _chunk_synced_lines(
+                    synced, tokenizer, max_tokens, max_chunk_seconds,
+                )
 
                 for chunk in chunks:
                     if not chunk["text"].strip():

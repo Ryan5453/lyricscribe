@@ -553,8 +553,10 @@ def finetune_setup(
     train_manifest = job_dir / "train_manifest.jsonl"
 
     if config['architecture'] == 'whisper':
-        n_train = finetune_data.create_whisper_manifest(train_dataset, train_manifest)
-        logger.info(f"Training: {n_train} chunks (Whisper 30s segments)")
+        n_train = finetune_data.create_whisper_manifest(
+            train_dataset, train_manifest, model_name=config['base_model'],
+        )
+        logger.info(f"Training: {n_train} chunks (Whisper token-bounded segments)")
     else:
         n_train = finetune_data.create_manifest(train_dataset, train_manifest, architecture=config['architecture'])
         logger.info(f"Training: {n_train} songs")
@@ -567,7 +569,9 @@ def finetune_setup(
         )
         val_manifest = job_dir / "val_manifest.jsonl"
         if config['architecture'] == 'whisper':
-            n_val = finetune_data.create_whisper_manifest(val_dataset, val_manifest)
+            n_val = finetune_data.create_whisper_manifest(
+                val_dataset, val_manifest, model_name=config['base_model'],
+            )
             logger.info(f"Validation: {n_val} chunks")
         else:
             n_val = finetune_data.create_manifest(val_dataset, val_manifest, architecture=config['architecture'])

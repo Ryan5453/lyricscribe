@@ -63,21 +63,47 @@ def setup_finetune_job(config: dict, train_manifest: Path, val_manifest: Path | 
 
 
 def load_job_status(job_dir: Path) -> dict:
+    """
+    Load the top-level job status from ``status.json``.
+
+    :param job_dir: Path to the job directory.
+    :return: Status dictionary.
+    """
     with open(job_dir / "status.json") as f:
         return json.load(f)
 
 
 def save_job_status(job_dir: Path, status: dict) -> None:
+    """
+    Write the top-level job status to ``status.json``.
+
+    :param job_dir: Path to the job directory.
+    :param status: Status dictionary to write.
+    """
     with open(job_dir / "status.json", "w") as f:
         json.dump(status, f, indent=2)
 
 
 def load_chunk_status(job_dir: Path, chunk_id: int) -> dict:
+    """
+    Load the status of a single chunk.
+
+    :param job_dir: Path to the job directory.
+    :param chunk_id: Chunk number.
+    :return: Chunk status dictionary.
+    """
     with open(job_dir / "chunks" / f"chunk_{chunk_id}.json") as f:
         return json.load(f)
 
 
 def save_chunk_status(job_dir: Path, chunk_id: int, status: dict) -> None:
+    """
+    Write the status of a single chunk.
+
+    :param job_dir: Path to the job directory.
+    :param chunk_id: Chunk number.
+    :param status: Chunk status dictionary to write.
+    """
     with open(job_dir / "chunks" / f"chunk_{chunk_id}.json", "w") as f:
         json.dump(status, f, indent=2)
 

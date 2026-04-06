@@ -3,8 +3,8 @@
 #SBATCH --output=/projects/fahey.rya/music2text/logs/finetune/setup_%j.out
 #SBATCH --time=08:00:00
 #SBATCH --partition=short
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
 
 # Sets up all finetuning experiments, then launches the orchestrator.
 
@@ -24,7 +24,6 @@ EXPDIR=/projects/fahey.rya/music2text/experiments
 MODELS=(
     "nvidia/parakeet-tdt-0.6b-v3"
     "openai/whisper-large-v3"
-    "nvidia/canary-1b-v2"
 )
 
 # Each entry is a pipe-separated list of filenames
