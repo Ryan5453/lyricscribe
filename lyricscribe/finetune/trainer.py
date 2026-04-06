@@ -119,6 +119,8 @@ class NeMoTrainer:
             wandb.init(
                 project="lyricscribe-finetune",
                 name=self.config["exp_name"],
+                id=self.config["exp_name"],
+                resume="allow",
                 tags=[self.config["architecture"], self.config["base_model"]],
                 settings=wandb.Settings(init_timeout=300),
             )
