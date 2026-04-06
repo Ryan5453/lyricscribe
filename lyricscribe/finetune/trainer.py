@@ -58,41 +58,28 @@ class NeMoTrainer:
         cfg = self.model.cfg
         OmegaConf.set_struct(cfg, False)
 
-        is_canary = self.config["architecture"] == "canary"
-
-        if is_canary:
-            # Canary hard-requires Lhotse. Keep it enabled and fix
-            # broken None defaults (NeMo #14816).
-            # Audio files MUST be mono — Canary's prompt formatter
-            # rejects MultiCut (stereo). Manifests must point to mono files.
+        # Both Parakeet and Canary use Lhotse for duration-based dynamic
+        # batching (required to handle variable-length songs without OOM).
+        # Audio files MUST be mono — manifests point to .mono.wav files
+        # created during setup. Fix Lhotse None defaults (NeMo #14816).
+        if cfg.train_ds.get("use_lhotse", False):
             cfg.train_ds.num_buckets = cfg.train_ds.get("num_buckets") or 30
             cfg.train_ds.min_tps = cfg.train_ds.get("min_tps") if cfg.train_ds.get("min_tps") is not None else -1
             cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
-        else:
-            # Parakeet: disable Lhotse and use the standard NeMo dataloader
-            # which handles stereo→mono via channel_selector.
-            cfg.train_ds.use_lhotse = False
-            cfg.train_ds.channel_selector = "average"
 
         cfg.train_ds.manifest_filepath = str(train_manifest)
         cfg.train_ds.batch_size = self.config["batch_size"]
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
-        # Override pretrained max_duration (default 10s filters everything)
-        cfg.train_ds.max_duration = self.config.get("max_duration", 300.0)
 
         if val_manifest:
-            if is_canary:
+            if cfg.validation_ds.get("use_lhotse", False):
                 cfg.validation_ds.num_buckets = cfg.validation_ds.get("num_buckets") or 30
                 cfg.validation_ds.min_tps = cfg.validation_ds.get("min_tps") if cfg.validation_ds.get("min_tps") is not None else -1
                 cfg.validation_ds.max_tps = cfg.validation_ds.get("max_tps") if cfg.validation_ds.get("max_tps") is not None else float("inf")
-            else:
-                cfg.validation_ds.use_lhotse = False
-                cfg.validation_ds.channel_selector = "average"
             cfg.validation_ds.manifest_filepath = str(val_manifest)
             cfg.validation_ds.batch_size = self.config["batch_size"]
             cfg.validation_ds.num_workers = 4
-            cfg.validation_ds.max_duration = self.config.get("max_duration", 300.0)
 
         if self.config.get("use_augmentation", True):
             cfg.spec_augment.freq_masks = 2
@@ -145,12 +132,11 @@ class NeMoTrainer:
                 enable_checkpointing=False,
             )
 
-            # Canary uses Lhotse (iterable dataset, no __len__).
-            if self.model.cfg.train_ds.get("use_lhotse", False):
-                num_train_samples = _count_manifest_lines(self.train_manifest)
-                steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
-                trainer_kwargs["use_distributed_sampler"] = False
-                trainer_kwargs["limit_train_batches"] = steps_per_epoch
+            # Lhotse iterable datasets don't have __len__.
+            num_train_samples = _count_manifest_lines(self.train_manifest)
+            steps_per_epoch = max(1, num_train_samples // self.config["batch_size"])
+            trainer_kwargs["use_distributed_sampler"] = False
+            trainer_kwargs["limit_train_batches"] = steps_per_epoch
 
             self.trainer = pl.Trainer(**trainer_kwargs)
 

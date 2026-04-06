@@ -116,18 +116,18 @@ def create_manifest(
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Canary requires mono audio. Pre-convert all files in parallel.
-    if architecture == "canary":
-        all_paths = [item["audio_path"] for item in dataset]
-        needs_convert = [p for p in all_paths if not Path(p).with_suffix(".mono.wav").exists() and sf.info(p).channels > 1]
-        if needs_convert:
-            logger.info(f"  Converting {len(needs_convert)} stereo files to mono (parallel)...")
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                results = list(pool.map(_ensure_mono, needs_convert))
-            failed = sum(1 for r in results if r is None)
-            if failed:
-                logger.warning(f"  {failed}/{len(needs_convert)} files failed mono conversion")
-            logger.info("  Mono conversion complete.")
+    # NeMo models (Parakeet + Canary) use Lhotse which requires mono audio.
+    # Pre-convert stereo files to mono via ffmpeg in parallel.
+    all_paths = [item["audio_path"] for item in dataset]
+    needs_convert = [p for p in all_paths if not Path(p).with_suffix(".mono.wav").exists() and sf.info(p).channels > 1]
+    if needs_convert:
+        logger.info(f"  Converting {len(needs_convert)} stereo files to mono (parallel)...")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(_ensure_mono, needs_convert))
+        failed = sum(1 for r in results if r is None)
+        if failed:
+            logger.warning(f"  {failed}/{len(needs_convert)} files failed mono conversion")
+        logger.info("  Mono conversion complete.")
 
     count = 0
     skipped_duration = 0
@@ -141,12 +141,10 @@ def create_manifest(
             try:
                 audio_path = item["audio_path"]
 
-                # Canary's Lhotse pipeline requires MonoCut (mono audio).
-                # Use cached .mono.wav created by the parallel pre-conversion above.
-                if architecture == "canary":
-                    audio_path = _ensure_mono(audio_path)
-                    if audio_path is None:
-                        continue
+                # Lhotse requires mono audio. Use cached .mono.wav files.
+                audio_path = _ensure_mono(audio_path)
+                if audio_path is None:
+                    continue
 
                 info = sf.info(audio_path)
                 duration = info.duration
