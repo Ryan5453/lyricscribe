@@ -287,6 +287,45 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         """
         return len(self.entries)
 
+    def _load_audio(self, entry: dict) -> tuple[torch.Tensor, int]:
+        """
+        Load audio from a manifest entry, handling offset/duration slicing
+        and stereo-to-mono conversion.
+
+        :param entry: A single manifest entry dict.
+        :return: Tuple of (mono audio tensor, sample rate).
+        :raises RuntimeError: If the audio file cannot be decoded.
+        """
+        offset = entry.get("offset", 0)
+        duration = entry.get("duration")
+
+        if offset > 0 or duration is not None:
+            info = sf.info(entry["audio_filepath"])
+            frame_offset = int(offset * info.samplerate)
+            max_frames = info.frames - frame_offset
+            if max_frames <= 0:
+                return torch.zeros(16000), 16000
+            num_frames = int(duration * info.samplerate) if duration else -1
+            if num_frames > 0:
+                num_frames = min(num_frames, max_frames)
+            audio, sr = torchaudio.load(
+                entry["audio_filepath"],
+                frame_offset=frame_offset,
+                num_frames=num_frames,
+            )
+        else:
+            audio, sr = torchaudio.load(entry["audio_filepath"])
+
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0)
+        else:
+            audio = audio.squeeze(0)
+
+        if audio.numel() == 0:
+            return torch.zeros(16000), 16000
+
+        return audio, sr
+
     def __getitem__(self, idx: int) -> dict:
         """
         Load and preprocess a single training sample.
@@ -297,39 +336,10 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         """
         entry = self.entries[idx]
 
-        # Load audio slice if offset/duration are present (chunked manifest)
-        offset = entry.get("offset", 0)
-        duration = entry.get("duration")
-
-        if offset > 0 or duration is not None:
-            info = sf.info(entry["audio_filepath"])
-            frame_offset = int(offset * info.samplerate)
-            max_frames = info.frames - frame_offset
-            if max_frames <= 0:
-                # Defensive: return silence for out-of-bounds chunks
-                audio = torch.zeros(16000)
-                sr = 16000
-            else:
-                num_frames = int(duration * info.samplerate) if duration else -1
-                if num_frames > 0:
-                    num_frames = min(num_frames, max_frames)
-                audio, sr = torchaudio.load(
-                    entry["audio_filepath"],
-                    frame_offset=frame_offset,
-                    num_frames=num_frames,
-                )
-                if audio.shape[0] > 1:
-                    audio = audio.mean(dim=0)
-                else:
-                    audio = audio.squeeze(0)
-        else:
-            audio, sr = torchaudio.load(entry["audio_filepath"])
-            if audio.shape[0] > 1:
-                audio = audio.mean(dim=0)
-            else:
-                audio = audio.squeeze(0)
-
-        if audio.numel() == 0:
+        try:
+            audio, sr = self._load_audio(entry)
+        except Exception as e:
+            logger.warning(f"Failed to load audio for {entry.get('audio_filepath', '?')}: {e}")
             audio = torch.zeros(16000)
             sr = 16000
 
