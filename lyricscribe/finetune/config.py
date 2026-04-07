@@ -56,7 +56,7 @@ def create_finetune_config(
         "output_dir": str(output_dir),
         "exp_name": exp_name,
         "filenames": filenames,
-        "batch_size": kwargs.get("batch_size", 24 if architecture == "whisper" else 2),
+        "batch_size": kwargs.get("batch_size", 24 if architecture == "whisper" else 1),
         "max_epochs": kwargs.get("max_epochs", 50),
         "epochs_per_job": kwargs.get("epochs_per_job", 5),
         "learning_rate": kwargs.get("learning_rate", 1e-5),
