@@ -497,7 +497,9 @@ class WhisperTrainer:
                 warmup_ratio=warmup_ratio,
                 num_train_epochs=self.config["max_epochs"],
                 fp16=torch.cuda.is_available(),
-                save_strategy="no",
+                save_strategy="steps",
+                save_steps=2000,
+                save_total_limit=2,
                 logging_steps=100,
                 remove_unused_columns=False,
                 label_names=["labels"],
@@ -525,8 +527,17 @@ class WhisperTrainer:
 
         self.hf_trainer.args.num_train_epochs = target_epoch
 
+        # Resume from the latest HF step checkpoint if one exists (e.g.
+        # after a SLURM timeout). Otherwise start from the beginning.
+        hf_trainer_dir = Path(self.config["output_dir"]) / self.config["exp_name"] / "hf_trainer"
+        step_checkpoints = sorted(hf_trainer_dir.glob("checkpoint-*")) if hf_trainer_dir.exists() else []
+        resume_ckpt = str(step_checkpoints[-1]) if step_checkpoints else None
+
+        if resume_ckpt:
+            logger.info(f"Resuming from HF step checkpoint: {resume_ckpt}")
+
         logger.info(f"Training epoch {target_epoch}...")
-        self.hf_trainer.train(resume_from_checkpoint=False)
+        self.hf_trainer.train(resume_from_checkpoint=resume_ckpt)
 
         metrics = {}
         if eval_dataset is not None:
