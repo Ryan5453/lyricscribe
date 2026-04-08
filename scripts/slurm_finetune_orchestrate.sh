@@ -104,15 +104,75 @@ mark_chunk_status() {
     local exp_dir=$1
     local chunk_id=$2
     local new_status=$3
+    local job_id=${4:-}
     python3 -c "
 import json, sys
 path = sys.argv[1] + '/chunks/chunk_' + sys.argv[2] + '.json'
 with open(path) as f:
     data = json.load(f)
 data['status'] = sys.argv[3]
+if len(sys.argv) > 4 and sys.argv[4]:
+    data['slurm_job_id'] = sys.argv[4]
+elif sys.argv[3] != 'running':
+    data.pop('slurm_job_id', None)
 with open(path, 'w') as f:
     json.dump(data, f, indent=2)
-" "$exp_dir" "$chunk_id" "$new_status"
+" "$exp_dir" "$chunk_id" "$new_status" "$job_id"
+}
+
+# Read the slurm_job_id stored on a chunk (empty if none)
+chunk_job_id() {
+    local exp_dir=$1
+    local chunk_id=$2
+    python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1] + '/chunks/chunk_' + sys.argv[2] + '.json') as f:
+        print(json.load(f).get('slurm_job_id', ''))
+except Exception:
+    print('')
+" "$exp_dir" "$chunk_id" 2>/dev/null
+}
+
+# Reset any 'running' chunks whose slurm_job_id is no longer in the queue.
+# Returns the number of chunks reset.
+reset_orphaned_chunks() {
+    local reset_count=0
+    for exp in "${EXPERIMENTS[@]}"; do
+        local total=${TOTAL_CHUNKS[$exp]}
+        for ((i = 1; i <= total; i++)); do
+            local status
+            status=$(python3 -c "
+import json, sys
+with open(sys.argv[1] + '/chunks/chunk_' + sys.argv[2] + '.json') as f:
+    print(json.load(f)['status'])
+" "$exp" "$i" 2>/dev/null)
+            [ "$status" != "running" ] && continue
+
+            local jid
+            jid=$(chunk_job_id "$exp" "$i")
+
+            if [ -z "$jid" ]; then
+                # Running but no tracked job — definitely orphaned
+                echo "[$(date '+%H:%M:%S')] Orphan: $(basename "$exp") chunk $i (no job_id) -> pending"
+                mark_chunk_status "$exp" "$i" "pending"
+                reset_count=$((reset_count + 1))
+                continue
+            fi
+
+            # Check if the job is still in the queue
+            if ! squeue -j "$jid" -h 2>/dev/null | grep -q .; then
+                echo "[$(date '+%H:%M:%S')] Orphan: $(basename "$exp") chunk $i (job $jid gone) -> pending"
+                mark_chunk_status "$exp" "$i" "pending"
+                # Clear in-memory tracking too if it matches
+                if [ "${ACTIVE_JOB[$exp]:-0}" = "$jid" ]; then
+                    ACTIVE_JOB[$exp]=0
+                fi
+                reset_count=$((reset_count + 1))
+            fi
+        done
+    done
+    return $reset_count
 }
 
 # Get the next actionable chunk for an experiment.
@@ -162,7 +222,7 @@ submit_chunk() {
         if SLURM_OUT=$(sbatch "$SCRIPT_PATH" "$exp_dir" "$chunk_id" 2>&1); then
             SLURM_ID=$(echo "$SLURM_OUT" | awk '{print $NF}')
             ACTIVE_JOB[$exp_dir]=$SLURM_ID
-            mark_chunk_status "$exp_dir" "$chunk_id" "running"
+            mark_chunk_status "$exp_dir" "$chunk_id" "running" "$SLURM_ID"
             echo "[$(date '+%H:%M:%S')] Submitted $(basename "$exp_dir") chunk $chunk_id (job $SLURM_ID)"
             return 0
         else
@@ -177,28 +237,37 @@ submit_chunk() {
     done
 }
 
-# Recover from previous orchestrator run: any chunks stuck in "running"
-# without an actual SLURM job are orphaned and need to be reset to "pending".
-echo "Checking for orphaned running chunks..."
-NUM_FINETUNE_JOBS=$(squeue -u "$USER" -p gpu -h -o "%j" 2>/dev/null | grep -c "lyricscribe_finetune" || true)
-for exp in "${EXPERIMENTS[@]}"; do
-    total=${TOTAL_CHUNKS[$exp]}
-    for ((i = 1; i <= total; i++)); do
-        status=$(python3 -c "
+# After startup, rebuild ACTIVE_JOB from chunks marked "running" so the
+# main loop can monitor them across orchestrator restarts.
+rebuild_active_jobs_from_disk() {
+    for exp in "${EXPERIMENTS[@]}"; do
+        local total=${TOTAL_CHUNKS[$exp]}
+        for ((i = 1; i <= total; i++)); do
+            local status
+            status=$(python3 -c "
 import json, sys
 with open(sys.argv[1] + '/chunks/chunk_' + sys.argv[2] + '.json') as f:
     print(json.load(f)['status'])
 " "$exp" "$i" 2>/dev/null)
-        if [ "$status" = "running" ]; then
-            if [ "$NUM_FINETUNE_JOBS" -gt 0 ]; then
-                echo "  $(basename "$exp") chunk $i: marked running and finetune jobs exist in queue, leaving as-is"
-            else
-                echo "  $(basename "$exp") chunk $i: orphaned (no finetune jobs in queue), resetting to pending"
-                mark_chunk_status "$exp" "$i" "pending"
+            if [ "$status" = "running" ]; then
+                local jid
+                jid=$(chunk_job_id "$exp" "$i")
+                if [ -n "$jid" ] && squeue -j "$jid" -h 2>/dev/null | grep -q .; then
+                    ACTIVE_JOB[$exp]=$jid
+                    echo "[$(date '+%H:%M:%S')] Recovered: $(basename "$exp") chunk $i is job $jid"
+                fi
+                break  # Only one chunk per experiment can be running at a time
             fi
-        fi
+        done
     done
-done
+}
+
+# Recover from previous orchestrator run: rebuild in-memory job tracking
+# from chunks marked "running" with a still-live slurm_job_id, then reset
+# any orphaned chunks (running with no live job).
+echo "Recovering state from previous orchestrator run..."
+rebuild_active_jobs_from_disk
+reset_orphaned_chunks || true
 echo "---"
 
 while true; do
@@ -262,6 +331,10 @@ with open(sys.argv[1] + '/chunks/chunk_' + sys.argv[2] + '.json') as f:
             done
         fi
     done
+
+    # Catch chunks left "running" by orchestrator restarts, node crashes,
+    # or jobs we lost track of for any other reason.
+    reset_orphaned_chunks || true
 
     # Count currently submitted GPU jobs
     GPU_SUBMITTED=$(squeue -u "$USER" -p gpu -h 2>/dev/null | wc -l)
