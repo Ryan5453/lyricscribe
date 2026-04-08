@@ -6,12 +6,10 @@ from pathlib import Path
 
 import typer
 
-from lyricscribe import demucs, jobs, plots
-from lyricscribe.dataset import download_jam_alt, download_musdb_alt
-from lyricscribe.evaluate import collect_evaluation_data, evaluate_job
-from lyricscribe.finetune import data as finetune_data
+# Lightweight imports only — heavy modules (torch, transformers, nemo,
+# demucs, librosa) are imported lazily inside the commands that need them
+# so the CLI starts in well under a second for status/retry/inspect.
 from lyricscribe.finetune import jobs as finetune_jobs
-from lyricscribe.finetune import trainer as finetune_trainer
 from lyricscribe.finetune.config import (
     create_finetune_config,
     get_checkpoint_for_epoch,
@@ -19,8 +17,6 @@ from lyricscribe.finetune.config import (
     list_checkpoints,
     load_finetune_config,
 )
-from lyricscribe.transcribe import job as transcribe_job
-from lyricscribe.transcribe.artifacts import correlation, extractor, processor
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +101,8 @@ def separate_setup(
     """
     Initialize separation job by registering files into chunks.
     """
+    from lyricscribe import demucs
+
     demucs.setup_job(
         directories=directories,
         job_dir=job_dir,
@@ -125,6 +123,8 @@ def separate_run(
     """
     Process one chunk of the separation job.
     """
+    from lyricscribe import demucs
+
     demucs.process_chunk(job_dir=job_dir, chunk_id=chunk_id)
 
 
@@ -135,6 +135,8 @@ def separate_inspect(
     """
     Inspect separation job details and processing statistics.
     """
+    from lyricscribe import jobs
+
     with open(job_dir / "config.json") as f:
         config = json.load(f)
 
@@ -151,6 +153,8 @@ def separate_reset(
 
     Deletes separated output files and resets all chunk statuses to pending.
     """
+    from lyricscribe import demucs
+
     demucs.reset_job(job_dir)
 
 
@@ -197,6 +201,8 @@ def transcribe_setup(
     """
     Initialize a transcription job by registering files into chunks.
     """
+    from lyricscribe.transcribe import job as transcribe_job
+
     transcribe_job.setup_job(
         directories=directories,
         job_dir=job_dir,
@@ -221,6 +227,8 @@ def transcribe_run(
     """
     Process one chunk of a transcription job.
     """
+    from lyricscribe.transcribe import job as transcribe_job
+
     transcribe_job.process_chunk(job_dir=job_dir, chunk_id=chunk_id)
 
 
@@ -231,6 +239,8 @@ def transcribe_inspect(
     """
     Inspect transcription job details and processing statistics.
     """
+    from lyricscribe import jobs
+
     with open(job_dir / "config.json") as f:
         config = json.load(f)
     logger.info(f"VAD: {'enabled' if config.get('vad') else 'disabled'}")
@@ -281,6 +291,8 @@ def dataset_jam_alt(
     """
     Download the Jam-ALT dataset (79 songs, 4 languages).
     """
+    from lyricscribe.dataset import download_jam_alt
+
     download_jam_alt(output_dir)
 
 
@@ -293,6 +305,8 @@ def dataset_musdb_alt(
     """
     Download the MUSDB-ALT dataset (39 English songs).
     """
+    from lyricscribe.dataset import download_musdb_alt
+
     download_musdb_alt(output_dir)
 
 
@@ -303,6 +317,8 @@ def evaluate(
     ),
 ):
     """Evaluate transcription quality against ground-truth lyrics."""
+    from lyricscribe.evaluate import evaluate_job
+
     stats = evaluate_job(job_dir, verbose=True)
     if not stats:
         return
@@ -324,6 +340,8 @@ def evaluate_summarize(
     ),
 ):
     """Aggregate evaluation results across all jobs into a CSV file."""
+    from lyricscribe.evaluate import collect_evaluation_data
+
     all_stats = collect_evaluation_data(jobs_dir)
 
     if not all_stats:
@@ -376,6 +394,9 @@ def evaluate_plot(
     --results-file, and --musdb-dir. Repeat --results-file to include multiple
     model result files. The word-level dataset is built in memory.
     """
+    from lyricscribe import plots
+    from lyricscribe.transcribe.artifacts import correlation
+
     word_dataset = None
     result_files = _collect_result_files(
         results_file,
@@ -403,6 +424,8 @@ def artifact_extract(
     output_dir: Path = typer.Option(..., "--output-dir", help="Directory to write artifact feature JSON files"),
 ):
     """Extract per-frame artifact features for each song."""
+    from lyricscribe.transcribe.artifacts import extractor
+
     extractor.process_dataset(musdb_dir, output_dir)
 
 
@@ -428,6 +451,8 @@ def artifact_align(
     ),
 ):
     """Run Montreal Forced Aligner (via Singularity/Apptainer) for word-level alignments."""
+    from lyricscribe.transcribe.artifacts import processor
+
     processor.align(
         musdb_dir,
         output_dir,
@@ -465,6 +490,8 @@ def artifact_build(
     ),
 ):
     """Build the word-level dataset combining alignments, artifacts, and errors."""
+    from lyricscribe.transcribe.artifacts import correlation
+
     result_files = _collect_result_files(
         results_file,
         jobs_dir=results_jobs_dir,
@@ -516,6 +543,10 @@ def finetune_setup(
 
     Pass multiple --filename flags to train on a random mix of audio types.
     """
+    # Lazy import: data.py pulls in transformers (WhisperTokenizer),
+    # which is heavy. Only setup needs it.
+    from lyricscribe.finetune import data as finetune_data
+
     try:
         config = create_finetune_config(
             base_model=model,
@@ -593,11 +624,15 @@ def finetune_run(
     
     This is typically called by the SLURM script, not run directly.
     """
+    # Lazy import: trainer pulls in NeMo + Lightning + transformers,
+    # which takes a long time. Avoid that overhead for non-run commands.
+    from lyricscribe.finetune import trainer as finetune_trainer
+
     config_path = job_dir / "config.json"
     if not config_path.exists():
         logger.error(f"No config found at {config_path}")
         return
-    
+
     # status.json is the source of truth for current_epoch
     config = load_finetune_config(job_dir)
     status = finetune_jobs.load_job_status(job_dir)
