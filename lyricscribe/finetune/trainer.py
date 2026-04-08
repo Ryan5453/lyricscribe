@@ -446,6 +446,11 @@ class WhisperTrainer:
 
         import os
         os.environ.setdefault("WANDB_PROJECT", "lyricscribe-finetune")
+        # Pin the wandb run ID to the experiment name and allow resume so
+        # all SLURM-restarted chunks log into a single continuous wandb run
+        # instead of creating a new one each time.
+        os.environ["WANDB_RUN_ID"] = self.config["exp_name"]
+        os.environ["WANDB_RESUME"] = "allow"
 
         if self.model is None:
             logger.info(f"Loading Whisper model: {self.config['base_model']}")
@@ -471,11 +476,20 @@ class WhisperTrainer:
             is available).
         """
         train_dataset = WhisperFinetuneDataset(self.train_manifest, self.processor)
-        eval_dataset = (
-            WhisperFinetuneDataset(self.val_manifest, self.processor)
-            if self.val_manifest
-            else None
-        )
+        eval_dataset = None
+        if self.val_manifest:
+            full_eval = WhisperFinetuneDataset(self.val_manifest, self.processor)
+            # Eval is autoregressive generation which is much slower than
+            # training (~3 hours on the full validation set vs ~3 hours per
+            # training epoch). Sample a fixed subset for during-training
+            # sanity checks; full eval can be run separately if needed.
+            eval_subset_size = self.config.get("eval_subset_size", 200)
+            if len(full_eval) > eval_subset_size:
+                rng = torch.Generator().manual_seed(42)
+                indices = torch.randperm(len(full_eval), generator=rng)[:eval_subset_size].tolist()
+                eval_dataset = torch.utils.data.Subset(full_eval, indices)
+            else:
+                eval_dataset = full_eval
 
         job_dir = Path(self.config["output_dir"]) / self.config["exp_name"]
 
@@ -506,7 +520,7 @@ class WhisperTrainer:
                 label_names=["labels"],
                 weight_decay=0.01,
                 max_grad_norm=1.0,
-                dataloader_num_workers=4,
+                dataloader_num_workers=16,
                 predict_with_generate=True,
                 report_to="wandb",
                 run_name=self.config["exp_name"],
