@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -527,11 +528,23 @@ class WhisperTrainer:
 
         self.hf_trainer.args.num_train_epochs = target_epoch
 
-        # Resume from the latest HF step checkpoint if one exists (e.g.
-        # after a SLURM timeout). Otherwise start from the beginning.
+        # Resume from the latest *complete* HF step checkpoint if one
+        # exists. Incomplete checkpoints (from SLURM-killed mid-save) are
+        # detected by missing trainer_state.json and removed.
         hf_trainer_dir = Path(self.config["output_dir"]) / self.config["exp_name"] / "hf_trainer"
-        step_checkpoints = sorted(hf_trainer_dir.glob("checkpoint-*")) if hf_trainer_dir.exists() else []
-        resume_ckpt = str(step_checkpoints[-1]) if step_checkpoints else None
+        resume_ckpt = None
+        if hf_trainer_dir.exists():
+            step_checkpoints = sorted(
+                hf_trainer_dir.glob("checkpoint-*"),
+                key=lambda p: int(p.name.split("-")[1]),
+            )
+            for ckpt in reversed(step_checkpoints):
+                if (ckpt / "trainer_state.json").exists():
+                    resume_ckpt = str(ckpt)
+                    break
+                else:
+                    logger.warning(f"Removing incomplete checkpoint: {ckpt}")
+                    shutil.rmtree(ckpt, ignore_errors=True)
 
         if resume_ckpt:
             logger.info(f"Resuming from HF step checkpoint: {resume_ckpt}")

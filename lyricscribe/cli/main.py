@@ -666,26 +666,114 @@ def finetune_reset(
 @finetune_app.command("retry")
 def finetune_retry(
     job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
-    chunk_id: int = typer.Option(..., "--chunk-id", help="Chunk to retry"),
+    chunk_id: int = typer.Option(None, "--chunk-id", help="Specific chunk to retry (default: all failed chunks)"),
 ):
     """
-    Reset a single failed chunk back to pending so it can be resubmitted.
+    Reset failed chunks back to pending so the orchestrator resubmits them.
 
-    Use this when a chunk fails (OOM, bug, timeout) and you want the
-    orchestrator to pick it up again without resetting the whole experiment.
+    Without ``--chunk-id``, resets every failed chunk in the experiment.
+    With ``--chunk-id``, resets only that specific chunk.
+
+    Use this after fixing a bug to re-run failed chunks without losing
+    successful checkpoints.
     """
-    chunk_path = job_dir / "chunks" / f"chunk_{chunk_id}.json"
-    if not chunk_path.exists():
-        logger.error(f"Chunk {chunk_id} not found at {chunk_path}")
+    if not (job_dir / "status.json").exists():
+        logger.error(f"No job found at {job_dir}")
         return
 
-    chunk_data = finetune_jobs.load_chunk_status(job_dir, chunk_id)
-    if chunk_data["status"] == "success":
-        logger.error(f"Chunk {chunk_id} already succeeded — use 'reset' to start over")
+    if chunk_id is not None:
+        chunk_path = job_dir / "chunks" / f"chunk_{chunk_id}.json"
+        if not chunk_path.exists():
+            logger.error(f"Chunk {chunk_id} not found at {chunk_path}")
+            return
+
+        chunk_data = finetune_jobs.load_chunk_status(job_dir, chunk_id)
+        if chunk_data["status"] == "success":
+            logger.error(f"Chunk {chunk_id} already succeeded — use 'reset' to start over")
+            return
+
+        finetune_jobs.update_chunk_status(job_dir, chunk_id, "pending")
+        logger.info(f"Chunk {chunk_id} reset to pending — orchestrator will resubmit it")
+    else:
+        n = finetune_jobs.reset_failed_chunks(job_dir)
+        if n == 0:
+            logger.info(f"No failed chunks in {job_dir.name}")
+        else:
+            logger.info(f"Reset {n} failed chunks in {job_dir.name} — orchestrator will resubmit them")
+
+
+@finetune_app.command("retry-all")
+def finetune_retry_all(
+    experiments_dir: Path = typer.Option(..., "--experiments-dir", help="Directory containing experiment subdirectories"),
+):
+    """
+    Reset all failed chunks across every experiment in a directory.
+
+    This is the "I just deployed a fix, retry everything" button. It
+    leaves successful chunks and existing checkpoints alone.
+    """
+    if not experiments_dir.exists():
+        logger.error(f"Directory not found: {experiments_dir}")
         return
 
-    finetune_jobs.update_chunk_status(job_dir, chunk_id, "pending")
-    logger.info(f"Chunk {chunk_id} reset to pending — orchestrator will resubmit it")
+    total_reset = 0
+    total_experiments = 0
+    for job_dir in sorted(experiments_dir.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        if not (job_dir / "status.json").exists():
+            continue
+        total_experiments += 1
+        n = finetune_jobs.reset_failed_chunks(job_dir)
+        if n > 0:
+            logger.info(f"  {job_dir.name}: reset {n} chunks")
+            total_reset += n
+
+    logger.info(f"Reset {total_reset} chunks across {total_experiments} experiments")
+
+
+@finetune_app.command("status")
+def finetune_status(
+    experiments_dir: Path = typer.Option(..., "--experiments-dir", help="Directory containing experiment subdirectories"),
+):
+    """
+    Print a one-line summary of every experiment's progress.
+
+    Shows chunk counts, last checkpoint, and last metric values for
+    each experiment in the directory.
+    """
+    if not experiments_dir.exists():
+        logger.error(f"Directory not found: {experiments_dir}")
+        return
+
+    rows = []
+    for job_dir in sorted(experiments_dir.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        if not (job_dir / "status.json").exists():
+            continue
+        rows.append(finetune_jobs.gather_experiment_status(job_dir))
+
+    if not rows:
+        logger.info(f"No experiments found in {experiments_dir}")
+        return
+
+    name_width = max(len(r["exp_name"]) for r in rows)
+    for r in rows:
+        c = r["chunks"]
+        ckpt = r["last_checkpoint"] or "none"
+        chunks_str = f"{c['success']}✓ {c['failed']}✗ {c['running']}▶ {c['pending']}⏸"
+        loss_str = ""
+        if r["last_metrics"]:
+            for k in ("train_loss", "loss", "eval_loss"):
+                if k in r["last_metrics"]:
+                    loss_str = f" {k}={r['last_metrics'][k]:.3f}"
+                    break
+        logger.info(
+            f"  {r['exp_name']:<{name_width}}  "
+            f"{r['current_epoch']:>2}/{r['max_epochs']} epochs  "
+            f"chunks={chunks_str}  ckpt={ckpt}{loss_str}"
+        )
 
 
 @finetune_app.command("export-model")

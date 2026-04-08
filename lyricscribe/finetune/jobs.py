@@ -207,6 +207,92 @@ def show_job_stats(job_dir: Path) -> None:
                 logger.info(f"  {', '.join(parts)}")
 
 
+def reset_failed_chunks(job_dir: Path) -> int:
+    """
+    Reset all failed chunks in a job back to ``pending`` so the
+    orchestrator will resubmit them.
+
+    Unlike :func:`reset_job`, this preserves successful chunks and
+    existing checkpoints.
+
+    :param job_dir: Path to the job directory.
+    :return: Number of chunks that were reset.
+    """
+    chunks_dir = job_dir / "chunks"
+    if not chunks_dir.exists():
+        return 0
+
+    reset = 0
+    for chunk_file in sorted(chunks_dir.glob("chunk_*.json")):
+        chunk_id = int(chunk_file.stem.split("_")[1])
+        chunk_data = load_chunk_status(job_dir, chunk_id)
+        if chunk_data["status"] == "failed":
+            chunk_data["status"] = "pending"
+            save_chunk_status(job_dir, chunk_id, chunk_data)
+            reset += 1
+
+    if reset > 0:
+        # Reset the top-level status if it was marked complete-with-failures
+        job_status = load_job_status(job_dir)
+        if job_status.get("status") == "complete_with_failures":
+            job_status["status"] = "pending"
+            save_job_status(job_dir, job_status)
+
+    return reset
+
+
+def gather_experiment_status(job_dir: Path) -> dict:
+    """
+    Collect a one-line summary of an experiment's progress.
+
+    :param job_dir: Path to the job directory.
+    :return: Dict with ``exp_name``, ``architecture``, ``filenames``,
+        chunk counts (``done``, ``failed``, ``running``, ``pending``),
+        ``last_checkpoint``, and ``last_metrics``.
+    """
+    status = load_job_status(job_dir)
+
+    chunks_dir = job_dir / "chunks"
+    counts = {"pending": 0, "running": 0, "success": 0, "failed": 0}
+    if chunks_dir.exists():
+        for chunk_file in chunks_dir.glob("chunk_*.json"):
+            chunk_id = int(chunk_file.stem.split("_")[1])
+            chunk_data = load_chunk_status(job_dir, chunk_id)
+            counts[chunk_data["status"]] = counts.get(chunk_data["status"], 0) + 1
+
+    last_checkpoint = None
+    ckpt_dir = job_dir / "checkpoints"
+    if ckpt_dir.exists():
+        ckpts = [p for p in ckpt_dir.iterdir() if p.name.startswith("epoch_")]
+        if ckpts:
+            def epoch_num(p: Path) -> int:
+                try:
+                    return int(p.stem.split("_")[1])
+                except (IndexError, ValueError):
+                    return -1
+            last_checkpoint = max(ckpts, key=epoch_num).name
+
+    last_metrics = None
+    metrics_path = job_dir / "metrics.jsonl"
+    if metrics_path.exists():
+        with open(metrics_path) as f:
+            lines = f.readlines()
+        if lines:
+            last_metrics = json.loads(lines[-1])
+
+    return {
+        "exp_name": status["exp_name"],
+        "architecture": status["architecture"],
+        "filenames": status["filenames"],
+        "max_epochs": status["max_epochs"],
+        "current_epoch": status.get("current_epoch", 0),
+        "status": status.get("status", "unknown"),
+        "chunks": counts,
+        "last_checkpoint": last_checkpoint,
+        "last_metrics": last_metrics,
+    }
+
+
 def reset_job(job_dir: Path) -> None:
     """
     Reset a finetuning job to start from scratch.
