@@ -583,14 +583,13 @@ def finetune_setup(
     job_dir.mkdir(parents=True, exist_ok=True)
     train_manifest = job_dir / "train_manifest.jsonl"
 
-    if config['architecture'] == 'whisper':
-        n_train = finetune_data.create_whisper_manifest(
-            train_dataset, train_manifest, model_name=config['base_model'],
-        )
-        logger.info(f"Training: {n_train} chunks (Whisper token-bounded segments)")
-    else:
-        n_train = finetune_data.create_manifest(train_dataset, train_manifest, architecture=config['architecture'])
-        logger.info(f"Training: {n_train} songs")
+    n_train = finetune_data.create_manifest(
+        train_dataset,
+        train_manifest,
+        architecture=config['architecture'],
+        model_name=config['base_model'],
+    )
+    logger.info(f"Training: {n_train} chunks (synced-line segments)")
 
     val_manifest = None
     if val_dir:
@@ -599,14 +598,13 @@ def finetune_setup(
             filenames=config['filenames'],
         )
         val_manifest = job_dir / "val_manifest.jsonl"
-        if config['architecture'] == 'whisper':
-            n_val = finetune_data.create_whisper_manifest(
-                val_dataset, val_manifest, model_name=config['base_model'],
-            )
-            logger.info(f"Validation: {n_val} chunks")
-        else:
-            n_val = finetune_data.create_manifest(val_dataset, val_manifest, architecture=config['architecture'])
-            logger.info(f"Validation: {n_val} songs")
+        n_val = finetune_data.create_manifest(
+            val_dataset,
+            val_manifest,
+            architecture=config['architecture'],
+            model_name=config['base_model'],
+        )
+        logger.info(f"Validation: {n_val} chunks")
     
     finetune_jobs.setup_finetune_job(config, train_manifest, val_manifest)
 

@@ -198,6 +198,15 @@ class NeMoTrainer:
                 log_every_n_steps=1,
             )
 
+            # Cap validation to a fixed number of batches so we get a quick
+            # sanity check each epoch instead of running over the entire
+            # ~88k-chunk validation manifest. The full eval can be done
+            # separately with the inference harness on a real test set.
+            if self.val_manifest is not None:
+                trainer_kwargs["limit_val_batches"] = self.config.get(
+                    "eval_subset_size", 200
+                )
+
             if uses_lhotse:
                 # Lhotse iterable datasets don't have __len__.
                 num_train_samples = _count_manifest_lines(self.train_manifest)
@@ -351,6 +360,14 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
             audio.numpy(), sampling_rate=16000, return_tensors="pt"
         ).input_features[0]
 
+        # Set per-sample decoder prefix tokens so each label sequence starts
+        # with the correct <|lang|><|transcribe|> prefix Whisper expects.
+        # Each DataLoader worker has its own dataset/processor copy and
+        # __getitem__ runs sequentially within a worker, so mutating the
+        # tokenizer state here is safe.
+        self.processor.tokenizer.set_prefix_tokens(
+            language=entry["language"], task="transcribe"
+        )
         labels = self.processor.tokenizer(entry["text"]).input_ids
 
         return {"input_features": input_features, "labels": labels}
@@ -458,6 +475,13 @@ class WhisperTrainer:
                 self.config["base_model"]
             )
             self.processor = WhisperProcessor.from_pretrained(self.config["base_model"])
+
+            # In-loop eval cannot pass per-sample language to generate(), so
+            # let Whisper auto-detect language per sample. The training-time
+            # labels still get the correct per-sample prefix via the dataset.
+            self.model.generation_config.language = None
+            self.model.generation_config.task = "transcribe"
+            self.model.generation_config.forced_decoder_ids = None
 
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
