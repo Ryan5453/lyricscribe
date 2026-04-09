@@ -668,6 +668,11 @@ def run_training_job(
     ``epochs_per_job`` epochs, saves a checkpoint after each epoch, and
     writes metrics to ``metrics.jsonl``.
 
+    On ``torch.cuda.OutOfMemoryError`` the batch size is halved, the
+    discovered value is persisted to ``config.json``, the trainer is
+    recreated from the latest checkpoint, and the chunk is retried. This
+    repeats until either training succeeds or batch size hits 1.
+
     :param config: Job configuration dictionary.
     :param train_manifest: Path to the training manifest JSONL file.
     :param val_manifest: Path to the validation manifest JSONL file,
@@ -677,9 +682,43 @@ def run_training_job(
     :return: Dict with ``"status"``, ``"start_epoch"``, ``"end_epoch"``,
         and ``"checkpoint_path"`` keys.
     """
+    job_dir = Path(config["output_dir"]) / config["exp_name"]
+
+    while True:
+        try:
+            return _run_training_job_inner(
+                config, train_manifest, val_manifest, chunk_end_epoch, job_dir
+            )
+        except torch.cuda.OutOfMemoryError as e:
+            current_bs = config.get("batch_size", 1)
+            if current_bs <= 1:
+                logger.error("OOM at batch_size=1, cannot reduce further")
+                raise
+            new_bs = max(1, current_bs // 2)
+            logger.warning(
+                f"OOM at batch_size={current_bs} ({e}). "
+                f"Halving to batch_size={new_bs} and retrying."
+            )
+            config["batch_size"] = new_bs
+            with open(job_dir / "config.json", "w") as f:
+                json.dump(config, f, indent=2)
+            torch.cuda.empty_cache()
+
+
+def _run_training_job_inner(
+    config: dict,
+    train_manifest: Path,
+    val_manifest: Path | None,
+    chunk_end_epoch: int | None,
+    job_dir: Path,
+) -> dict:
+    """
+    Inner training implementation. Builds a fresh trainer, resumes from
+    the latest checkpoint if any, and trains the requested epochs. Any
+    OOM raised here is caught and handled by ``run_training_job``.
+    """
     trainer = create_trainer(config)
 
-    job_dir = Path(config["output_dir"]) / config["exp_name"]
     start_epoch = config.get("current_epoch", 0)
     latest_checkpoint = get_latest_checkpoint(job_dir, config)
 
@@ -711,7 +750,11 @@ def run_training_job(
     checkpoint_dir = job_dir / "checkpoints"
     last_checkpoint_path = None
 
-    logger.info(f"Training {epochs_to_train} epochs (from epoch {start_epoch}), saving after each")
+    logger.info(
+        f"Training {epochs_to_train} epochs "
+        f"(from epoch {start_epoch}, batch_size={config.get('batch_size')}), "
+        "saving after each"
+    )
 
     for epoch in range(start_epoch + 1, start_epoch + epochs_to_train + 1):
         metrics = trainer.train_one_epoch(epoch)

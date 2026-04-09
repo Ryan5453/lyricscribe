@@ -520,16 +520,16 @@ def finetune_setup(
         None, "--val-dir", help="Directory containing validation songs (optional but recommended)"
     ),
     batch_size: int = typer.Option(
-        8, "--batch-size", help="Training batch size"
+        None, "--batch-size", help="Training batch size (default: arch-dependent)"
     ),
     max_epochs: int = typer.Option(
-        50, "--max-epochs", help="Maximum training epochs"
+        None, "--max-epochs", help="Maximum training epochs (default: from config)"
     ),
     epochs_per_job: int = typer.Option(
-        5, "--epochs-per-job", help="Epochs to train per SLURM job (default: 5)"
+        None, "--epochs-per-job", help="Epochs to train per SLURM job (default: from config)"
     ),
     learning_rate: float = typer.Option(
-        1e-5, "--learning-rate", help="Peak learning rate"
+        None, "--learning-rate", help="Peak learning rate (default: arch-dependent)"
     ),
     no_augment: bool = typer.Option(
         False, "--no-augment", help="Disable SpecAugment"
@@ -547,6 +547,17 @@ def finetune_setup(
     # which is heavy. Only setup needs it.
     from lyricscribe.finetune import data as finetune_data
 
+    overrides = {
+        k: v
+        for k, v in {
+            "batch_size": batch_size,
+            "max_epochs": max_epochs,
+            "epochs_per_job": epochs_per_job,
+            "learning_rate": learning_rate,
+        }.items()
+        if v is not None
+    }
+
     try:
         config = create_finetune_config(
             base_model=model,
@@ -554,11 +565,8 @@ def finetune_setup(
             output_dir=output_dir,
             filenames=filename,
             val_dir=val_dir,
-            batch_size=batch_size,
-            max_epochs=max_epochs,
-            epochs_per_job=epochs_per_job,
-            learning_rate=learning_rate,
             use_augmentation=not no_augment,
+            **overrides,
         )
     except ValueError as e:
         logger.error(f"Invalid configuration: {e}")

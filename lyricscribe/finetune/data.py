@@ -133,6 +133,13 @@ def _chunk_synced_lines(
         if not text:
             continue
 
+        # Skip individual synced lines longer than the chunk cap. These are
+        # almost always data anomalies (e.g. a provider returning the full
+        # song as a single "line"). Letting them through produces oversized
+        # chunks that OOM Parakeet/Canary at training time.
+        if line["duration"] > max_ms:
+            continue
+
         line_start = line["start"]
         line_end = line_start + line["duration"]
 
