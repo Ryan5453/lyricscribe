@@ -771,7 +771,7 @@ def _run_training_job_inner(
         logger.info(f"Resuming from checkpoint: {latest_checkpoint}")
         try:
             loaded_epoch = trainer.load_checkpoint(latest_checkpoint)
-            start_epoch = loaded_epoch + 1
+            start_epoch = loaded_epoch
         except Exception as e:
             logger.warning(
                 f"Failed to load checkpoint {latest_checkpoint}: {e}. "
