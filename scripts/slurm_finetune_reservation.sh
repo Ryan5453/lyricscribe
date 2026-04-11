@@ -14,12 +14,11 @@
 #SBATCH --reservation=fahey.rya_test
 #SBATCH --nodelist=d1028
 
-# GPU count is set dynamically below via sacct/scontrol, but SBATCH
-# directives must be static. We override via srun flags instead.
-# Request max GPUs; the launcher will use only $NUM_GPUS of them.
-#SBATCH --gres=gpu:a100:2
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=128G
+# Default to 1 GPU. For multi-GPU benchmarks, override on the command line:
+#   sbatch --gres=gpu:a100:2 --cpus-per-task=32 --mem=128G scripts/slurm_finetune_reservation.sh ... 2
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 
 if [ -z "$1" ] || [ -z "$2" ]; then
     echo "Error: Job directory and chunk ID are required"
