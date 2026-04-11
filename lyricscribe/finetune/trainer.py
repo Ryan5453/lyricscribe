@@ -210,7 +210,7 @@ class NeMoTrainer:
             step_checkpoint = ModelCheckpoint(
                 dirpath=str(self._step_ckpt_dir),
                 every_n_train_steps=2000,
-                save_top_k=2,
+                save_top_k=-1,
                 filename="step-{step:08d}",
             )
 
