@@ -9,6 +9,7 @@ import jiwer
 import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf
 import lightning.pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 import soundfile as sf
 import torch
@@ -24,6 +25,14 @@ from transformers import (
 from lyricscribe.finetune.config import get_latest_checkpoint
 
 logger = logging.getLogger(__name__)
+
+
+def _is_main_process() -> bool:
+    """Return True if this is rank 0 (or single-GPU). Used to guard
+    file writes (checkpoints, metrics, config) in multi-GPU DDP."""
+    import os
+    return int(os.environ.get("LOCAL_RANK", 0)) == 0
+
 
 def _count_manifest_lines(manifest_path: Path) -> int:
     """
@@ -186,15 +195,36 @@ class NeMoTrainer:
 
             uses_lhotse = self.model.cfg.train_ds.get("use_lhotse", False)
 
+            num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            if num_gpus > 1:
+                logger.info(f"Multi-GPU detected: {num_gpus} devices, using DDP")
+
+            # Mid-epoch step checkpoints so SLURM timeouts don't waste
+            # an entire epoch of training. PL restores full state (model,
+            # optimizer, scheduler, step counter) on resume.
+            self._step_ckpt_dir = (
+                Path(self.config["output_dir"])
+                / self.config["exp_name"]
+                / "pl_step_checkpoints"
+            )
+            step_checkpoint = ModelCheckpoint(
+                dirpath=str(self._step_ckpt_dir),
+                every_n_train_steps=2000,
+                save_top_k=2,
+                filename="step-{step:08d}",
+            )
+
             trainer_kwargs = dict(
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
-                devices=1,
+                devices=num_gpus,
+                strategy="ddp" if num_gpus > 1 else "auto",
                 precision="bf16-mixed" if torch.cuda.is_available() else 32,
                 gradient_clip_val=1.0,
                 enable_progress_bar=True,
                 logger=wandb_logger,
-                enable_checkpointing=False,
+                enable_checkpointing=True,
+                callbacks=[step_checkpoint],
                 log_every_n_steps=1,
             )
 
@@ -219,8 +249,22 @@ class NeMoTrainer:
 
         self.trainer.fit_loop.max_epochs = target_epoch
 
+        # Resume from the latest step checkpoint if one exists (e.g. after
+        # a SLURM timeout mid-epoch). PL restores model weights, optimizer,
+        # scheduler, and dataloader position so we lose at most ~2000 steps.
+        ckpt_path = None
+        step_ckpt_dir = getattr(self, "_step_ckpt_dir", None)
+        if step_ckpt_dir and step_ckpt_dir.exists():
+            step_ckpts = sorted(
+                step_ckpt_dir.glob("step-*.ckpt"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            if step_ckpts:
+                ckpt_path = str(step_ckpts[-1])
+                logger.info(f"Resuming from step checkpoint: {ckpt_path}")
+
         logger.info(f"Training epoch {target_epoch}...")
-        self.trainer.fit(self.model)
+        self.trainer.fit(self.model, ckpt_path=ckpt_path)
 
         metrics = {}
         if hasattr(self.trainer, "callback_metrics"):
@@ -483,8 +527,8 @@ class WhisperTrainer:
             self.model.generation_config.task = "transcribe"
             self.model.generation_config.forced_decoder_ids = None
 
-            if torch.cuda.is_available():
-                self.model = self.model.cuda()
+            # Don't manually move to CUDA here — Seq2SeqTrainer handles
+            # device placement, including multi-GPU DDP via torchrun.
 
     def train_one_epoch(self, target_epoch: int) -> dict:
         """
@@ -605,14 +649,17 @@ class WhisperTrainer:
         """
         Save model and processor weights to a directory.
 
+        Only writes on rank 0 in multi-GPU DDP.
+
         :param epoch: Epoch number for the directory name.
         :param checkpoint_dir: Parent directory for checkpoints.
         :return: Path to the saved checkpoint directory.
         """
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = checkpoint_dir / f"epoch_{epoch}"
-        self.model.save_pretrained(checkpoint_path)
-        self.processor.save_pretrained(checkpoint_path)
+        if _is_main_process():
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.model.save_pretrained(checkpoint_path)
+            self.processor.save_pretrained(checkpoint_path)
         return checkpoint_path
 
     def load_checkpoint(self, checkpoint_path: Path) -> int:
@@ -630,9 +677,7 @@ class WhisperTrainer:
         except (IndexError, ValueError):
             epoch = 0
 
-        if torch.cuda.is_available():
-            self.model = self.model.cuda()
-
+        # Seq2SeqTrainer handles device placement (including multi-GPU).
         return epoch
 
 
@@ -761,15 +806,26 @@ def _run_training_job_inner(
 
         last_checkpoint_path = trainer.save_checkpoint(epoch, checkpoint_dir)
 
-        config["current_epoch"] = epoch
-        config["completed_epochs"] = epoch
-        with open(job_dir / "config.json", "w") as f:
-            json.dump(config, f, indent=2)
+        # Only rank 0 writes config/metrics to avoid races in multi-GPU DDP.
+        if _is_main_process():
+            config["current_epoch"] = epoch
+            config["completed_epochs"] = epoch
+            with open(job_dir / "config.json", "w") as f:
+                json.dump(config, f, indent=2)
 
-        metrics_entry = {"epoch": epoch}
-        metrics_entry.update(metrics)
-        with open(job_dir / "metrics.jsonl", "a") as f:
-            f.write(json.dumps(metrics_entry) + "\n")
+            metrics_entry = {"epoch": epoch}
+            metrics_entry.update(metrics)
+            with open(job_dir / "metrics.jsonl", "a") as f:
+                f.write(json.dumps(metrics_entry) + "\n")
+
+            # Clean up mid-epoch step checkpoints after a successful epoch.
+            # The .nemo epoch checkpoint is the durable artifact; step
+            # checkpoints are only needed for mid-epoch SLURM timeout recovery.
+            step_ckpt_dir = job_dir / "pl_step_checkpoints"
+            if step_ckpt_dir.exists():
+                for ckpt in step_ckpt_dir.glob("*.ckpt"):
+                    ckpt.unlink()
+                logger.info("Cleaned up mid-epoch step checkpoints")
 
         logger.info(f"Epoch {epoch} complete, checkpoint saved")
 
