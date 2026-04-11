@@ -747,6 +747,12 @@ def run_training_job(
             config["batch_size"] = new_bs
             with open(job_dir / "config.json", "w") as f:
                 json.dump(config, f, indent=2)
+            # Force garbage collection of the old trainer/model before
+            # clearing CUDA cache. Without this, the old model's GPU
+            # tensors are still referenced and empty_cache() can't free
+            # them, causing each retry to OOM on top of the previous.
+            import gc
+            gc.collect()
             torch.cuda.empty_cache()
 
 
