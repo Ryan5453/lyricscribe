@@ -116,6 +116,7 @@ class NeMoTrainer:
             cfg.train_ds.batch_size = self.config["batch_size"]
 
         cfg.train_ds.manifest_filepath = str(train_manifest)
+        cfg.train_ds.min_duration = 0.1
         cfg.train_ds.max_duration = 240.0
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
@@ -132,6 +133,7 @@ class NeMoTrainer:
                 cfg.validation_ds.channel_selector = "average"
                 cfg.validation_ds.batch_size = self.config["batch_size"]
             cfg.validation_ds.manifest_filepath = str(val_manifest)
+            cfg.validation_ds.min_duration = 0.1
             cfg.validation_ds.max_duration = 240.0
             cfg.validation_ds.num_workers = 4
 
