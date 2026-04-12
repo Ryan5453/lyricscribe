@@ -146,6 +146,11 @@ class NeMoTrainer:
         cfg.train_ds.manifest_filepath = str(train_manifest)
         cfg.train_ds.min_duration = 0.1
         cfg.train_ds.max_duration = 240.0
+
+        # Ensure the RNNT/TDT loss returns a scalar (mean over batch).
+        # Newer NeMo/PL versions error on logging per-sample loss vectors.
+        if hasattr(cfg, "loss") and cfg.loss is not None:
+            cfg.loss.reduction = "mean_batch"
         cfg.train_ds.shuffle = True
         cfg.train_ds.num_workers = 4
 
@@ -515,8 +520,16 @@ class WhisperTrainer:
         pred_ids = pred.predictions
         label_ids = pred.label_ids
 
-        # Replace -100 padding with pad token for decoding
-        label_ids[label_ids == -100] = self.processor.tokenizer.pad_token_id
+        # Sanitize both pred and label IDs before decoding. Generated
+        # predictions can contain -100 padding or out-of-vocab values
+        # when the model hallucinates, which trips batch_decode with
+        # OverflowError. Clip to the valid tokenizer vocab range.
+        pad_id = self.processor.tokenizer.pad_token_id
+        vocab_size = self.processor.tokenizer.vocab_size
+
+        label_ids[label_ids == -100] = pad_id
+        pred_ids[pred_ids == -100] = pad_id
+        pred_ids[(pred_ids < 0) | (pred_ids >= vocab_size)] = pad_id
 
         pred_str = self.processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = self.processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
