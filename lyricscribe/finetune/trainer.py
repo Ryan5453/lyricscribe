@@ -9,7 +9,7 @@ import jiwer
 import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf
 import lightning.pytorch as pl
-from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
 import soundfile as sf
 import torch
@@ -32,6 +32,25 @@ def _is_main_process() -> bool:
     file writes (checkpoints, metrics, config) in multi-GPU DDP."""
     import os
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
+
+
+class _SkipBadBatchCallback(Callback):
+    """Skip training batches that would crash the RNNT/TDT loss.
+
+    NeMo's RNNT loss raises ``RuntimeError: Invalid parameter`` when a
+    sample has zero encoder frames (e.g. audio at the stated manifest
+    offset is empty or corrupted). This callback catches the error and
+    skips the batch instead of crashing the entire job.
+    """
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if batch is not None and isinstance(batch, tuple) and len(batch) >= 2:
+            signal_len = batch[1]  # NeMo ASR batch: (signal, signal_len, text, text_len)
+            if hasattr(signal_len, "min") and signal_len.min().item() == 0:
+                logger.warning(
+                    f"Skipping batch {batch_idx}: contains sample with 0 audio frames"
+                )
+                return -1  # PL convention: return -1 to skip batch
 
 
 def _count_manifest_lines(manifest_path: Path) -> int:
@@ -226,7 +245,7 @@ class NeMoTrainer:
                 enable_progress_bar=True,
                 logger=wandb_logger,
                 enable_checkpointing=True,
-                callbacks=[step_checkpoint],
+                callbacks=[step_checkpoint, _SkipBadBatchCallback()],
                 log_every_n_steps=1,
             )
 
