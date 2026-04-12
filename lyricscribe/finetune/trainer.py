@@ -35,22 +35,31 @@ def _is_main_process() -> bool:
 
 
 class _SkipBadBatchCallback(Callback):
-    """Skip training batches that would crash the RNNT/TDT loss.
+    """Skip training batches that crash the RNNT/TDT loss.
 
     NeMo's RNNT loss raises ``RuntimeError: Invalid parameter`` when a
-    sample has zero encoder frames (e.g. audio at the stated manifest
-    offset is empty or corrupted). This callback catches the error and
-    skips the batch instead of crashing the entire job.
+    sample has zero encoder frames after subsampling (e.g. audio at the
+    stated manifest offset is too short or corrupted). Raw signal_len
+    may be non-zero, so we can't filter pre-forward. Instead we wrap
+    the model's training_step to catch the error and return a zero loss.
     """
 
-    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
-        if batch is not None and isinstance(batch, tuple) and len(batch) >= 2:
-            signal_len = batch[1]  # NeMo ASR batch: (signal, signal_len, text, text_len)
-            if hasattr(signal_len, "min") and signal_len.min().item() == 0:
-                logger.warning(
-                    f"Skipping batch {batch_idx}: contains sample with 0 audio frames"
-                )
-                return -1  # PL convention: return -1 to skip batch
+    def setup(self, trainer, pl_module, stage=None):
+        original_step = pl_module.training_step
+
+        def safe_training_step(batch, batch_idx):
+            try:
+                return original_step(batch, batch_idx)
+            except RuntimeError as e:
+                if "Invalid parameter" in str(e) or "working space memory" in str(e):
+                    logger.warning(
+                        f"Skipping batch {batch_idx}: RNNT loss got invalid input "
+                        f"(likely zero encoder frames). Error: {e}"
+                    )
+                    return torch.tensor(0.0, device=next(pl_module.parameters()).device, requires_grad=True)
+                raise
+
+        pl_module.training_step = safe_training_step
 
 
 def _count_manifest_lines(manifest_path: Path) -> int:
