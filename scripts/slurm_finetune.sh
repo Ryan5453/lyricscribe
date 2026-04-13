@@ -2,22 +2,17 @@
 # Use a login shell so Environment Modules are initialized
 #SBATCH --job-name=lyricscribe_finetune
 #SBATCH --output=/projects/fahey.rya/music2text/logs/finetune/finetune_%j.out
-#SBATCH --time=8:00:00
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:h200:1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --time=12:00:00
+#SBATCH --partition=multigpu
+#SBATCH --gres=gpu:h200:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=256G
 
-# Finetuning job script for SLURM
+# Finetuning job script for SLURM (multigpu, 4 H200s per job).
 # Usage: sbatch scripts/slurm_finetune.sh /path/to/job-dir <chunk-id>
 #
-# This trains one chunk (block of epochs) of a finetuning job.
-# Each chunk saves a checkpoint, so you can resume if the job times out.
-#
-# To run the full training:
-#   1. Setup the job: lyricscribe finetune setup ...
-#   2. Create a run list: for i in {1..N}; do echo "/path/to/job $i"; done > finetune_jobs.txt
-#   3. Use the orchestrator: sbatch scripts/slurm_finetune_orchestrate.sh experiments.txt
+# Whisper uses torchrun to launch DDP; NeMo/Parakeet picks up multi-GPU
+# via torch.cuda.device_count() inside its PL Trainer config.
 
 if [ -z "$1" ] || [ -z "$2" ]; then
     echo "Error: Job directory and chunk ID are required"
@@ -42,10 +37,20 @@ source .venv/bin/activate
 
 set -euo pipefail
 
-echo "Starting finetuning chunk $CHUNK_ID..."
+NUM_GPUS=$(nvidia-smi --query-gpu=count --format=csv,noheader | head -1)
+ARCHITECTURE=$(python3 -c "import json; print(json.load(open('$JOB_DIR/config.json'))['architecture'])")
+
+echo "Starting finetuning chunk $CHUNK_ID ($ARCHITECTURE) on $NUM_GPUS GPU(s)..."
 echo "Start time: $(date)"
 
-lyricscribe finetune run --job-dir "$JOB_DIR" --chunk-id "$CHUNK_ID"
+if [ "$ARCHITECTURE" = "whisper" ] && [ "$NUM_GPUS" -gt 1 ]; then
+    # HF Seq2SeqTrainer uses torchrun env vars for DDP.
+    torchrun --nproc_per_node="$NUM_GPUS" \
+        $(which lyricscribe) finetune run --job-dir "$JOB_DIR" --chunk-id "$CHUNK_ID"
+else
+    # NeMo/PL Trainer spawns its own DDP processes via the strategy="ddp" config.
+    lyricscribe finetune run --job-dir "$JOB_DIR" --chunk-id "$CHUNK_ID"
+fi
 
 echo "Chunk $CHUNK_ID completed successfully"
 echo "End time: $(date)"
