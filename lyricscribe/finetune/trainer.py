@@ -703,6 +703,21 @@ class WhisperTrainer:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self.model.save_pretrained(checkpoint_path)
             self.processor.save_pretrained(checkpoint_path)
+
+            # Fix a transformers 4.57.x bug: save_pretrained() writes
+            # eos_token_id as a single-element list in generation_config.json,
+            # which crashes Whisper's SuppressTokensAtBeginLogitsProcessor
+            # at inference time (it uses eos_token_id as a slice index).
+            # Unwrap it back to an int.
+            gen_config_path = checkpoint_path / "generation_config.json"
+            if gen_config_path.exists():
+                with open(gen_config_path) as f:
+                    gc = json.load(f)
+                eos = gc.get("eos_token_id")
+                if isinstance(eos, list) and len(eos) == 1:
+                    gc["eos_token_id"] = eos[0]
+                    with open(gen_config_path, "w") as f:
+                        json.dump(gc, f, indent=2)
         return checkpoint_path
 
     def load_checkpoint(self, checkpoint_path: Path) -> int:
