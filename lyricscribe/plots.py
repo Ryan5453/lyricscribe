@@ -1,6 +1,7 @@
 import logging
 from pathlib import Path
 
+import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -564,15 +565,23 @@ def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
     logger.info(f"Saved error type breakdown plot -> {output_path}")
 
 
+_PIPELINE_LABELS: dict[tuple[str, bool, bool], str] = {
+    ("vocals.wav", False, False): "Clean Stems",
+    ("htdemucs_ft_vocals.wav", False, False): "Demucs",
+    ("htdemucs_ft_vocals.wav", True, False): "Demucs + VAD",
+    ("mixture.wav", True, False): "VAD-guided Mix",
+    ("mixture.wav", False, False): "Raw Mix",
+}
+
+
 def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
     """
-    Generate per-model scatter plots of pipeline error-profile shifts.
+    Generate a scatter plot of pipeline error-profile shifts.
 
-    For each model a scatter plot shows how every pipeline configuration
-    shifts the insertion and deletion proportions relative to a baseline
-    (clean stems, no VAD, no chunking).  Each point is annotated with
-    its pipeline descriptor, and dashed cross-hairs mark the zero-delta
-    axes.
+    Filters to ``musdb_alt`` and the five key pipeline configurations,
+    plots all models on a single axes colour-coded by model, with
+    human-readable pipeline labels.  The baseline is clean stems
+    (vocals.wav, no VAD, no chunking).
 
     :param df: evaluation summary DataFrame as returned by
         :func:`~lyricscribe.evaluate.collect_evaluation_data`.
@@ -580,59 +589,69 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
     """
     _apply_style()
     df = df.copy()
+
+    # Filter to musdb_alt (only dataset with clean stems baseline)
+    df = df[df["dataset"] == "musdb_alt"]
+    df = df.drop_duplicates(subset=["model", "filename", "vad", "chunked"])
+
     total_errors = df["substitutions"] + df["insertions"] + df["deletions"]
     df["insertion_prop"] = df["insertions"] / total_errors
     df["deletion_prop"] = df["deletions"] / total_errors
 
+    # Keep only the key pipeline configs
+    df["_key"] = list(zip(df["filename"], df["vad"], df["chunked"]))
+    df = df[df["_key"].isin(_PIPELINE_LABELS)].copy()
+    df["label"] = df["_key"].map(_PIPELINE_LABELS)
+
     models = sorted(df["model"].unique())
     colors = _model_colors(models)
-    fig, axes = plt.subplots(
-        len(models), 1, figsize=(12, 6 * len(models)), squeeze=False
-    )
 
-    for ax_row, model_id in zip(axes, models):
-        ax = ax_row[0]
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    for model_id in models:
         m = df[df["model"] == model_id].copy()
 
-        baseline_mask = (
-            (m["filename"] == "vocals.wav") & (~m["vad"]) & (~m["chunked"])
-        )
-        if not baseline_mask.any():
-            baseline_mask = m.index == m.index[0]
-
-        baseline = m.loc[baseline_mask].iloc[0]
+        baseline = m[m["label"] == "Clean Stems"].iloc[0]
         m["d_insertion"] = m["insertion_prop"] - baseline["insertion_prop"]
         m["d_deletion"] = m["deletion_prop"] - baseline["deletion_prop"]
 
-        m["pipeline"] = (
-            m["filename"]
-            + " | vad:"
-            + m["vad"].astype(str)
-            + " | chunked:"
-            + m["chunked"].astype(str)
+        color = colors[model_id]
+        ax.scatter(
+            m["d_insertion"],
+            m["d_deletion"],
+            s=90,
+            color=color,
+            edgecolors="white",
+            linewidths=0.8,
+            label=_model_label(model_id),
+            zorder=3,
         )
 
-        ax.scatter(m["d_insertion"], m["d_deletion"], s=60, color=colors[model_id])
         for _, row in m.iterrows():
+            if row["label"] == "Clean Stems":
+                continue
             ax.annotate(
-                row["pipeline"],
+                row["label"],
                 (row["d_insertion"], row["d_deletion"]),
-                fontsize=6,
+                fontsize=8,
+                fontweight="bold",
+                color=color,
                 textcoords="offset points",
-                xytext=(4, 4),
+                xytext=(6, 6),
+                path_effects=[pe.withStroke(linewidth=2.5, foreground="white")],
             )
 
-        ax.axhline(0, color="black", linewidth=0.7, linestyle="--")
-        ax.axvline(0, color="black", linewidth=0.7, linestyle="--")
-        ax.set_title(_model_label(model_id), fontsize=12, fontweight="bold")
-        ax.set_xlabel("Δ Insertion Proportion")
-        ax.set_ylabel("Δ Deletion Proportion")
-
-    fig.suptitle(
-        "How each pipeline shifts the error profile vs. clean-stems baseline",
-        fontsize=13,
+    ax.axhline(0, color="#888888", linewidth=0.8, linestyle="--", zorder=1)
+    ax.axvline(0, color="#888888", linewidth=0.8, linestyle="--", zorder=1)
+    ax.set_xlabel("Change in Insertion Proportion", fontsize=11)
+    ax.set_ylabel("Change in Deletion Proportion", fontsize=11)
+    ax.legend(fontsize=10, loc="lower right", framealpha=0.9)
+    ax.set_title(
+        "Pipeline Shift vs. Clean Stems Baseline (MUSDB18)",
+        fontsize=12,
         fontweight="bold",
     )
+
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
