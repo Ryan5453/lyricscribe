@@ -58,7 +58,7 @@ def create_finetune_config(
         "filenames": filenames,
         "batch_size": kwargs.get("batch_size", 24 if architecture == "whisper" else 5),
         "max_epochs": kwargs.get("max_epochs", 10),
-        "epochs_per_job": kwargs.get("epochs_per_job", 5),
+        "epochs_per_job": kwargs.get("epochs_per_job", 5 if architecture == "whisper" else 3),
         "learning_rate": kwargs.get("learning_rate", 1e-5 if architecture == "whisper" else 1e-4),
         "warmup_epochs": kwargs.get("warmup_epochs", 5),
         "use_augmentation": kwargs.get("use_augmentation", True),
