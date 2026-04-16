@@ -42,22 +42,44 @@ class _SkipBadBatchCallback(Callback):
     stated manifest offset is too short or corrupted). Raw signal_len
     may be non-zero, so we can't filter pre-forward. Instead we wrap
     the model's training_step to catch the error and return a zero loss.
+
+    Under DDP, a naive catch causes an NCCL ALLREDUCE deadlock: if one
+    rank fails and returns a detached zero tensor while other ranks
+    succeed and fire their gradient hooks normally, the failing rank
+    never participates in the gradient sync and other ranks time out.
+    We fix this by (1) all-reducing the skip decision so every rank
+    agrees, and (2) returning a zero loss that still touches every
+    trainable parameter so DDP gradient hooks fire uniformly.
     """
 
     def setup(self, trainer, pl_module, stage=None):
         original_step = pl_module.training_step
 
         def safe_training_step(batch, batch_idx):
+            skip_flag = torch.zeros(1, device=pl_module.device)
+            loss = None
+            local_err: str | None = None
             try:
-                return original_step(batch, batch_idx)
+                loss = original_step(batch, batch_idx)
             except RuntimeError as e:
                 if "Invalid parameter" in str(e) or "working space memory" in str(e):
+                    local_err = str(e)
+                    skip_flag[0] = 1.0
+                else:
+                    raise
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(skip_flag, op=torch.distributed.ReduceOp.MAX)
+
+            if skip_flag.item() > 0:
+                if local_err is not None:
                     logger.warning(
                         f"Skipping batch {batch_idx}: RNNT loss got invalid input "
-                        f"(likely zero encoder frames). Error: {e}"
+                        f"(likely zero encoder frames). Error: {local_err}"
                     )
-                    return torch.tensor(0.0, device=next(pl_module.parameters()).device, requires_grad=True)
-                raise
+                return sum(p.sum() for p in pl_module.parameters() if p.requires_grad) * 0.0
+
+            return loss
 
         pl_module.training_step = safe_training_step
 
