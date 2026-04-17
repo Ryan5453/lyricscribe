@@ -1,9 +1,84 @@
 import json
 import logging
 import math
+import os
 import shutil
+import types
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def _configure_cuda_toolkit_for_numba() -> None:
+    """
+    Numba (used by NeMo's RNNT/TDT losses and CUDA-graph decoding) needs
+    libnvvm.so and libcudart.so at import time. On systems without a
+    system CUDA Toolkit (e.g. dev boxes running only the driver), those
+    ship with the pip-installed ``nvidia-cuda-nvcc-cu12`` /
+    ``nvidia-cuda-runtime-cu12`` packages — but numba only picks them up
+    if ``CUDA_HOME`` and ``LD_LIBRARY_PATH`` point at their locations.
+
+    This must run *before* ``import nemo`` — NeMo lazily imports numba
+    on first RNNT forward, and we set these at module-import time so the
+    CLI entry point configures them before NeMo loads.
+
+    On SLURM/production where ``module load cuda/…`` already set up a
+    system toolkit, env vars are left alone (the toolkit wins over pip
+    shims via existing LD_LIBRARY_PATH).
+    """
+    try:
+        import nvidia  # noqa: F401
+    except ImportError:
+        return
+
+    site = Path(__import__("nvidia").__path__[0])
+    nvcc_root = site / "cuda_nvcc"
+    cudart_lib = site / "cuda_runtime" / "lib"
+
+    if not nvcc_root.exists():
+        return
+
+    os.environ.setdefault("CUDA_HOME", str(nvcc_root))
+
+    # Numba's find_lib requires versioned sonames (``libnvvm.so.4``) but
+    # the pip-installed cuda-nvcc ships only the unversioned ``libnvvm.so``.
+    # Read the SONAME and create a matching symlink so find_lib picks it up.
+    nvvm_lib64 = nvcc_root / "nvvm" / "lib64"
+    nvvm_unversioned = nvvm_lib64 / "libnvvm.so"
+    if nvvm_unversioned.exists():
+        try:
+            import subprocess
+            soname = subprocess.check_output(
+                ["objdump", "-p", str(nvvm_unversioned)], text=True
+            )
+            for line in soname.splitlines():
+                if "SONAME" in line:
+                    _, name = line.strip().rsplit(None, 1)
+                    versioned = nvvm_lib64 / name
+                    if not versioned.exists():
+                        versioned.symlink_to(nvvm_unversioned.name)
+                    break
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    # Numba finds ``libcudart`` via ``CUDA_HOME/lib64`` (not via
+    # LD_LIBRARY_PATH — setting LD_LIBRARY_PATH at Python runtime is
+    # ignored by the dynamic linker). Create ``cuda_nvcc/lib64/`` and
+    # symlink libcudart into it so numba's ``find_lib`` picks it up.
+    if cudart_lib.exists():
+        versioned = cudart_lib / "libcudart.so.12"
+        if versioned.exists():
+            target_lib64 = nvcc_root / "lib64"
+            target_lib64.mkdir(exist_ok=True)
+            for name in ("libcudart.so", "libcudart.so.12"):
+                link = target_lib64 / name
+                if not link.exists():
+                    try:
+                        link.symlink_to(versioned)
+                    except OSError:
+                        pass
+
+
+_configure_cuda_toolkit_for_numba()
 
 import jiwer
 import nemo.collections.asr as nemo_asr
@@ -30,6 +105,227 @@ def _is_main_process() -> bool:
     file writes (checkpoints, metrics, config) in multi-GPU DDP."""
     import os
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
+
+
+def _build_mono_averaging_canary_dataset_cls():
+    """
+    Build a subclass of NeMo's PromptedAudioToTextLhotseDataset that:
+
+    1. Downmixes multi-channel audio to mono by *averaging* channels
+       (rather than picking one or summing-with-clip). Canary rejects
+       MultiCut at prompt-format time, and its dataloader has no built-in
+       option to average channels on the fly, so we do it here.
+    2. Delegates prompt formatting to the (patched) registry, so the
+       stereo→mono audio averaging stays orthogonal from the prompt
+       logic. See ``_patch_prompt_format_for_multi_channel`` for the
+       MultiCut-tolerating prompt-function wrapper.
+
+    Returns the class so importing NeMo stays lazy.
+    """
+    import numpy as np
+    from lhotse import CutSet
+    from lhotse.dataset.collation import collate_vectors
+    from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
+        PromptedAudioToTextLhotseDataset,
+        PromptedAudioToTextMiniBatch,
+        _drop_in_memory_data,
+    )
+    from nemo.collections.common.data import apply_prompt_format_fn
+
+    class MonoAveragingPromptedDataset(PromptedAudioToTextLhotseDataset):
+        """Load audio, average stereo channels, and format prompts as usual.
+
+        Keeps the original cuts (which may already carry pre-formatted
+        prompt attributes from NeMo's ``pretokenize`` step) — the prompt
+        format function is separately patched at the registry level to
+        accept MultiCut, so we don't need to rebuild the cuts here.
+        """
+
+        def __getitem__(self, cuts: CutSet) -> PromptedAudioToTextMiniBatch:
+            # Load per-cut and average channels so we never pass
+            # (B, C, T) to the model (the preprocessor only accepts (B, T)).
+            audios: list[torch.Tensor] = []
+            audio_lens_list: list[int] = []
+            for cut in cuts:
+                arr = cut.load_audio()
+                if arr.ndim == 2:
+                    if arr.shape[0] > 1:
+                        arr = arr.mean(axis=0)
+                    else:
+                        arr = arr.squeeze(0)
+                audios.append(torch.from_numpy(np.ascontiguousarray(arr)).float())
+                audio_lens_list.append(arr.shape[-1])
+
+            audio_lens = torch.tensor(audio_lens_list, dtype=torch.int32)
+            audio = collate_vectors(audios, padding_value=0.0)
+
+            # Mirror the fast/slow prompt paths from the upstream dataset.
+            attrs = ("input_ids", "context_ids", "answer_ids")
+            pre_formatted = all(hasattr(c, a) for c in cuts for a in attrs)
+            if pre_formatted:
+                prompts_with_answers, prompts, answers = zip(
+                    *((c.input_ids, c.context_ids, c.answer_ids) for c in cuts)
+                )
+            else:
+                formatted = [apply_prompt_format_fn(cut, self.prompt) for cut in cuts]
+                prompts_with_answers = [ex["input_ids"] for ex in formatted]
+                prompts = [ex["context_ids"] for ex in formatted]
+                answers = [ex["answer_ids"] for ex in formatted]
+
+            transcript, transcript_lens = self._collate_tokens(answers)
+            prompts_with_answers, prompts_with_answers_lens = self._collate_tokens(
+                prompts_with_answers
+            )
+            prompts, prompt_lens = self._collate_tokens(prompts)
+
+            return PromptedAudioToTextMiniBatch(
+                audio=audio,
+                audio_lens=audio_lens,
+                transcript=transcript,
+                transcript_lens=transcript_lens,
+                prompt=prompts,
+                prompt_lens=prompt_lens,
+                prompted_transcript=prompts_with_answers,
+                prompted_transcript_lens=prompts_with_answers_lens,
+                cuts=_drop_in_memory_data(cuts),
+            )
+
+    return MonoAveragingPromptedDataset
+
+
+def _patch_prompt_format_for_multi_channel() -> None:
+    """
+    Wrap every registered prompt-format function so it tolerates MultiCut
+    by first converting to a channel-0 MonoCut view (audio gets averaged
+    in the dataset's ``__getitem__`` — this conversion only changes *type*
+    so the prompt formatter accepts the cut).
+
+    NeMo's Lhotse dataloader tokenizes cuts via
+    ``CutSet.map(tokenize_with_prompt)`` *before* our dataset runs (when
+    ``pretokenize=True``), so patching the prompt format functions at the
+    registry level is the earliest hook point. Idempotent: attaches a
+    ``_lyricscribe_patched`` marker on each wrapper.
+    """
+    from lhotse import MonoCut
+    from lhotse.cut import Cut, MixedCut
+    from nemo.collections.common.data import prompt_fn as _prompt_fn
+
+    def _to_mono_view(cut):
+        if isinstance(cut, (MonoCut, MixedCut)):
+            return cut
+        if not hasattr(cut, "num_channels") or cut.num_channels <= 1:
+            return cut
+        channel = cut.channel[0] if isinstance(cut.channel, (list, tuple)) else cut.channel
+        if not isinstance(channel, int):
+            channel = 0
+        return MonoCut(
+            id=cut.id,
+            start=cut.start,
+            duration=cut.duration,
+            channel=channel,
+            recording=cut.recording,
+            supervisions=cut.supervisions,
+            custom=getattr(cut, "custom", None),
+        )
+
+    for key, existing in list(_prompt_fn.PROMPT_FORMAT_FNS.items()):
+        # The registry is keyed by either ``example_type`` or
+        # ``(example_type, formatter_type)``. Only patch entries whose
+        # example type is a Cut (that's where MultiCut can show up).
+        if isinstance(key, tuple):
+            example_type = key[0]
+        else:
+            example_type = key
+        if not (isinstance(example_type, type) and issubclass(example_type, Cut)):
+            continue
+        if getattr(existing, "_lyricscribe_patched", False):
+            continue
+
+        def _make_wrapper(fn):
+            def wrapped(example, prompt):
+                return fn(_to_mono_view(example), prompt)
+
+            wrapped._lyricscribe_patched = True  # type: ignore[attr-defined]
+            wrapped.__name__ = getattr(fn, "__name__", "wrapped_prompt_fn")
+            return wrapped
+
+        _prompt_fn.PROMPT_FORMAT_FNS[key] = _make_wrapper(existing)
+
+
+def _install_mono_averaging_dataloader(model) -> None:
+    """
+    Override ``model._setup_dataloader_from_config`` so the Lhotse dataloader
+    uses the mono-averaging dataset above. Must be called before
+    ``setup_training_data`` / ``setup_validation_data``.
+    """
+    from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
+
+    # Must patch the prompt format registry before the dataloader tokenizes
+    # cuts (with pretokenize=True, CutSet.map runs the formatter at manifest
+    # iteration time, before our dataset ever sees the cut).
+    _patch_prompt_format_for_multi_channel()
+
+    dataset_cls = _build_mono_averaging_canary_dataset_cls()
+
+    def _setup(self, config):
+        assert config.get("use_lhotse", False), (
+            "Canary requires Lhotse dataloading (use_lhotse=True)."
+        )
+        return get_lhotse_dataloader_from_config(
+            config,
+            global_rank=config.get("global_rank", self.global_rank),
+            world_size=config.get("world_size", self.world_size),
+            dataset=dataset_cls(
+                tokenizer=self.tokenizer,
+                prompt=self.prompt,
+            ),
+            tokenizer=self.tokenizer,
+        )
+
+    model._setup_dataloader_from_config = types.MethodType(_setup, model)
+
+
+class _SkipNaNOrInfLossCallback(Callback):
+    """
+    Replace ``training_step``'s loss with a harmless zero when it is
+    non-finite (NaN/Inf). Without this, a single bad batch poisons the
+    optimizer and every subsequent step diverges.
+
+    Uses the same DDP-safe pattern as ``_SkipBadBatchCallback``: we
+    all-reduce the "skip" decision so every rank agrees, and return a
+    zero that still touches every trainable parameter so gradient hooks
+    fire uniformly across ranks.
+    """
+
+    def setup(self, trainer, pl_module, stage=None):
+        original_step = pl_module.training_step
+
+        def safe_step(batch, batch_idx):
+            skip_flag = torch.zeros(1, device=pl_module.device)
+            out = original_step(batch, batch_idx)
+
+            # training_step may return a tensor or a dict with 'loss'.
+            if isinstance(out, dict):
+                loss = out.get("loss")
+            else:
+                loss = out
+
+            if loss is None or not torch.isfinite(loss).all():
+                skip_flag[0] = 1.0
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(skip_flag, op=torch.distributed.ReduceOp.MAX)
+
+            if skip_flag.item() > 0:
+                logger.warning(
+                    f"Skipping batch {batch_idx}: non-finite loss "
+                    f"(loss={loss.item() if loss is not None else 'None'})"
+                )
+                return sum(p.sum() for p in pl_module.parameters() if p.requires_grad) * 0.0
+
+            return out
+
+        pl_module.training_step = safe_step
 
 
 class _SkipBadBatchCallback(Callback):
@@ -131,9 +427,17 @@ class NeMoTrainer:
 
         if self.model is None:
             logger.info(f"Loading NeMo model: {self.config['base_model']}")
+            # ``map_location='cpu'`` is critical for multi-GPU DDP: NeMo's
+            # default placement sends weights to ``cuda:0``, so without this
+            # every rank's subprocess briefly holds a full model copy on
+            # GPU 0 before Lightning moves it to the rank-specific device.
+            # On tight GPUs (e.g. 16 GB A4000 as cuda:0) that OOMs before
+            # training ever starts.
             self.model = nemo_asr.models.ASRModel.from_pretrained(
-                model_name=self.config["base_model"]
+                model_name=self.config["base_model"],
+                map_location="cpu",
             )
+            self.model = self.model.cpu()
 
         # Disable CUDA graphs for RNNT/TDT models (e.g. Parakeet).
         # CUDA graphs cause illegal memory access on H200 GPUs.
@@ -154,8 +458,14 @@ class NeMoTrainer:
             cfg.train_ds.num_buckets = cfg.train_ds.get("num_buckets") or 30
             cfg.train_ds.min_tps = cfg.train_ds.get("min_tps") if cfg.train_ds.get("min_tps") is not None else -1
             cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
-            cfg.train_ds.batch_duration = 600
+            cfg.train_ds.batch_duration = self.config.get("batch_duration", 600)
             cfg.train_ds.batch_size = None
+
+            # Canary rejects multi-channel cuts in its prompt formatter and
+            # has no on-the-fly stereo→mono averaging. Install a dataset
+            # subclass that averages channels per-sample before collation.
+            _install_mono_averaging_dataloader(self.model)
+
         else:
             # Parakeet: use the standard NeMo dataloader.
             # channel_selector="average" mixes stereo to mono at load time.
@@ -165,7 +475,19 @@ class NeMoTrainer:
 
         cfg.train_ds.manifest_filepath = str(train_manifest)
         cfg.train_ds.min_duration = 0.1
-        cfg.train_ds.max_duration = 240.0
+        cfg.train_ds.max_duration = self.config.get("max_duration", 240.0)
+
+        # Optional encoder freeze for both Canary and Parakeet: cuts
+        # AdamW state by the ratio of encoder-to-total params (~5x for
+        # Canary, ~2x for Parakeet) so the full-Adam finetune fits on
+        # a 12–16 GB GPU. No effect on Whisper. Enable via
+        # ``"freeze_encoder": true`` in the job config.
+        if self.config.get("freeze_encoder", False):
+            frozen = 0
+            for p in self.model.encoder.parameters():
+                p.requires_grad = False
+                frozen += 1
+            logger.info(f"Froze {frozen} encoder parameter tensors")
 
         # Ensure the RNNT/TDT loss returns a scalar (mean over batch).
         # Newer NeMo/PL versions error on logging per-sample loss vectors.
@@ -179,7 +501,7 @@ class NeMoTrainer:
                 cfg.validation_ds.num_buckets = cfg.validation_ds.get("num_buckets") or 30
                 cfg.validation_ds.min_tps = cfg.validation_ds.get("min_tps") if cfg.validation_ds.get("min_tps") is not None else -1
                 cfg.validation_ds.max_tps = cfg.validation_ds.get("max_tps") if cfg.validation_ds.get("max_tps") is not None else float("inf")
-                cfg.validation_ds.batch_duration = 600
+                cfg.validation_ds.batch_duration = self.config.get("batch_duration", 600)
                 cfg.validation_ds.batch_size = None
             else:
                 cfg.validation_ds.use_lhotse = False
@@ -187,7 +509,7 @@ class NeMoTrainer:
                 cfg.validation_ds.batch_size = self.config["batch_size"]
             cfg.validation_ds.manifest_filepath = str(val_manifest)
             cfg.validation_ds.min_duration = 0.1
-            cfg.validation_ds.max_duration = 240.0
+            cfg.validation_ds.max_duration = self.config.get("max_duration", 240.0)
             cfg.validation_ds.num_workers = 4
 
         if self.config.get("use_augmentation", True):
@@ -254,6 +576,17 @@ class NeMoTrainer:
                 filename="step-{step:08d}",
             )
 
+            # Both NeMo architectures can produce non-finite losses on rare
+            # bad samples (Canary: bf16 attention overflow on long prompts;
+            # Parakeet: bf16 RNNT logit overflow). Skip those batches
+            # instead of poisoning the optimizer and driving every
+            # subsequent step to NaN.
+            callbacks = [
+                step_checkpoint,
+                _SkipBadBatchCallback(),
+                _SkipNaNOrInfLossCallback(),
+            ]
+
             trainer_kwargs = dict(
                 max_epochs=self.config["max_epochs"],
                 accelerator="gpu" if torch.cuda.is_available() else "cpu",
@@ -264,15 +597,14 @@ class NeMoTrainer:
                 enable_progress_bar=True,
                 logger=False,
                 enable_checkpointing=True,
-                callbacks=[step_checkpoint, _SkipBadBatchCallback()],
+                callbacks=callbacks,
                 log_every_n_steps=1,
-                # In-loop validation deadlocks under DDP at end-of-epoch (NeMo
-                # validation path hangs at a collective after training step
-                # completes). External eval via the inference harness is the
-                # source of truth anyway — in-loop WER was unreliable.
-                limit_val_batches=0,
-                num_sanity_val_steps=0,
             )
+
+            # No limit_val_batches: the val manifest passed in is already
+            # the fixed-size subset written at setup time, so we evaluate
+            # all of it. This keeps Whisper and NeMo aligned on the same
+            # samples. Full-corpus eval goes through the inference harness.
 
             if uses_lhotse:
                 # Lhotse iterable datasets don't have __len__.
@@ -532,7 +864,15 @@ class WhisperTrainer:
         pred_str = self.processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = self.processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-        wer = jiwer.wer(label_str, pred_str)
+        # jiwer rejects batches with any empty reference (division by zero
+        # on 0-word references). Our manifests include empty-text windows
+        # that land on purely instrumental regions — drop those pairs
+        # before computing WER instead of crashing the whole chunk.
+        paired = [(r, h) for r, h in zip(label_str, pred_str) if r.strip()]
+        if not paired:
+            return {"wer": 0.0}
+        refs, hyps = zip(*paired)
+        wer = jiwer.wer(list(refs), list(hyps))
         return {"wer": wer}
 
     def setup(self, train_manifest: Path, val_manifest: Path | None) -> None:
@@ -579,23 +919,21 @@ class WhisperTrainer:
         train_dataset = WhisperFinetuneDataset(self.train_manifest, self.processor)
         eval_dataset = None
         if self.val_manifest:
-            full_eval = WhisperFinetuneDataset(self.val_manifest, self.processor)
-            # Eval is autoregressive generation which is much slower than
-            # training (~3 hours on the full validation set vs ~3 hours per
-            # training epoch). Sample a fixed subset for during-training
-            # sanity checks; full eval can be run separately if needed.
-            eval_subset_size = self.config.get("eval_subset_size", 200)
-            if len(full_eval) > eval_subset_size:
-                rng = torch.Generator().manual_seed(42)
-                indices = torch.randperm(len(full_eval), generator=rng)[:eval_subset_size].tolist()
-                eval_dataset = torch.utils.data.Subset(full_eval, indices)
-            else:
-                eval_dataset = full_eval
+            # The val manifest passed in here is the fixed-size subset
+            # materialized at setup time (``val_subset_manifest.jsonl``),
+            # so we don't re-subset in Python. That keeps this eval pool
+            # identical to what NeMo sees. Full-corpus eval runs
+            # separately via the inference harness.
+            eval_dataset = WhisperFinetuneDataset(self.val_manifest, self.processor)
 
         job_dir = Path(self.config["output_dir"]) / self.config["exp_name"]
 
-        warmup_ratio = self.config.get("warmup_epochs", 5) / max(
-            self.config["max_epochs"], 1
+        # Clamp so short smoke runs (e.g. max_epochs < warmup_epochs) still
+        # satisfy HF's warmup_ratio ∈ [0, 1] constraint — 1.0 means the whole
+        # run is warmup, which is the correct degenerate behaviour.
+        warmup_ratio = min(
+            1.0,
+            self.config.get("warmup_epochs", 5) / max(self.config["max_epochs"], 1),
         )
 
         # Create trainer once and reuse to preserve optimizer state across epochs.

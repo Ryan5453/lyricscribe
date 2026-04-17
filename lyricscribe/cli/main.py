@@ -534,6 +534,31 @@ def finetune_setup(
     no_augment: bool = typer.Option(
         False, "--no-augment", help="Disable SpecAugment"
     ),
+    batch_duration: float = typer.Option(
+        None,
+        "--batch-duration",
+        help="Canary-only: Lhotse batch duration in seconds (default: 600; lower for <24GB GPUs)",
+    ),
+    freeze_encoder: bool = typer.Option(
+        False,
+        "--freeze-encoder",
+        help="Canary-only: freeze the encoder so only the decoder+head train (fits on 12-16 GB GPUs)",
+    ),
+    eval_subset_size: int = typer.Option(
+        None,
+        "--eval-subset-size",
+        help="Fixed number of validation samples both Whisper and NeMo evaluate against each epoch (default: 200)",
+    ),
+    windows_per_song: int = typer.Option(
+        3,
+        "--windows-per-song",
+        help="Random 30s windows sampled per song (per ~30s of song duration). Higher = more diverse coverage across epochs. Raise toward your total epoch count for approximate per-epoch randomization.",
+    ),
+    line_overlap_threshold: float = typer.Option(
+        0.7,
+        "--line-overlap-threshold",
+        help="Minimum fraction of a synced line's duration that must fall inside a window for its text to be included in that window's label. Guards against partial-audio hallucination and deletion bias.",
+    ),
 ):
     """
     Setup a finetuning experiment with epoch-level checkpointing.
@@ -554,6 +579,9 @@ def finetune_setup(
             "max_epochs": max_epochs,
             "epochs_per_job": epochs_per_job,
             "learning_rate": learning_rate,
+            "batch_duration": batch_duration,
+            "freeze_encoder": freeze_encoder if freeze_encoder else None,
+            "eval_subset_size": eval_subset_size,
         }.items()
         if v is not None
     }
@@ -596,6 +624,8 @@ def finetune_setup(
         train_manifest,
         architecture=config['architecture'],
         model_name=config['base_model'],
+        windows_per_song_multiplier=windows_per_song,
+        line_overlap_threshold=line_overlap_threshold,
     )
     logger.info(f"Training: {n_train} chunks (synced-line segments)")
 
@@ -606,14 +636,29 @@ def finetune_setup(
             filenames=config['filenames'],
         )
         val_manifest = job_dir / "val_manifest.jsonl"
+        # Validation manifest stays at windows_per_song=1: eval is just a
+        # sanity check, we don't need the same over-sampling as training.
         n_val = finetune_data.create_manifest(
             val_dataset,
             val_manifest,
             architecture=config['architecture'],
             model_name=config['base_model'],
+            windows_per_song_multiplier=1,
+            line_overlap_threshold=line_overlap_threshold,
         )
         logger.info(f"Validation: {n_val} chunks")
-    
+
+        # Write a fixed-size shuffled subset that both Whisper and NeMo
+        # evaluate against each epoch. Without this each trainer picks
+        # its own window (Subset vs. limit_val_batches) so cross-arch
+        # WER comparisons are over different audio — see #2.
+        subset_size = config.get("eval_subset_size", 200)
+        val_subset_manifest = job_dir / "val_subset_manifest.jsonl"
+        n_subset = finetune_data.write_subset_manifest(
+            val_manifest, val_subset_manifest, size=subset_size, seed=42,
+        )
+        logger.info(f"Validation subset (used during training): {n_subset} chunks")
+
     finetune_jobs.setup_finetune_job(config, train_manifest, val_manifest)
 
     num_chunks = (config['max_epochs'] + config['epochs_per_job'] - 1) // config['epochs_per_job']
@@ -652,7 +697,18 @@ def finetune_run(
     logger.info(f"Processing chunk {chunk_id}: epochs {chunk_data['start_epoch']} to {chunk_data['end_epoch']}")
 
     train_manifest = job_dir / "train_manifest.jsonl"
-    val_manifest = job_dir / "val_manifest.jsonl" if (job_dir / "val_manifest.jsonl").exists() else None
+    # Prefer the fixed-size subset manifest for during-training eval
+    # so Whisper and NeMo evaluate on identical samples. Fall back to
+    # the full val manifest for older experiments that predate the
+    # subset file.
+    val_subset = job_dir / "val_subset_manifest.jsonl"
+    val_full = job_dir / "val_manifest.jsonl"
+    if val_subset.exists():
+        val_manifest = val_subset
+    elif val_full.exists():
+        val_manifest = val_full
+    else:
+        val_manifest = None
 
     try:
         result = finetune_trainer.run_training_job(

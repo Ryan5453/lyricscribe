@@ -48,6 +48,22 @@ def create_finetune_config(
     filenames_short = "_".join(Path(f).stem for f in filenames)
     exp_name = kwargs.get("exp_name") if kwargs.get("exp_name") else f"{arch_short}_{filenames_short}_{timestamp}"
 
+    # Per-architecture finetune LR defaults. These aren't lumped by
+    # training library — each model has its own sensitivity:
+    #  - Whisper: HF's ``Seq2SeqTrainer`` + ``fp16``, 244M–1.55B params.
+    #    1e-5 is the community-standard finetune LR.
+    #  - Canary: 1B encoder-decoder with bf16 attention that can overflow
+    #    at hot LRs. NVIDIA's finetune recipes sit at 5e-6 to 1e-5.
+    #  - Parakeet: 600M RNNT/TDT. The bf16 RNNT logits can overflow under
+    #    aggressive LRs (we saw NaN at 1e-4 on a smoke run), so we
+    #    default lower than NVIDIA's published 1e-4 recipe; users can
+    #    override back up via ``--learning-rate``.
+    default_lr = {
+        "whisper": 1e-5,
+        "canary": 1e-5,
+        "parakeet": 5e-5,
+    }[architecture]
+
     config = {
         "architecture": architecture,
         "base_model": base_model,
@@ -59,9 +75,22 @@ def create_finetune_config(
         "batch_size": kwargs.get("batch_size", 24 if architecture == "whisper" else 5),
         "max_epochs": kwargs.get("max_epochs", 10),
         "epochs_per_job": kwargs.get("epochs_per_job", 5 if architecture == "whisper" else 3),
-        "learning_rate": kwargs.get("learning_rate", 1e-5 if architecture == "whisper" else 1e-4),
+        "learning_rate": kwargs.get("learning_rate", default_lr),
         "warmup_epochs": kwargs.get("warmup_epochs", 5),
         "use_augmentation": kwargs.get("use_augmentation", True),
+        # Canary-specific: Lhotse's duration-based batching. Unused by
+        # Whisper/Parakeet (they use batch_size). 600 s matches H200
+        # production defaults; lower for smaller GPUs.
+        "batch_duration": kwargs.get("batch_duration", 600),
+        # Canary-specific: freeze the encoder so only decoder+head are
+        # optimized. Cuts AdamW state ~5x and lets 1 B-param Canary train
+        # on a 12–16 GB GPU. No effect for Whisper/Parakeet.
+        "freeze_encoder": kwargs.get("freeze_encoder", False),
+        # Shared fixed-size validation subset both Whisper and NeMo
+        # evaluate against each epoch. Materialized as a separate
+        # ``val_subset_manifest.jsonl`` at setup time — see
+        # ``write_subset_manifest``.
+        "eval_subset_size": kwargs.get("eval_subset_size", 200),
         "current_epoch": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }

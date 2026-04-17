@@ -102,7 +102,8 @@ def create_manifest(
     model_name: str | None = None,
     window_seconds: float = 30.0,
     max_tokens: int = 440,
-    windows_per_song_multiplier: int = 1,
+    windows_per_song_multiplier: int = 3,
+    line_overlap_threshold: float = 0.7,
 ) -> int:
     """
     Create a manifest JSONL by sampling random fixed-length audio windows
@@ -140,9 +141,20 @@ def create_manifest(
     :param max_tokens: Whisper decoder token cap. Only applied when
         ``architecture == "whisper"``.
     :param windows_per_song_multiplier: Multiplier on the base
-        ``ceil(song_duration / window_seconds)`` window count. Default 1
-        gives one random window per ``window_seconds`` of song on
-        average; raising it trades training time for coverage diversity.
+        ``ceil(song_duration / window_seconds)`` window count. Default 3
+        gives ~3 random windows per ``window_seconds`` of song, which
+        approximates per-epoch randomization over a ~3-epoch run
+        (the model sees different slices of each song within the
+        manifest, just in shuffled order across epochs). For longer
+        runs, raise proportionally.
+    :param line_overlap_threshold: Minimum fraction of a synced line's
+        duration that must fall inside a window for that line to be
+        kept as part of the window's label. Guards against the model
+        being asked to transcribe lyrics from partial audio
+        (hallucination bias) or to stay silent on audible vocals that
+        have no text label (deletion bias). Default 0.7 means we keep
+        a line only if at least 70% of its duration is inside the
+        window.
     :return: Number of manifest entries written.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -213,15 +225,34 @@ def create_manifest(
                     window_start_ms = offset * 1000
                     window_end_ms = window_start_ms + window_ms
 
-                    # Collect synced lines whose start time falls inside
-                    # the window. Lines that only partially overlap (start
-                    # before or after the window) are excluded to keep
-                    # audio/text aligned to what the model will see.
-                    lines_in_window = [
-                        line for line in synced
-                        if window_start_ms <= line.get("start", 0) < window_end_ms
-                        and line.get("text", "").strip()
-                    ]
+                    # Keep lines whose audio is *mostly* inside the window.
+                    # Start-in-window alone (the old filter) broke on both
+                    # sides of the boundary: a line starting before the
+                    # window gets excluded even though its audio plays in
+                    # the window (deletion bias), and a line starting near
+                    # the window's end gets its full text included even
+                    # though most of its audio is outside (hallucination
+                    # bias). Overlap-ratio gating fixes both.
+                    lines_in_window = []
+                    for line in synced:
+                        if not line.get("text", "").strip():
+                            continue
+                        line_start = line.get("start", 0)
+                        line_dur = line.get("duration", 0)
+                        if line_dur <= 0:
+                            # No duration field — fall back to the old
+                            # start-in-window rule so we don't drop valid
+                            # data from providers that only ship start.
+                            if window_start_ms <= line_start < window_end_ms:
+                                lines_in_window.append(line)
+                            continue
+                        line_end = line_start + line_dur
+                        overlap_start = max(line_start, window_start_ms)
+                        overlap_end = min(line_end, window_end_ms)
+                        overlap = max(0, overlap_end - overlap_start)
+                        if overlap / line_dur >= line_overlap_threshold:
+                            lines_in_window.append(line)
+
                     text = " ".join(
                         line["text"].strip() for line in lines_in_window
                     ).strip()
@@ -249,7 +280,11 @@ def create_manifest(
                         entry["answer"] = text
                         entry["source_lang"] = detected_language
                         entry["target_lang"] = detected_language
-                        entry["pnc"] = "no"
+                        # Ground-truth lyrics keep punctuation and capitalization,
+                        # so tell Canary's prompt to predict them too. With
+                        # pnc="no" Canary's tokenizer would strip them from
+                        # the target, creating a train/infer distribution gap.
+                        entry["pnc"] = "yes"
 
                     f.write(json.dumps(entry) + "\n")
                     count += 1
@@ -265,3 +300,46 @@ def create_manifest(
         f"{skipped_too_long} windows dropped for exceeding {max_tokens} tokens)"
     )
     return count
+
+
+def write_subset_manifest(
+    source: Path,
+    dest: Path,
+    size: int,
+    seed: int = 42,
+) -> int:
+    """
+    Copy a deterministic shuffled subset of a JSONL manifest.
+
+    Used for the during-training validation subset: we want Whisper and
+    NeMo to evaluate on the exact same set of samples each epoch, so we
+    materialize one shared subset manifest at setup time instead of
+    letting each trainer pick its own window (``torch.Subset`` vs
+    ``limit_val_batches``, which produce different sizes *and*
+    different contents).
+
+    The shuffle is seeded so re-running setup on the same full manifest
+    always produces the same subset — reproducible, and subsetting a
+    subset is a no-op.
+
+    :param source: Path to the full manifest (JSONL).
+    :param dest: Path to write the subset to (JSONL).
+    :param size: Maximum number of entries in the subset. If the source
+        has fewer entries, the whole thing is copied.
+    :param seed: Shuffle seed (default 42).
+    :return: Number of entries written to the subset manifest.
+    """
+    import random as _random
+
+    with open(source) as f:
+        lines = f.readlines()
+
+    rng = _random.Random(seed)
+    rng.shuffle(lines)
+    lines = lines[:size]
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "w") as f:
+        f.writelines(lines)
+
+    return len(lines)
