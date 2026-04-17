@@ -283,16 +283,13 @@ class NeMoTrainer:
                 enable_checkpointing=True,
                 callbacks=[step_checkpoint, _SkipBadBatchCallback()],
                 log_every_n_steps=1,
+                # In-loop validation deadlocks under DDP at end-of-epoch (NeMo
+                # validation path hangs at a collective after training step
+                # completes). External eval via the inference harness is the
+                # source of truth anyway — in-loop WER was unreliable.
+                limit_val_batches=0,
+                num_sanity_val_steps=0,
             )
-
-            # Cap validation to a fixed number of batches so we get a quick
-            # sanity check each epoch instead of running over the entire
-            # ~88k-chunk validation manifest. The full eval can be done
-            # separately with the inference harness on a real test set.
-            if self.val_manifest is not None:
-                trainer_kwargs["limit_val_batches"] = self.config.get(
-                    "eval_subset_size", 200
-                )
 
             if uses_lhotse:
                 # Lhotse iterable datasets don't have __len__.
