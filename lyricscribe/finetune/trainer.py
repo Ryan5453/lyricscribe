@@ -10,11 +10,9 @@ import nemo.collections.asr as nemo_asr
 from omegaconf import OmegaConf
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
-from lightning.pytorch.loggers import WandbLogger
 import soundfile as sf
 import torch
 import torchaudio
-import wandb
 from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
@@ -228,28 +226,13 @@ class NeMoTrainer:
         """
         Train the model up to *target_epoch* using PyTorch Lightning.
 
-        On the first call, initializes a wandb run (best-effort) and creates
-        the PL Trainer. Subsequent calls reuse the same Trainer to preserve
-        optimizer state across epochs.
+        On the first call, creates the PL Trainer. Subsequent calls reuse
+        the same Trainer to preserve optimizer state across epochs.
 
         :param target_epoch: The epoch number to train up to (1-indexed).
         :return: Dict of metrics from ``trainer.callback_metrics``.
         """
         if self.trainer is None:
-            try:
-                wandb.init(
-                    project="lyricscribe-finetune",
-                    name=self.config["exp_name"],
-                    id=self.config["exp_name"],
-                    resume="allow",
-                    tags=[self.config["architecture"], self.config["base_model"]],
-                    settings=wandb.Settings(init_timeout=300),
-                )
-                wandb_logger = WandbLogger(experiment=wandb.run)
-            except Exception as e:
-                logger.warning(f"wandb init failed ({e}), training without wandb")
-                wandb_logger = None
-
             uses_lhotse = self.model.cfg.train_ds.get("use_lhotse", False)
 
             num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -279,7 +262,7 @@ class NeMoTrainer:
                 precision="bf16-mixed" if torch.cuda.is_available() else 32,
                 gradient_clip_val=1.0,
                 enable_progress_bar=True,
-                logger=wandb_logger,
+                logger=False,
                 enable_checkpointing=True,
                 callbacks=[step_checkpoint, _SkipBadBatchCallback()],
                 log_every_n_steps=1,
@@ -325,11 +308,7 @@ class NeMoTrainer:
             for k, v in self.trainer.callback_metrics.items():
                 metrics[k] = float(v) if isinstance(v, torch.Tensor) else v
 
-        # NeMo logs with on_epoch=True which PL may not forward to wandb
-        # in our setup. Manually log so we get charts.
         if metrics:
-            if wandb.run is not None:
-                wandb.log(metrics, step=target_epoch)
             logger.info(f"Epoch {target_epoch} metrics: {metrics}")
 
         return metrics
@@ -558,7 +537,7 @@ class WhisperTrainer:
 
     def setup(self, train_manifest: Path, val_manifest: Path | None) -> None:
         """
-        Load the Whisper model and processor, and configure wandb.
+        Load the Whisper model and processor.
 
         :param train_manifest: Path to the training manifest JSONL file.
         :param val_manifest: Path to the validation manifest JSONL file,
@@ -566,14 +545,6 @@ class WhisperTrainer:
         """
         self.train_manifest = train_manifest
         self.val_manifest = val_manifest
-
-        import os
-        os.environ.setdefault("WANDB_PROJECT", "lyricscribe-finetune")
-        # Pin the wandb run ID to the experiment name and allow resume so
-        # all SLURM-restarted chunks log into a single continuous wandb run
-        # instead of creating a new one each time.
-        os.environ["WANDB_RUN_ID"] = self.config["exp_name"]
-        os.environ["WANDB_RESUME"] = "allow"
 
         if self.model is None:
             logger.info(f"Loading Whisper model: {self.config['base_model']}")
@@ -652,7 +623,7 @@ class WhisperTrainer:
                 max_grad_norm=1.0,
                 dataloader_num_workers=16,
                 predict_with_generate=True,
-                report_to="wandb",
+                report_to="none",
                 run_name=self.config["exp_name"],
             )
 
