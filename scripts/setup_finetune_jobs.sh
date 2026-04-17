@@ -24,6 +24,7 @@ EXPDIR=/projects/fahey.rya/music2text/experiments
 MODELS=(
     "nvidia/parakeet-tdt-0.6b-v3"
     "openai/whisper-large-v3"
+    "nvidia/canary-1b-v2"
 )
 
 # Each entry is a pipe-separated list of filenames
