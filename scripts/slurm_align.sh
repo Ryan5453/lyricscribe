@@ -4,8 +4,8 @@
 #SBATCH --output=/projects/fahey.rya/music2text/logs/align/align_%A_%a.out
 #SBATCH --time=08:00:00
 #SBATCH --partition=short
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=64G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=24G
 
 # Run MFA word-level alignment as a SLURM array, 1 task per shard.
 # Alignments are written back into each song's lyrics.json (populates the
