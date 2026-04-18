@@ -306,6 +306,8 @@ def align(
                 "--output_format",
                 "json",
                 "--clean",
+                "--temporary_directory",
+                f"{_WORK_MOUNT}/mfa_tmp",
             ]
 
             logger.info(f"Running: {runtime} exec ... mfa align ...")
