@@ -34,7 +34,7 @@ echo "Job directory: $JOB_DIR"
 echo "Chunk ID: $CHUNK_ID"
 echo "GPUs requested: $NUM_GPUS"
 
-module load cuda/12.8.0
+module load cuda/13.2.0
 module load FFmpeg/7.1.1
 
 export HF_HOME=/projects/fahey.rya/music2text/.cache/huggingface
