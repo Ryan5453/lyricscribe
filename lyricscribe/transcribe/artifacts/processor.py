@@ -316,11 +316,16 @@ def align(
                 text=True,
                 check=False,
             )
+            # A single bad audio file can make MFA exit non-zero, but it
+            # usually produces per-utterance JSON for every utterance it
+            # managed to align before the crash. Keep going so we salvage
+            # the successful ones; re-running the chunk with
+            # skip_existing will only retry songs that still have no
+            # alignment field.
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"MFA align failed with exit code {result.returncode}. "
-                    "Check that english_mfa acoustic model and dictionary are "
-                    "downloaded in your --mfa-root directory."
+                logger.warning(
+                    f"MFA align exited {result.returncode}; some songs may not be "
+                    "aligned. Re-run with --skip-existing to retry only the gaps."
                 )
 
             # Collect MFA word outputs, keyed by song_id, in seconds.
