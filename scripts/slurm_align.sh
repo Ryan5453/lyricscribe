@@ -46,6 +46,12 @@ CHUNK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
 mkdir -p /projects/fahey.rya/music2text/logs/align
 
+# torchcodec (pulled in by torchaudio.load on torch 2.11+) dlopens
+# libavcodec/libavformat at import time. Without an FFmpeg module
+# loaded first, the .so fails to resolve and `lyricscribe dataset
+# align` crashes before any songs are processed.
+module load FFmpeg/7.1.1
+
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
 
