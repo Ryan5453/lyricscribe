@@ -4,9 +4,9 @@
 #SBATCH --output=/projects/fahey.rya/music2text/logs/finetune/finetune_%j.out
 #SBATCH --time=12:00:00
 #SBATCH --partition=multigpu
-#SBATCH --gres=gpu:h200:4
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=256G
+#SBATCH --gres=gpu:a100:4
+#SBATCH --cpus-per-task=56
+#SBATCH --mem=240G
 
 # Finetuning job script for SLURM (multigpu, 4 H200s per job).
 # Usage: sbatch scripts/slurm_finetune.sh /path/to/job-dir <chunk-id>
