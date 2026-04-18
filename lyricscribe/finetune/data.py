@@ -149,12 +149,21 @@ def create_manifest(
         runs, raise proportionally.
     :param line_overlap_threshold: Minimum fraction of a synced line's
         duration that must fall inside a window for that line to be
-        kept as part of the window's label. Guards against the model
-        being asked to transcribe lyrics from partial audio
-        (hallucination bias) or to stay silent on audible vocals that
-        have no text label (deletion bias). Default 0.7 means we keep
-        a line only if at least 70% of its duration is inside the
-        window.
+        kept as part of the window's label. Used only when a song has
+        no MFA alignment in its ``lyrics.json`` (fallback path).
+        Guards against the model being asked to transcribe lyrics from
+        partial audio (hallucination bias) or to stay silent on
+        audible vocals that have no text label (deletion bias).
+        Default 0.7 means we keep a line only if at least 70% of its
+        duration is inside the window.
+
+    When a song's ``lyrics.json`` carries an ``alignment`` field (from
+    ``lyricscribe dataset align``), word-level MFA times are used
+    directly: a word is kept only if its full ``[start, start+duration]``
+    falls inside the window. This replaces the line-level overlap
+    heuristic with per-word precision, eliminating partial-word
+    supervision at window boundaries.
+
     :return: Number of manifest entries written.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +200,12 @@ def create_manifest(
                     skipped_no_sync += 1
                     continue
 
+                # Opt-in word-level filtering when MFA alignment is present.
+                aligned_words = None
+                alignment = lyrics_data.get("alignment")
+                if alignment:
+                    aligned_words = alignment.get("words")
+
                 detected_language = lyrics_data["detected_language"]
                 audio_file = song["dir"] / _RNG.choice(song["available"])
 
@@ -225,37 +240,43 @@ def create_manifest(
                     window_start_ms = offset * 1000
                     window_end_ms = window_start_ms + window_ms
 
-                    # Keep lines whose audio is *mostly* inside the window.
-                    # Start-in-window alone (the old filter) broke on both
-                    # sides of the boundary: a line starting before the
-                    # window gets excluded even though its audio plays in
-                    # the window (deletion bias), and a line starting near
-                    # the window's end gets its full text included even
-                    # though most of its audio is outside (hallucination
-                    # bias). Overlap-ratio gating fixes both.
-                    lines_in_window = []
-                    for line in synced:
-                        if not line.get("text", "").strip():
-                            continue
-                        line_start = line.get("start", 0)
-                        line_dur = line.get("duration", 0)
-                        if line_dur <= 0:
-                            # No duration field — fall back to the old
-                            # start-in-window rule so we don't drop valid
-                            # data from providers that only ship start.
-                            if window_start_ms <= line_start < window_end_ms:
+                    if aligned_words is not None:
+                        # Word-level MFA filter: keep only words whose full
+                        # audio extent falls inside the window. Labels lose
+                        # the punctuation/capitalization the provider's
+                        # synced text carried (MFA lowercases and strips)
+                        # but in exchange every label word is supervised on
+                        # complete audio the model can actually hear.
+                        kept = [
+                            w for w in aligned_words
+                            if w["start"] >= window_start_ms
+                            and w["start"] + w["duration"] <= window_end_ms
+                        ]
+                        text = " ".join(w["word"] for w in kept).strip()
+                    else:
+                        # No MFA alignment for this song — fall back to
+                        # line-level overlap-ratio filtering.
+                        lines_in_window = []
+                        for line in synced:
+                            if not line.get("text", "").strip():
+                                continue
+                            line_start = line.get("start", 0)
+                            line_dur = line.get("duration", 0)
+                            if line_dur <= 0:
+                                # Provider only ships start times — fall
+                                # back to start-in-window.
+                                if window_start_ms <= line_start < window_end_ms:
+                                    lines_in_window.append(line)
+                                continue
+                            line_end = line_start + line_dur
+                            overlap_start = max(line_start, window_start_ms)
+                            overlap_end = min(line_end, window_end_ms)
+                            overlap = max(0, overlap_end - overlap_start)
+                            if overlap / line_dur >= line_overlap_threshold:
                                 lines_in_window.append(line)
-                            continue
-                        line_end = line_start + line_dur
-                        overlap_start = max(line_start, window_start_ms)
-                        overlap_end = min(line_end, window_end_ms)
-                        overlap = max(0, overlap_end - overlap_start)
-                        if overlap / line_dur >= line_overlap_threshold:
-                            lines_in_window.append(line)
-
-                    text = " ".join(
-                        line["text"].strip() for line in lines_in_window
-                    ).strip()
+                        text = " ".join(
+                            line["text"].strip() for line in lines_in_window
+                        ).strip()
 
                     if tokenizer is not None and text:
                         token_count = len(tokenizer(text).input_ids)
