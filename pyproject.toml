@@ -10,9 +10,6 @@ dependencies = [
     "datasets>=3.0",
     "pydantic",
     "transformers",
-    # NeMo ≥ 2.7 is required for Canary 1B v2 — earlier versions silently
-    # fall back to a plain SentencePiece tokenizer, tripping the canary2
-    # prompt formatter's EOS assertion.
     "nemo_toolkit[asr]>=2.7",
     "lhotse>=1.32",
     "antlr4-python3-runtime==4.9.3",
@@ -20,17 +17,12 @@ dependencies = [
     "jiwer",
     "matplotlib",
     "pandas",
-    # Bumped in lock-step with NeMo 2.7 (which pins torch 2.11 / cu130).
     "torch==2.11.0",
     "torchaudio==2.11.0",
     "torchcodec==0.11.0",
-    # NeMo's RNNT/TDT loss + CUDA-graph decoding route through Numba,
-    # which needs libnvvm.so and libcudart.so at runtime. On boxes
-    # without a system CUDA toolkit, pip ships these; trainer.py auto-
-    # configures CUDA_HOME/LD_LIBRARY_PATH on import. Production SLURM
-    # jobs typically `module load cuda/…` and ignore these.
-    "nvidia-cuda-nvcc-cu12",
-    "nvidia-cuda-runtime-cu12",
+    "nvidia-cuda-nvcc",
+    "nvidia-cuda-runtime",
+    "nvidia-npp",
 ]
 
 [project.scripts]
