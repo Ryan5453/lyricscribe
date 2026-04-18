@@ -6,6 +6,27 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def detect_architecture(model_name: str) -> str:
+    """
+    Map a model identifier to its architecture name.
+
+    :param model_name: Model identifier (e.g. ``nvidia/parakeet-tdt-0.6b-v3``).
+    :return: One of ``"whisper"``, ``"canary"``, ``"parakeet"``.
+    :raises ValueError: If the name doesn't match any known architecture.
+    """
+    name = model_name.lower()
+    if "whisper" in name:
+        return "whisper"
+    if "canary" in name:
+        return "canary"
+    if "parakeet" in name:
+        return "parakeet"
+    raise ValueError(
+        f"Cannot detect architecture from model name '{model_name}'. "
+        "Model name must contain 'whisper', 'canary', or 'parakeet'."
+    )
+
+
 def create_finetune_config(
     base_model: str,
     train_dir: Path,
@@ -30,18 +51,7 @@ def create_finetune_config(
     if not filenames:
         raise ValueError("At least one --filename is required")
 
-    model_lower = base_model.lower()
-    if "whisper" in model_lower:
-        architecture = "whisper"
-    elif "canary" in model_lower:
-        architecture = "canary"
-    elif "parakeet" in model_lower:
-        architecture = "parakeet"
-    else:
-        raise ValueError(
-            f"Cannot detect architecture from model name '{base_model}'. "
-            "Model name must contain 'whisper', 'canary', or 'parakeet'."
-        )
+    architecture = detect_architecture(base_model)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     arch_short = architecture[:3].lower()

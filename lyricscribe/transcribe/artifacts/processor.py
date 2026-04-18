@@ -5,9 +5,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torchaudio
+
+from lyricscribe.schemas import AlignedWord, Alignment, Lyrics
 
 logger = logging.getLogger(__name__)
 
@@ -122,31 +125,40 @@ def _iter_synced_segments(lyrics_data: dict) -> list[dict]:
 
 
 def align(
-    musdb_dir: Path,
-    output_dir: Path,
+    dataset_dir: Path,
     *,
     container: str | Path | None = None,
     mfa_root: Path | None = None,
+    filename: str = "vocals.wav",
+    num_chunks: int = 1,
+    chunk_id: int = 0,
+    skip_existing: bool = True,
 ) -> None:
     """
     Run Montreal Forced Aligner inside a Singularity/Apptainer container and
-    write per-song alignment JSON files.
+    write word-level alignments back into each song's ``lyrics.json``.
 
     Prepares a temporary MFA corpus directory (wav + lab files), runs
-    ``mfa align`` in the container with ``--output_format json``, then converts
-    MFA's output into the per-song format expected by
-    :func:`~lyricscribe.transcribe.artifacts.correlation._load_alignments`.
+    ``mfa align`` in the container with ``--output_format json``, then mutates
+    each song's ``lyrics.json`` in place to populate the
+    :attr:`lyricscribe.schemas.Lyrics.alignment` field.
 
-    :param musdb_dir: root MUSDB directory containing one subdirectory per song,
-        each with ``vocals.wav`` and ``lyrics.json``.
-    :param output_dir: directory to write one ``.json`` alignment file per song.
+    :param dataset_dir: root dataset directory containing one subdirectory per
+        song, each with an audio file (see ``filename``) and ``lyrics.json``.
     :param container: path to a ``.sif`` image or ``docker://`` URI, or ``None``
         to read from ``LYRICSCRIBE_MFA_CONTAINER``.
     :param mfa_root: host directory bound as MFA's model cache. If omitted, a
         temp directory is used (models re-downloaded each run).
+    :param filename: audio filename inside each song subdirectory (e.g.
+        ``"vocals.wav"`` or ``"htdemucs_ft_vocals.wav"``).
+    :param num_chunks: total number of shards this dataset is partitioned into.
+        When >1, only the subset matching ``chunk_id`` is processed. Used by
+        the SLURM array wrapper to parallelize large datasets across nodes.
+    :param chunk_id: 0-indexed shard id to process (requires ``num_chunks > 1``).
+    :param skip_existing: if True, songs whose ``lyrics.json`` already has a
+        non-null ``alignment`` field are skipped — makes resume-on-failure
+        cheap and lets the same command run across partial datasets.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     raw = container
     if raw is None:
         raw = os.environ.get("LYRICSCRIBE_MFA_CONTAINER")
@@ -167,8 +179,36 @@ def align(
 
     runtime = _find_container_runtime()
 
-    song_dirs = sorted([d for d in musdb_dir.iterdir() if d.is_dir()])
-    logger.info(f"Found {len(song_dirs)} songs in {musdb_dir}")
+    song_dirs = sorted([d for d in dataset_dir.iterdir() if d.is_dir()])
+    total_found = len(song_dirs)
+
+    # Deterministic chunk partition: take every ``num_chunks``-th song starting
+    # at ``chunk_id``. Deterministic so reruns hit the same songs, cheap to
+    # compute, and naturally balanced for a uniformly-sized dataset.
+    if num_chunks > 1:
+        song_dirs = song_dirs[chunk_id::num_chunks]
+
+    if skip_existing:
+        def _already_aligned(song_dir: Path) -> bool:
+            lyrics_path = song_dir / "lyrics.json"
+            if not lyrics_path.exists():
+                return False
+            try:
+                data = json.loads(lyrics_path.read_text())
+                return data.get("alignment") is not None
+            except (json.JSONDecodeError, OSError):
+                return False
+
+        song_dirs = [d for d in song_dirs if not _already_aligned(d)]
+
+    logger.info(
+        f"Found {total_found} songs in {dataset_dir}; "
+        f"processing {len(song_dirs)} (chunk {chunk_id}/{num_chunks}, "
+        f"skip_existing={skip_existing})"
+    )
+    if not song_dirs:
+        logger.info("Nothing to align — exiting.")
+        return
 
     mfa_root_temp: tempfile.TemporaryDirectory[str] | None = None
     if mfa_root is None:
@@ -190,12 +230,12 @@ def align(
             prepared_segments = 0
             segment_index: dict[str, dict] = {}
             for song_dir in song_dirs:
-                vocals_path = song_dir / "vocals.wav"
+                vocals_path = song_dir / filename
                 lyrics_path = song_dir / "lyrics.json"
 
                 if not vocals_path.exists() or not lyrics_path.exists():
                     logger.warning(
-                        f"Missing vocals.wav or lyrics.json in {song_dir.name}"
+                        f"Missing {filename} or lyrics.json in {song_dir.name}"
                     )
                     continue
 
@@ -281,6 +321,7 @@ def align(
                     "downloaded in your --mfa-root directory."
                 )
 
+            # Collect MFA word outputs, keyed by song_id, in seconds.
             song_words: dict[str, list[dict]] = {}
             for json_path in sorted(mfa_output.glob("**/*.json")):
                 utterance_id = json_path.stem
@@ -301,22 +342,47 @@ def align(
                     for word in words
                 )
 
+            # Mutate each song's lyrics.json with the new alignment.
+            # Use Lyrics.model_validate/model_dump_json so the whole file is
+            # revalidated against the schema on write — catches bit rot.
+            generated_at = datetime.now(timezone.utc)
+            song_dirs_by_name = {d.name: d for d in song_dirs}
             success = 0
             for song_id, words in sorted(song_words.items()):
                 words.sort(key=lambda x: (x["start"], x["end"]))
-                out_path = output_dir / f"{song_id}.json"
-                out_path.write_text(
-                    json.dumps(
-                        {
-                            "song_id": song_id,
-                            "words": words,
-                        },
-                        indent=2,
+                aligned_words = [
+                    AlignedWord(
+                        word=w["word"],
+                        start=round(w["start"] * 1000),
+                        duration=round((w["end"] - w["start"]) * 1000),
                     )
+                    for w in words
+                ]
+                alignment = Alignment(
+                    words=aligned_words,
+                    source_audio=filename,
+                    mfa_model=_ACOUSTIC_MODEL,
+                    generated_at=generated_at,
                 )
+
+                song_dir = song_dirs_by_name.get(song_id)
+                if song_dir is None:
+                    logger.warning(
+                        "MFA output for %s has no matching song dir (post-chunk?)",
+                        song_id,
+                    )
+                    continue
+
+                lyrics_path = song_dir / "lyrics.json"
+                lyrics = Lyrics.model_validate_json(lyrics_path.read_text())
+                lyrics.alignment = alignment
+                lyrics_path.write_text(lyrics.model_dump_json(indent=2))
                 success += 1
 
-            logger.info(f"Wrote alignments for {success} songs to {output_dir}")
+            logger.info(
+                "Wrote alignments for %s songs into their lyrics.json files",
+                success,
+            )
     finally:
         if mfa_root_temp is not None:
             mfa_root_temp.cleanup()

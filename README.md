@@ -17,7 +17,7 @@ Note: The project is configured for CUDA 12.9 (`cu129`). If you need a different
 
 ## CLI Usage
 
-The LyricScribe CLI contains five subcommands: `lyricscribe dataset` for downloading public ALT datasets, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), `lyricscribe transcribe` for batch ASR transcription, `lyricscribe evaluate` for transcription quality evaluation and plotting, and `lyricscribe artifacts` for artifact feature extraction and correlation analysis.
+The LyricScribe CLI contains six subcommands: `lyricscribe dataset` for downloading public ALT datasets and running word-level forced alignment on them, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), `lyricscribe transcribe` for batch ASR transcription, `lyricscribe evaluate` for transcription quality evaluation and plotting, `lyricscribe artifacts` for artifact feature extraction and correlation analysis, and `lyricscribe finetune` for ASR model finetuning with epoch-level SLURM checkpointing.
 
 <details>
 <summary><h3>lyricscribe dataset</h3></summary>
@@ -68,6 +68,69 @@ musdb_alt/
 │   └── lyrics.json
 └── ...
 ```
+
+#### `lyricscribe dataset align`
+
+Runs Montreal Forced Aligner via Singularity/Apptainer to produce word-level alignments and writes them back into each song's `lyrics.json` under the `alignment` field. Works on any dataset that follows the standard per-song layout (each subdirectory contains an audio file and a `lyrics.json`).
+
+**Setup** — pull the MFA image and download models once:
+
+```bash
+singularity pull mfa.sif docker://mmcauliffe/montreal-forced-aligner:latest
+mkdir -p /path/to/mfa_cache
+singularity exec --env MFA_ROOT_DIR=/mfa_root -B /path/to/mfa_cache:/mfa_root mfa.sif \
+    mfa model download acoustic english_mfa
+singularity exec --env MFA_ROOT_DIR=/mfa_root -B /path/to/mfa_cache:/mfa_root mfa.sif \
+    mfa model download dictionary english_mfa
+```
+
+**Usage:**
+
+```bash
+uv run lyricscribe dataset align \
+    --dataset-dir ./dataset/musdb_alt \
+    --filename vocals.wav \
+    --container ./mfa.sif \
+    --mfa-root /path/to/mfa_cache
+```
+
+For datasets separated with `lyricscribe separate` (e.g. an `htdemucs_ft_vocals.wav` stem per song), pass the stem filename:
+
+```bash
+uv run lyricscribe dataset align \
+    --dataset-dir ./dataset/final_train \
+    --filename htdemucs_ft_vocals.wav \
+    --container ./mfa.sif \
+    --mfa-root /path/to/mfa_cache
+```
+
+Options:
+
+- `--dataset-dir`: Root dataset directory containing song subdirectories (required)
+- `--filename`: Audio filename inside each song subdirectory (default: `vocals.wav`)
+- `--container` / `-c`: Path to `.sif` file (or set env `LYRICSCRIBE_MFA_CONTAINER`)
+- `--mfa-root`: Host directory for cached MFA pretrained models (recommended)
+- `--num-chunks`: Total shards for parallel execution (default `1`)
+- `--chunk-id`: 0-indexed shard to process (used with `--num-chunks`, usually supplied by `$SLURM_ARRAY_TASK_ID`)
+- `--skip-existing` / `--no-skip-existing`: Skip songs whose `lyrics.json` already has a non-null `alignment` (default on; makes reruns cheap)
+
+After alignment, each song's `lyrics.json` has an `alignment` field like:
+
+```json
+{
+  "alignment": {
+    "words": [
+      {"word": "she's", "start": 2310, "duration": 530},
+      {"word": "the", "start": 2840, "duration": 340}
+    ],
+    "source_audio": "vocals.wav",
+    "mfa_model": "english_mfa",
+    "generated_at": "2026-04-18T12:34:56Z"
+  }
+}
+```
+
+Times are in milliseconds (matching the `synced` field's convention).
 
 </details>
 
@@ -226,6 +289,18 @@ Options:
 
 - `--job-dir`: Path to job directory (required)
 
+#### `lyricscribe transcribe reset`
+
+Reset a transcription job so it can be re-run from scratch. Deletes any `results*.jsonl` files in the job directory and flips every chunk entry's status back to `pending` (clearing its duration, error, and processed-at fields).
+
+```bash
+uv run lyricscribe transcribe reset --job-dir ./jobs/whisper_vocals
+```
+
+Options:
+
+- `--job-dir`: Path to job directory (required)
+
 </details>
 
 <details>
@@ -268,11 +343,12 @@ uv run lyricscribe evaluate plot \
     --jobs-dir ./jobs \
     --output-dir ./plots
 
-# Include the artifact quartile chart (builds word-level data in memory)
+# Include the artifact quartile chart (builds word-level data in memory).
+# Alignments are read from each song's lyrics.json — run
+# `lyricscribe dataset align` on the MUSDB directory first.
 uv run lyricscribe evaluate plot \
     --jobs-dir ./jobs \
     --output-dir ./plots \
-    --alignments-dir ./alignments \
     --features-dir ./features \
     --results-file ./jobs/whisper_vocals/results.jsonl \
     --results-file ./jobs/parakeet_vocals/results.jsonl \
@@ -284,10 +360,9 @@ Options:
 
 - `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
 - `--output-dir`: Directory to save the generated PDF plots (required)
-- `--alignments-dir`: Directory of MFA alignment JSON files (enables artifact chart)
 - `--features-dir`: Directory of artifact feature JSON files (enables artifact chart)
 - `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (enables artifact chart)
-- `--musdb-dir`: Root MUSDB directory for ground truth lyrics (enables artifact chart)
+- `--musdb-dir`: Root MUSDB directory (alignments + ground truth both from each song's `lyrics.json`, enables artifact chart)
 
 Output files:
 
@@ -323,45 +398,14 @@ Options:
 - `--musdb-dir`: Root MUSDB directory (required)
 - `--output-dir`: Directory to write per-song feature JSON files (required)
 
-#### `lyricscribe artifacts align`
-
-Runs Montreal Forced Aligner via Singularity/Apptainer to produce word-level alignments. MFA does not need to be installed in your Python environment.
-
-**Setup** — pull the MFA image and download models once:
-
-```bash
-singularity pull mfa.sif docker://mmcauliffe/montreal-forced-aligner:latest
-mkdir -p /path/to/mfa_cache
-singularity exec --env MFA_ROOT_DIR=/mfa_root -B /path/to/mfa_cache:/mfa_root mfa.sif \
-    mfa model download acoustic english_mfa
-singularity exec --env MFA_ROOT_DIR=/mfa_root -B /path/to/mfa_cache:/mfa_root mfa.sif \
-    mfa model download dictionary english_mfa
-```
-
-**Usage:**
-
-```bash
-uv run lyricscribe artifacts align \
-    --musdb-dir ./dataset/musdb_alt \
-    --output-dir ./alignments \
-    --container ./mfa.sif \
-    --mfa-root /path/to/mfa_cache
-```
-
-Options:
-
-- `--musdb-dir`: Root MUSDB directory containing song subdirectories (required)
-- `--output-dir`: Directory to write per-song alignment JSON files (required)
-- `--container` / `-c`: Path to `.sif` file (or set env `LYRICSCRIBE_MFA_CONTAINER`)
-- `--mfa-root`: Host directory for cached MFA pretrained models (recommended)
-
 #### `lyricscribe artifacts build`
 
 Builds a word-level CSV dataset that combines MFA alignments, artifact features, ground-truth lyrics, and model transcription errors. Each row represents one word for one model, with the artifact features averaged over that word's time window, the error type (correct, deletion, substitution) from jiwer alignment, and the count of hypothesis words inserted adjacent to this reference word. This CSV is useful for notebook exploration; plotting is handled by `evaluate plot`.
 
+Run `lyricscribe dataset align` on the MUSDB directory first so alignments are present in each song's `lyrics.json`.
+
 ```bash
 uv run lyricscribe artifacts build \
-    --alignments-dir ./alignments \
     --features-dir ./features \
     --results-file ./jobs/whisper_vocals/results.jsonl \
     --results-file ./jobs/parakeet_vocals/results.jsonl \
@@ -372,10 +416,9 @@ uv run lyricscribe artifacts build \
 
 Options:
 
-- `--alignments-dir`: Directory of MFA alignment JSON files (required)
 - `--features-dir`: Directory of artifact feature JSON files (required)
 - `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (required)
-- `--musdb-dir`: Root MUSDB directory for ground truth lyrics (required)
+- `--musdb-dir`: Root MUSDB directory (alignments + ground truth both from each song's `lyrics.json`) (required)
 - `--output`: Path to write the word-level CSV (required)
 
 </details>
@@ -467,6 +510,30 @@ Options:
 
 - `--job-dir`: Path to job directory (required)
 - `--chunk-id`: Chunk to retry (required)
+
+#### `lyricscribe finetune retry-all`
+
+Reset every failed chunk across every experiment in an experiments directory. Successful chunks and existing checkpoints are left alone. Use this after deploying a fix that should unblock previously-failed runs.
+
+```bash
+lyricscribe finetune retry-all --experiments-dir ./experiments
+```
+
+Options:
+
+- `--experiments-dir`: Directory containing experiment subdirectories (required)
+
+#### `lyricscribe finetune status`
+
+Print a one-line summary for every experiment in a directory: current epoch, chunk success/failure/running/pending counts, last checkpoint, and last observed loss.
+
+```bash
+lyricscribe finetune status --experiments-dir ./experiments
+```
+
+Options:
+
+- `--experiments-dir`: Directory containing experiment subdirectories (required)
 
 #### `lyricscribe finetune export-model`
 

@@ -494,7 +494,10 @@ class NeMoTrainer:
         if hasattr(cfg, "loss") and cfg.loss is not None:
             cfg.loss.reduction = "mean_batch"
         cfg.train_ds.shuffle = True
-        cfg.train_ds.num_workers = 4
+        # num_workers overrideable via config — on tight-CPU dev boxes
+        # 4 is optimal, on H200 nodes with 64+ cores raise to 16–32.
+        cfg.train_ds.num_workers = self.config.get("num_workers", 4)
+        cfg.train_ds.pin_memory = True
 
         if val_manifest:
             if is_canary:
@@ -510,7 +513,8 @@ class NeMoTrainer:
             cfg.validation_ds.manifest_filepath = str(val_manifest)
             cfg.validation_ds.min_duration = 0.1
             cfg.validation_ds.max_duration = self.config.get("max_duration", 240.0)
-            cfg.validation_ds.num_workers = 4
+            cfg.validation_ds.num_workers = self.config.get("num_workers", 4)
+            cfg.validation_ds.pin_memory = True
 
         if self.config.get("use_augmentation", True):
             cfg.spec_augment.freq_masks = 2
@@ -947,6 +951,7 @@ class WhisperTrainer:
             training_args = Seq2SeqTrainingArguments(
                 output_dir=str(job_dir / "hf_trainer"),
                 per_device_train_batch_size=self.config["batch_size"],
+                gradient_accumulation_steps=self.config.get("grad_accum", 1),
                 learning_rate=self.config["learning_rate"],
                 warmup_ratio=warmup_ratio,
                 num_train_epochs=self.config["max_epochs"],
@@ -960,9 +965,27 @@ class WhisperTrainer:
                 weight_decay=0.01,
                 max_grad_norm=1.0,
                 dataloader_num_workers=16,
+                # Keep workers alive across epoch boundaries instead of
+                # re-spawning — eliminates the ~2 s per-epoch cold start
+                # where every worker re-imports transformers + torch.
+                dataloader_persistent_workers=True,
+                # Each worker keeps N batches pre-fetched ahead of the
+                # GPU, so even a slow individual batch decode gets hidden
+                # behind the prior step's compute. 4 is conservative —
+                # memory cost = 4 × batch of mel spectrograms per worker,
+                # typically well under 1 GB of host RAM.
+                dataloader_prefetch_factor=4,
+                dataloader_pin_memory=True,
                 predict_with_generate=True,
                 report_to="none",
                 run_name=self.config["exp_name"],
+                # ``torch_compile`` can fuse Whisper's small ops and
+                # eliminate dtype-cast traffic, but the compile cost
+                # hits the first ~10 steps and only amortizes in long
+                # training runs. Default off — enable explicitly with
+                # ``"torch_compile": true`` in the job config for
+                # production runs where it pays back.
+                torch_compile=self.config.get("torch_compile", False),
             )
 
             self.hf_trainer = Seq2SeqTrainer(
@@ -974,6 +997,7 @@ class WhisperTrainer:
                 data_collator=WhisperDataCollator(processor=self.processor),
                 tokenizer=self.processor,
             )
+
         else:
             self.hf_trainer.train_dataset = train_dataset
             if eval_dataset is not None:
@@ -1118,7 +1142,7 @@ def run_training_job(
     while True:
         try:
             return _run_training_job_inner(
-                config, train_manifest, val_manifest, chunk_end_epoch, job_dir
+                config, train_manifest, val_manifest, chunk_end_epoch, job_dir,
             )
         except torch.cuda.OutOfMemoryError as e:
             current_bs = config.get("batch_size", 1)

@@ -5,6 +5,8 @@ from pathlib import Path
 import jiwer
 import numpy as np
 
+from lyricscribe.schemas import Lyrics
+
 logger = logging.getLogger(__name__)
 
 fields = [
@@ -21,18 +23,39 @@ fields = [
 # spectral_flatness, how noisy vs. tonal the artifact is
 
 
-def _load_alignments(alignments_dir: Path) -> dict[str, list[dict]]:
+def _load_alignments(dataset_dir: Path) -> dict[str, list[dict]]:
     """
-    Load MFA word-level alignments for each song.
+    Load MFA word-level alignments from each song's lyrics.json.
 
-    :param alignments_dir: absolute path to directory containing one .json alignment file per song.
-    :returns: Dictionary mapping song_id to a list of word dicts, each containing'word', 'start', and 'end' keys.
+    Walks ``dataset_dir`` subdirectories; for each song that has a
+    non-null ``alignment`` field in its ``lyrics.json``, converts word
+    times from milliseconds (schema) to seconds (what the downstream
+    window-indexing expects).
+
+    :param dataset_dir: Root dataset directory (one subdirectory per song).
+    :returns: Dictionary mapping song_id to a list of word dicts, each
+        with ``word``, ``start``, and ``end`` keys (start/end in seconds).
     """
     alignments = {}
-    for path in  (sorted(alignments_dir.glob("*.json"))):
-        with open(path) as f:
-            data = json.load(f)
-        alignments[data["song_id"]] = data["words"]
+    for song_dir in sorted(d for d in dataset_dir.iterdir() if d.is_dir()):
+        lyrics_path = song_dir / "lyrics.json"
+        if not lyrics_path.exists():
+            continue
+        try:
+            lyrics = Lyrics.model_validate_json(lyrics_path.read_text())
+        except Exception as e:
+            logger.warning(f"Skipping {song_dir.name}: invalid lyrics.json ({e})")
+            continue
+        if lyrics.alignment is None:
+            continue
+        alignments[song_dir.name] = [
+            {
+                "word": w.word,
+                "start": w.start / 1000.0,
+                "end": (w.start + w.duration) / 1000.0,
+            }
+            for w in lyrics.alignment.words
+        ]
     logger.info(f"Loaded alignments for {len(alignments)} songs")
     return alignments
 
@@ -166,7 +189,6 @@ def _get_word_error(reference: str, hypothesis: str) -> tuple[dict[int, str], di
 
 
 def build_dataset(
-    alignment_dir: Path,
     features_dir: Path,
     results_files: list[Path],
     musdb_dir: Path,
@@ -181,14 +203,15 @@ def build_dataset(
     features during that word's time window and the model's error type for
     that word.  Returns one dict per (word, model) pair.
 
-    :param alignment_dir: directory containing MFA alignment .json files.
     :param features_dir: directory containing artifact feature .json files.
     :param results_files: paths to one or more .jsonl transcription results files.
-    :param musdb_dir: root MUSDB directory, used to load ground truth lyrics.
+    :param musdb_dir: root MUSDB directory. Alignments are read from the
+        ``alignment`` field of each song's ``lyrics.json``; ground-truth
+        lyrics from the same file's ``synced`` field.
     :param csv_output: optional path to also write the dataset as CSV.
     :returns: list of row dicts.
     """
-    alignments = _load_alignments(alignment_dir)
+    alignments = _load_alignments(musdb_dir)
     features = _load_artifact_features(features_dir)
     results = _load_results(results_files)
     ground_truth = _load_ground_truth(musdb_dir)

@@ -370,9 +370,6 @@ def evaluate_plot(
     output_dir: Path = typer.Option(
         ..., "--output-dir", help="Directory to save the generated PDF plots"
     ),
-    alignments_dir: Path | None = typer.Option(
-        None, "--alignments-dir", help="Directory of MFA alignment JSON files (enables artifact chart)"
-    ),
     features_dir: Path | None = typer.Option(
         None, "--features-dir", help="Directory of artifact feature JSON files (enables artifact chart)"
     ),
@@ -385,14 +382,15 @@ def evaluate_plot(
         help="Job subdirectory name to auto-discover results*.jsonl across all model directories under --jobs-dir",
     ),
     musdb_dir: Path | None = typer.Option(
-        None, "--musdb-dir", help="Root MUSDB directory for ground truth lyrics (enables artifact chart)"
+        None, "--musdb-dir", help="Root MUSDB directory (alignments + ground-truth both come from each song's lyrics.json)"
     ),
 ):
     """Generate evaluation plots from job directories.
 
-    To include the artifact quartile chart, pass --alignments-dir, --features-dir,
-    --results-file, and --musdb-dir. Repeat --results-file to include multiple
-    model result files. The word-level dataset is built in memory.
+    To include the artifact quartile chart, pass --features-dir, --musdb-dir,
+    and --results-file (repeat for multiple models). Alignments are read from
+    the ``alignment`` field of each song's ``lyrics.json``, so run
+    ``lyricscribe dataset align`` on the MUSDB directory first.
     """
     from lyricscribe import plots
     from lyricscribe.transcribe.artifacts import correlation
@@ -403,16 +401,16 @@ def evaluate_plot(
         jobs_dir=jobs_dir,
         job_name=results_job_name,
     )
-    if alignments_dir is not None and features_dir is not None and musdb_dir is not None and result_files:
+    if features_dir is not None and musdb_dir is not None and result_files:
         word_dataset = correlation.build_dataset(
-            alignments_dir, features_dir, result_files, musdb_dir
+            features_dir, result_files, musdb_dir
         )
     elif any(
-        opt is not None for opt in [alignments_dir, features_dir, musdb_dir]
+        opt is not None for opt in [features_dir, musdb_dir]
     ) or result_files or results_job_name:
         logger.warning(
-            "Artifact chart requires --alignments-dir, --features-dir, --musdb-dir, "
-            "and either one or more --results-file values or --results-job-name. "
+            "Artifact chart requires --features-dir, --musdb-dir, and either "
+            "one or more --results-file values or --results-job-name. "
             "Skipping artifact chart."
         )
     plots.generate_all_plots(jobs_dir, output_dir, word_dataset=word_dataset)
@@ -429,13 +427,10 @@ def artifact_extract(
     extractor.process_dataset(musdb_dir, output_dir)
 
 
-@artifacts_app.command("align")
-def artifact_align(
-    musdb_dir: Path = typer.Option(
-        ..., "--musdb-dir", help="Root MUSDB directory containing song subdirectories"
-    ),
-    output_dir: Path = typer.Option(
-        ..., "--output-dir", help="Directory to write per-song alignment JSON files"
+@dataset_app.command("align")
+def dataset_align(
+    dataset_dir: Path = typer.Option(
+        ..., "--dataset-dir", help="Root dataset directory containing song subdirectories"
     ),
     container: str | None = typer.Option(
         None,
@@ -449,23 +444,46 @@ def artifact_align(
         "--mfa-root",
         help="Host directory for cached MFA pretrained models",
     ),
+    filename: str = typer.Option(
+        "vocals.wav",
+        "--filename",
+        help="Audio filename inside each song subdirectory (e.g. htdemucs_ft_vocals.wav)",
+    ),
+    num_chunks: int = typer.Option(
+        1,
+        "--num-chunks",
+        help="Total number of shards to partition the dataset into",
+    ),
+    chunk_id: int = typer.Option(
+        0,
+        "--chunk-id",
+        help="0-indexed shard to process (requires --num-chunks > 1)",
+    ),
+    skip_existing: bool = typer.Option(
+        True,
+        "--skip-existing/--no-skip-existing",
+        help="Skip songs whose lyrics.json already has a non-null alignment",
+    ),
 ):
-    """Run Montreal Forced Aligner (via Singularity/Apptainer) for word-level alignments."""
+    """
+    Run Montreal Forced Aligner on a dataset and write word-level alignments
+    back into each song's lyrics.json (populates the `alignment` field).
+    """
     from lyricscribe.transcribe.artifacts import processor
 
     processor.align(
-        musdb_dir,
-        output_dir,
+        dataset_dir,
         container=container,
         mfa_root=mfa_root,
+        filename=filename,
+        num_chunks=num_chunks,
+        chunk_id=chunk_id,
+        skip_existing=skip_existing,
     )
 
 
 @artifacts_app.command("build")
 def artifact_build(
-    alignments_dir: Path = typer.Option(
-        ..., "--alignments-dir", help="Directory of MFA alignment JSON files"
-    ),
     features_dir: Path = typer.Option(
         ..., "--features-dir", help="Directory of artifact feature JSON files"
     ),
@@ -483,13 +501,18 @@ def artifact_build(
         help="Job subdirectory name to auto-discover results*.jsonl across model directories",
     ),
     musdb_dir: Path = typer.Option(
-        ..., "--musdb-dir", help="Root MUSDB directory for ground truth lyrics"
+        ..., "--musdb-dir", help="Root MUSDB directory (alignments + ground truth both from each song's lyrics.json)"
     ),
     output: Path = typer.Option(
         ..., "--output", help="Path to write the word-level CSV dataset"
     ),
 ):
-    """Build the word-level dataset combining alignments, artifacts, and errors."""
+    """Build the word-level dataset combining alignments, artifacts, and errors.
+
+    Alignments are read from the ``alignment`` field of each song's
+    ``lyrics.json`` — run ``lyricscribe dataset align`` on the MUSDB
+    directory first.
+    """
     from lyricscribe.transcribe.artifacts import correlation
 
     result_files = _collect_result_files(
@@ -498,7 +521,7 @@ def artifact_build(
         job_name=results_job_name,
     )
     correlation.build_dataset(
-        alignments_dir, features_dir, result_files, musdb_dir, csv_output=output
+        features_dir, result_files, musdb_dir, csv_output=output
     )
 
 
@@ -871,6 +894,109 @@ def finetune_status(
             f"{r['current_epoch']:>2}/{r['max_epochs']} epochs  "
             f"chunks={chunks_str}  ckpt={ckpt}{loss_str}"
         )
+
+
+@finetune_app.command("tune-batch")
+def finetune_tune_batch(
+    dataset_dir: Path = typer.Option(
+        ...,
+        "--dataset-dir",
+        help="Folder of song subdirectories. The sweep reads the first "
+             "bs samples of the requested filename per trial — no "
+             "manifests, no job config files, just direct file reads.",
+    ),
+    filename: str = typer.Option(
+        ...,
+        "--filename",
+        help="Which audio file to read in each song subdirectory "
+             "(e.g. htdemucs_ft_vocals.wav, audio.mp3). Different "
+             "filenames can have different VRAM footprints (stereo vs. "
+             "mono source, different codec), so sweep on whichever "
+             "you'll actually train against.",
+    ),
+    model: str = typer.Option(
+        ..., "--model", help="Model identifier (e.g. nvidia/parakeet-tdt-0.6b-v3).",
+    ),
+    freeze_encoder: bool = typer.Option(
+        False,
+        "--freeze-encoder",
+        help="Freeze the encoder — Canary/Parakeet only. MUST match "
+             "production; freeze state shifts VRAM by ~5–10 GiB.",
+    ),
+    max_duration: float = typer.Option(
+        30.0,
+        "--max-duration",
+        help="Audio clip length in seconds. Longer = more activations = "
+             "more VRAM. Must match production.",
+    ),
+    start: int = typer.Option(
+        1, "--start", help="Smallest batch size to try."
+    ),
+    max_bs: int = typer.Option(
+        128, "--max", help="Largest batch size to try.",
+    ),
+    safety_margin_pct: float = typer.Option(
+        15.0,
+        "--safety-margin",
+        help="Percent shaved off the VRAM ceiling when no sweet spot "
+             "is found — covers DDP overhead + per-sample variance.",
+    ),
+    timeout_s: int = typer.Option(
+        900,
+        "--timeout",
+        help="Kill any trial running longer than this (seconds). "
+             "Usually indicates a hang on model download or first-step "
+             "CUDA compilation.",
+    ),
+    min_gap: int = typer.Option(
+        2,
+        "--min-gap",
+        help="After doubling hits OOM, bisect between last-success and "
+             "OOM until gap ≤ this. 1 = exact ceiling, 2 = one less "
+             "trial with 1-unit slop.",
+    ),
+):
+    """
+    Find the largest batch size that fits for this model on this hardware.
+
+    Run as a SLURM job with the **same node shape** (GPU count, GPU type,
+    DDP rank count) you'll actually train on — per-rank VRAM depends on
+    the DDP bucket size, which depends on rank count.
+
+    Each trial is a fresh ``multiprocessing.Process`` (spawn context) so
+    an OOM cleanly crashes the worker instead of corrupting the parent's
+    CUDA state. In-process measurement:
+
+    1. Load the model.
+    2. Read ``bs`` real audio files from ``--dataset-dir``, decode to
+       16 kHz mono, pad/truncate to ``--max-duration``.
+    3. Build the forward batch exactly as the model's training_step
+       would see it.
+    4. Run warmup + 4 training steps (forward + backward + optimizer)
+       in bf16-mixed autocast with AdamW.
+    5. Report peak reserved VRAM and median step time.
+
+    No manifests are created. No config files are written. Nothing
+    persists after the sweep.
+    """
+    from lyricscribe.finetune import tune_batch
+
+    if not dataset_dir.is_dir():
+        logger.error(f"Not a directory: {dataset_dir}")
+        raise typer.Exit(code=1)
+
+    tune_batch.tune_batch_size(
+        dataset_dir=dataset_dir,
+        filename=filename,
+        model_name=model,
+        freeze_encoder=freeze_encoder,
+        max_duration_s=max_duration,
+        start=start,
+        max_bs=max_bs,
+        min_gap=min_gap,
+        timeout_s=timeout_s,
+        safety_margin_pct=safety_margin_pct,
+    )
 
 
 @finetune_app.command("export-model")
