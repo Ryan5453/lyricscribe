@@ -29,9 +29,9 @@
 #SBATCH --output=/projects/fahey.rya/music2text/logs/tune_batch/tune_%j.out
 #SBATCH --time=4:00:00
 #SBATCH --partition=multigpu
-#SBATCH --gres=gpu:a100:4
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=256G
+#SBATCH --gres=gpu:h200:4
+#SBATCH --cpus-per-task=56
+#SBATCH --mem=240G
 
 if [ $# -lt 3 ]; then
     echo "Usage: sbatch scripts/slurm_tune_batch.sh <dataset-dir> <filename> <model> [extra args]"

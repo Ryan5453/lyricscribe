@@ -4,7 +4,7 @@
 #SBATCH --output=/projects/fahey.rya/music2text/logs/finetune/finetune_%j.out
 #SBATCH --time=12:00:00
 #SBATCH --partition=multigpu
-#SBATCH --gres=gpu:a100:4
+#SBATCH --gres=gpu:h200:4
 #SBATCH --cpus-per-task=56
 #SBATCH --mem=240G
 
