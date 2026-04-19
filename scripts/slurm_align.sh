@@ -51,8 +51,6 @@ module load FFmpeg/7.1.1
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
 
-export LD_LIBRARY_PATH="$(pwd)/.venv/lib/python3.11/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
-
 export LYRICSCRIBE_MFA_CONTAINER=/projects/fahey.rya/music2text/mfa.sif
 
 echo "=== MFA align chunk ${CHUNK_ID}/${NUM_CHUNKS} ==="

@@ -51,7 +51,7 @@ echo "extra:    $EXTRA_ARGS"
 echo "node:     $(scontrol show job $SLURM_JOB_ID 2>/dev/null | grep -E 'NumNodes|NumCPUs|Gres' | xargs)"
 echo "start:    $(date)"
 
-module load cuda/13.2.0
+module load cuda/12.8.0
 module load FFmpeg/7.1.1
 
 export HF_HOME=/projects/fahey.rya/music2text/.cache/huggingface
