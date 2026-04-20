@@ -82,24 +82,14 @@ def create_finetune_config(
         "output_dir": str(output_dir),
         "exp_name": exp_name,
         "filenames": filenames,
-        "batch_size": kwargs.get("batch_size", 24 if architecture == "whisper" else 5),
+        "batch_size": kwargs.get("batch_size", 48 if architecture == "parakeet" else 24),
         "max_epochs": kwargs.get("max_epochs", 10),
         "epochs_per_job": kwargs.get("epochs_per_job", 5 if architecture == "whisper" else 3),
         "learning_rate": kwargs.get("learning_rate", default_lr),
         "warmup_epochs": kwargs.get("warmup_epochs", 5),
         "use_augmentation": kwargs.get("use_augmentation", True),
-        # Canary-specific: Lhotse's duration-based batching. Unused by
-        # Whisper/Parakeet (they use batch_size). 600 s matches H200
-        # production defaults; lower for smaller GPUs.
-        "batch_duration": kwargs.get("batch_duration", 600),
-        # Canary-specific: freeze the encoder so only decoder+head are
-        # optimized. Cuts AdamW state ~5x and lets 1 B-param Canary train
-        # on a 12–16 GB GPU. No effect for Whisper/Parakeet.
+        "batch_duration": kwargs.get("batch_duration", 1440),
         "freeze_encoder": kwargs.get("freeze_encoder", False),
-        # Shared fixed-size validation subset both Whisper and NeMo
-        # evaluate against each epoch. Materialized as a separate
-        # ``val_subset_manifest.jsonl`` at setup time — see
-        # ``write_subset_manifest``.
         "eval_subset_size": kwargs.get("eval_subset_size", 200),
         "current_epoch": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
