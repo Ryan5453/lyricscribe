@@ -31,6 +31,7 @@ module load FFmpeg/7.1.1
 export HF_HOME=/projects/fahey.rya/music2text/.cache/huggingface
 export TORCH_HOME=/projects/fahey.rya/music2text/.cache/torch
 export NEMO_CACHE_DIR=/projects/fahey.rya/music2text/.cache/nemo
+export NCCL_NVLS_ENABLE=0
 
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
