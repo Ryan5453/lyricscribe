@@ -555,12 +555,18 @@ def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
     ax.set_title(
         "Error Type Breakdown by Model", fontsize=13, fontweight="bold", pad=12
     )
-    ax.set_ylim(0, 108)
-    ax.legend(frameon=False, fontsize=10, loc="upper right")
+    ax.set_ylim(0, 105)
+    ax.legend(
+        frameon=False,
+        fontsize=10,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=3,
+    )
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0f}%"))
     ax.set_axisbelow(True)
     fig.tight_layout()
-    fig.savefig(output_path)
+    fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved error type breakdown plot -> {output_path}")
 
