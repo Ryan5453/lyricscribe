@@ -2,14 +2,22 @@ import json
 import logging
 from pathlib import Path
 
-from alt_eval import compute_metrics
+import jiwer
+from alt_eval.tokenizer import WORD, LyricsTokenizer, tokens_as_words
 
 logger = logging.getLogger(__name__)
+
+_TOKENIZER = LyricsTokenizer()
 
 
 def _language_for(lyrics_data: dict) -> str:
     lang = lyrics_data.get("detected_language") or "en"
     return lang.split("-")[0].split("_")[0].lower() or "en"
+
+
+def _normalized(text: str, language: str) -> str:
+    tokens = _TOKENIZER(text, language=language)
+    return " ".join(t.text.lower() for t in tokens_as_words(tokens) if WORD in t.tags)
 
 
 def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
@@ -91,24 +99,30 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
                 logger.warning(f"{song_id}: skipped (no ground truth)")
             continue
 
-        measures = compute_metrics(
-            references=[references[song_id]],
-            hypotheses=[hypothesis],
-            languages=[languages[song_id]],
-        )
+        lang = languages[song_id]
+        ref_norm = _normalized(references[song_id], lang)
+        hyp_norm = _normalized(hypothesis, lang)
+        if not ref_norm:
+            if verbose:
+                logger.warning(f"{song_id}: skipped (empty reference after normalization)")
+            continue
+
+        measures = jiwer.process_words([ref_norm], [hyp_norm])
 
         if verbose:
+            ref_len = measures.substitutions + measures.deletions + measures.hits
+            wer = (measures.substitutions + measures.deletions + measures.insertions) / ref_len if ref_len else 0.0
             logger.debug(
-                f"{song_id} [{languages[song_id]}]: WER={measures['WER']:.2%}  "
-                f"I={measures['insertions']}  "
-                f"D={measures['deletions']}  "
-                f"S={measures['substitutions']}"
+                f"{song_id} [{lang}]: WER={wer:.2%}  "
+                f"I={measures.insertions}  "
+                f"D={measures.deletions}  "
+                f"S={measures.substitutions}"
             )
 
-        totals["insertions"] += measures["insertions"]
-        totals["deletions"] += measures["deletions"]
-        totals["substitutions"] += measures["substitutions"]
-        totals["hits"] += measures["hits"]
+        totals["insertions"] += measures.insertions
+        totals["deletions"] += measures.deletions
+        totals["substitutions"] += measures.substitutions
+        totals["hits"] += measures.hits
         n += 1
 
     if n == 0:
