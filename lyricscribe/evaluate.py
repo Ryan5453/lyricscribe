@@ -95,7 +95,6 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
             references=[references[song_id]],
             hypotheses=[hypothesis],
             languages=[languages[song_id]],
-            include_other=False,
         )
 
         if verbose:
