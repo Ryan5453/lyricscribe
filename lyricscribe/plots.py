@@ -33,16 +33,25 @@ def _apply_style() -> None:
     )
 
 
+_MODEL_LABELS = {
+    "openai/whisper-large-v3": "Whisper large-v3",
+    "nvidia/canary-1b-v2": "Canary 1B v2",
+    "nvidia/parakeet-tdt-0.6b-v3": "Parakeet TDT 0.6B v3",
+}
+
+
 def _model_label(full_name: str) -> str:
     """
-    Derive a human-readable label from a HuggingFace model ID.
+    Human-readable label for a HuggingFace model ID.
 
-    Short alphabetic segments (<=3 chars) are uppercased, everything else
-    is title-cased, and hyphens become spaces.
+    Uses the vendor's own capitalization for known models; falls back to
+    a hyphen-split, title-cased form otherwise.
 
     :param full_name: full model identifier, e.g. ``'openai/whisper-large-v3'``.
-    :returns: readable label, e.g. ``'Whisper Large V3'``.
+    :returns: readable label, e.g. ``'Whisper large-v3'``.
     """
+    if full_name in _MODEL_LABELS:
+        return _MODEL_LABELS[full_name]
     name = full_name.rsplit("/", 1)[-1]
     parts = name.split("-")
     return " ".join(p.upper() if p.isalpha() and len(p) <= 3 else p.title() for p in parts)
@@ -651,7 +660,13 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
     ax.axvline(0, color="#888888", linewidth=0.8, linestyle="--", zorder=1)
     ax.set_xlabel("Change in Insertion Proportion", fontsize=11)
     ax.set_ylabel("Change in Deletion Proportion", fontsize=11)
-    ax.legend(fontsize=10, loc="lower right", framealpha=0.9)
+    ax.legend(
+        fontsize=10,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=len(models),
+        frameon=False,
+    )
     ax.set_title(
         "Pipeline Shift vs. Clean Stems Baseline (MUSDB18)",
         fontsize=12,
@@ -659,7 +674,7 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
     )
 
     fig.tight_layout()
-    fig.savefig(output_path)
+    fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved pipeline shift plot -> {output_path}")
 
