@@ -106,7 +106,7 @@ def plot_baseline_wer(df: pd.DataFrame, output_path: Path) -> None:
 
     for i, model in enumerate(models):
         model_df = df[df["model"] == model]
-        wer_map = model_df.groupby("config")["mean_wer"].mean()
+        wer_map = model_df.groupby("config")["wer"].mean()
         vals = [wer_map.get(c, 0) for c in configs]
 
         offset = (i - (n_models - 1) / 2) * w
@@ -422,7 +422,7 @@ def plot_wer_heatmap(df: pd.DataFrame, output_path: Path) -> None:
     configs = list(dict.fromkeys(df["config"]))
 
     pivot = df.pivot_table(
-        values="mean_wer", index="model", columns="config", aggfunc="mean"
+        values="wer", index="model", columns="config", aggfunc="mean"
     )
     pivot = pivot.reindex(index=models, columns=configs)
     matrix = pivot.values * 100

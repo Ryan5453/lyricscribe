@@ -2,15 +2,25 @@ import json
 import logging
 from pathlib import Path
 
-import jiwer
+from alt_eval import compute_metrics
 
 logger = logging.getLogger(__name__)
+
+
+def _language_for(lyrics_data: dict) -> str:
+    lang = lyrics_data.get("detected_language") or "en"
+    return lang.split("-")[0].split("_")[0].lower() or "en"
 
 
 def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
     """
     Evaluate a single transcription job directory, returning aggregate
     WER stats and the job config, or None if the job cannot be evaluated.
+
+    References and hypotheses both flow through the alt-eval lyrics
+    tokenizer and normalizer (Cífka et al. 2024) before WER / I / D / S
+    are computed, so differences in casing, punctuation, and per-language
+    contraction handling are not counted as errors.
     """
     config_path = job_dir / "config.json"
     if not config_path.exists():
@@ -26,6 +36,7 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
         return None
 
     references: dict[str, str] = {}
+    languages: dict[str, str] = {}
     for directory in directories:
         for song_dir in directory.iterdir():
             if not song_dir.is_dir():
@@ -35,6 +46,7 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
                 with open(lyrics_path) as f:
                     lyrics_data = json.load(f)
                 references[song_dir.name] = lyrics_data["unsynced"]["data"]
+                languages[song_dir.name] = _language_for(lyrics_data)
 
     if not references:
         if verbose:
@@ -63,12 +75,8 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
             logger.warning("No results found in job directory")
         return None
 
-    totals: dict[str, list] = {
-        "wer": [],
-        "insertions": [],
-        "deletions": [],
-        "substitutions": [],
-    }
+    n = 0
+    totals = {"insertions": 0, "deletions": 0, "substitutions": 0, "hits": 0}
     for r in results:
         song_id = r["song_id"]
         hypothesis = r["transcription"]
@@ -83,33 +91,41 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
                 logger.warning(f"{song_id}: skipped (no ground truth)")
             continue
 
-        measures = jiwer.compute_measures(references[song_id], hypothesis)
+        measures = compute_metrics(
+            references=[references[song_id]],
+            hypotheses=[hypothesis],
+            languages=[languages[song_id]],
+            include_other=False,
+        )
 
         if verbose:
             logger.debug(
-                f"{song_id}: WER={measures['wer']:.2%}  "
+                f"{song_id} [{languages[song_id]}]: WER={measures['WER']:.2%}  "
                 f"I={measures['insertions']}  "
                 f"D={measures['deletions']}  "
                 f"S={measures['substitutions']}"
             )
 
-        totals["wer"].append(measures["wer"])
-        totals["insertions"].append(measures["insertions"])
-        totals["deletions"].append(measures["deletions"])
-        totals["substitutions"].append(measures["substitutions"])
+        totals["insertions"] += measures["insertions"]
+        totals["deletions"] += measures["deletions"]
+        totals["substitutions"] += measures["substitutions"]
+        totals["hits"] += measures["hits"]
+        n += 1
 
-    n = len(totals["wer"])
     if n == 0:
         if verbose:
             logger.warning("No songs could be evaluated")
         return None
 
+    ref_length = totals["substitutions"] + totals["deletions"] + totals["hits"]
+    errors = totals["substitutions"] + totals["deletions"] + totals["insertions"]
     return {
         "n_songs": n,
-        "mean_wer": sum(totals["wer"]) / n,
-        "insertions": sum(totals["insertions"]),
-        "deletions": sum(totals["deletions"]),
-        "substitutions": sum(totals["substitutions"]),
+        "wer": errors / ref_length if ref_length else 0.0,
+        "insertions": totals["insertions"],
+        "deletions": totals["deletions"],
+        "substitutions": totals["substitutions"],
+        "hits": totals["hits"],
         "config": config,
     }
 
@@ -137,13 +153,14 @@ def collect_evaluation_data(jobs_dir: Path) -> list[dict]:
                 "filename": config.get("filename", ""),
                 "vad": config.get("vad", False),
                 "chunked": config.get("chunked", False),
-                "mean_wer": stats["mean_wer"],
+                "wer": stats["wer"],
                 "n_songs": stats["n_songs"],
                 "insertions": stats["insertions"],
                 "deletions": stats["deletions"],
                 "substitutions": stats["substitutions"],
+                "hits": stats["hits"],
             }
         )
 
-    all_stats.sort(key=lambda x: x["mean_wer"])
+    all_stats.sort(key=lambda x: x["wer"])
     return all_stats

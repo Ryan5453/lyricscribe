@@ -4,10 +4,18 @@ import logging
 from pathlib import Path
 import jiwer
 import numpy as np
+from alt_eval.tokenizer import WORD, LyricsTokenizer, tokens_as_words
 
 from lyricscribe.schemas import Lyrics
 
 logger = logging.getLogger(__name__)
+
+_TOKENIZER = LyricsTokenizer()
+
+
+def _normalized_words(text: str, language: str = "en") -> list[str]:
+    tokens = _TOKENIZER(text, language=language)
+    return [t.text.lower() for t in tokens_as_words(tokens) if WORD in t.tags]
 
 fields = [
         "song_id", "model_name", "word", "word_idx", "start", "end",
@@ -101,14 +109,15 @@ def _load_results(result_files: list[Path]) -> dict[tuple[str, str], str]:
     return results
 
 
-def _load_ground_truth(musedb_dir: Path) -> dict[str, str]:
+def _load_ground_truth(musedb_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
     """
-    Load ground truth lyrics for each MUSDB song from its lyrics.json file.
+    Load ground truth lyrics and language for each MUSDB song from its lyrics.json file.
 
     :param musdb_dir: root directory of the MUSDB dataset, containing one subdirectory per song, each with a lyrics.json file.
-    :returns: Dictionary mapping song_id to the raw unsynced lyrics string.
+    :returns: Tuple of (ground_truth, languages) dicts keyed by song_id.
     """
     ground_truth = {}
+    languages = {}
     for song_path in musedb_dir.iterdir():
         if not song_path or not song_path.is_dir():
             continue
@@ -119,9 +128,11 @@ def _load_ground_truth(musedb_dir: Path) -> dict[str, str]:
                 data = json.load(f)
 
             ground_truth[song_path.name] = data["unsynced"]["data"]
+            lang = (data.get("detected_language") or "en").split("-")[0].split("_")[0].lower()
+            languages[song_path.name] = lang or "en"
 
     logger.info(f"Loaded ground truth for {len(ground_truth)} songs")
-    return ground_truth
+    return ground_truth, languages
                      
 
 
@@ -154,18 +165,31 @@ def _get_artifact_features_for_window(features: dict, start_s: float, end_s: flo
 
     return result
 
-def _get_word_error(reference: str, hypothesis: str) -> tuple[dict[int, str], dict[int, int]]:
+def _get_word_error(
+    reference: str, hypothesis: str, language: str = "en"
+) -> tuple[dict[int, str], dict[int, int]]:
     """
     Compute the error type for each reference word using jiwer word alignment.
 
+    Both sides are first tokenized with the alt-eval lyrics tokenizer
+    (Cífka et al. 2024), lowercased, and stripped of non-word tokens so
+    that casing and punctuation differences are not counted as errors.
+    The returned indices are positions in the normalized word list, which
+    is what the MFA per-word alignment also uses (MFA tokens are
+    lowercase and punctuation-stripped), so downstream positional lookups
+    stay valid.
+
     :param reference: Ground truth lyrics string.
     :param hypothesis: Model transcription string.
+    :param language: ISO 639-1 language code for the reference.
     :returns: tuple of (word_errors, insertion_counts) where word_errors maps
         reference word index to error type, and insertion_counts maps each
         reference word index to the number of hypothesis words inserted
         adjacent to it.
     """
-    output = jiwer.process_words(reference, hypothesis)
+    ref_words = _normalized_words(reference, language)
+    hyp_words = _normalized_words(hypothesis, language)
+    output = jiwer.process_words(" ".join(ref_words), " ".join(hyp_words))
     word_errors: dict[int, str] = {}
     insertion_counts: dict[int, int] = {}
 
@@ -214,7 +238,7 @@ def build_dataset(
     alignments = _load_alignments(musdb_dir)
     features = _load_artifact_features(features_dir)
     results = _load_results(results_files)
-    ground_truth = _load_ground_truth(musdb_dir)
+    ground_truth, languages = _load_ground_truth(musdb_dir)
 
     models = sorted(set(model for _, model in results.keys()))
 
@@ -238,7 +262,9 @@ def build_dataset(
             hypothesis = results[(song_id, model_name)]
 
             try:
-                word_errors, insertion_counts = _get_word_error(reference, hypothesis)
+                word_errors, insertion_counts = _get_word_error(
+                    reference, hypothesis, language=languages.get(song_id, "en")
+                )
                 logger.info(f"word_errors sample: {list(word_errors.items())[:3]}")
             except Exception as e:
                 logger.warning(f"JiWER failed for {song_id}: {e}")

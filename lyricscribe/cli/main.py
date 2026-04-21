@@ -324,7 +324,7 @@ def evaluate(
         return
 
     logger.info(f"--- Summary ({stats['n_songs']} songs) ---")
-    logger.info(f"Mean WER: {stats['mean_wer']:.2%}")
+    logger.info(f"WER: {stats['wer']:.2%}")
     logger.info(f"Total insertions: {stats['insertions']}")
     logger.info(f"Total deletions: {stats['deletions']}")
     logger.info(f"Total substitutions: {stats['substitutions']}")
@@ -353,7 +353,7 @@ def evaluate_summarize(
             f,
             fieldnames=[
                 "job_dir", "model", "dataset", "filename", "vad", "chunked",
-                "mean_wer", "n_songs", "insertions", "deletions", "substitutions"
+                "wer", "n_songs", "insertions", "deletions", "substitutions", "hits"
             ]
         )
         writer.writeheader()
