@@ -32,6 +32,7 @@ export HF_HOME=/projects/fahey.rya/music2text/.cache/huggingface
 export TORCH_HOME=/projects/fahey.rya/music2text/.cache/torch
 export NEMO_CACHE_DIR=/projects/fahey.rya/music2text/.cache/nemo
 export NCCL_NVLS_ENABLE=0
+export NCCL_P2P_DISABLE=1
 export NCCL_DEBUG=INFO
 export NCCL_DEBUG_SUBSYS=INIT,COLL,NET
 
