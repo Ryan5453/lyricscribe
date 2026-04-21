@@ -1,5 +1,0 @@
-model,quartile,n_words,error_rate,deletion_rate,substitution_rate,mean_artifact_to_signal
-openai/whisper-large-v3,Q1,1296,0.4005,0.0193,0.2793,0.326
-openai/whisper-large-v3,Q2,1295,0.4162,0.027,0.268,0.5748
-openai/whisper-large-v3,Q3,1295,0.4255,0.0625,0.2386,0.7627
-openai/whisper-large-v3,Q4,1295,0.4819,0.0317,0.2819,10.1495
