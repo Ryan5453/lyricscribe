@@ -160,17 +160,6 @@ def plot_baseline_wer(df: pd.DataFrame, output_path: Path) -> None:
 def plot_artifact_quartile_error(
     quartile_data: list[dict], output_path: Path
 ) -> None:
-    """
-    Generate a line chart of error rate across artifact noise quartiles.
-
-    Plots one line per model showing how error rate changes from the
-    cleanest (Q1) to noisiest (Q4) artifact quartile.  The Q4 region is
-    highlighted with a subtle shaded band.
-
-    :param quartile_data: list of quartile summary dicts as returned by
-        :func:`~lyricscribe.transcribe.artifacts.correlation.analyse`.
-    :param output_path: file path to write the plot image to.
-    """
     _apply_style()
 
     rows = quartile_data
@@ -235,42 +224,31 @@ def plot_artifact_quartile_error(
     logger.info(f"Saved artifact quartile error plot -> {output_path}")
 
 
-def plot_error_type_rates(df: pd.DataFrame, output_path: Path) -> None:
-    """
-    Generate a grouped bar chart of normalised error type rates per model.
-
-    For each model the mean insertion, deletion, and substitution rates
-    (each as a fraction of total errors) are shown as side-by-side bars
-    with the numeric value annotated above each bar.
-
-    :param df: evaluation summary DataFrame as returned by
-        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
-    :param output_path: file path to write the plot image to.
-    """
+def plot_error_type_shares(df: pd.DataFrame, output_path: Path) -> None:
     _apply_style()
     df = df.copy()
 
     total_errors = df["substitutions"] + df["insertions"] + df["deletions"]
-    df["insertion_rate"] = df["insertions"] / total_errors
-    df["deletion_rate"] = df["deletions"] / total_errors
-    df["substitution_rate"] = df["substitutions"] / total_errors
+    df["insertion_share"] = df["insertions"] / total_errors
+    df["deletion_share"] = df["deletions"] / total_errors
+    df["substitution_share"] = df["substitutions"] / total_errors
 
     models = sorted(df["model"].unique())
     colors = _model_colors(models)
 
-    rate_cols = ["insertion_rate", "deletion_rate", "substitution_rate"]
-    rate_labels = ["Insertions", "Deletions", "Substitutions"]
-    rate_colors = [_ERROR_COLORS["ins"], _ERROR_COLORS["del"], _ERROR_COLORS["sub"]]
+    share_cols = ["insertion_share", "deletion_share", "substitution_share"]
+    share_labels = ["Insertions", "Deletions", "Substitutions"]
+    share_colors = [_ERROR_COLORS["ins"], _ERROR_COLORS["del"], _ERROR_COLORS["sub"]]
 
-    agg = df.groupby("model")[rate_cols].mean().reindex(models)
+    agg = df.groupby("model")[share_cols].mean().reindex(models)
 
     x = np.arange(len(models))
-    n_bars = len(rate_cols)
+    n_bars = len(share_cols)
     w = 0.8 / n_bars
 
     fig, ax = plt.subplots(figsize=(max(8, 2.5 * len(models)), 5))
 
-    for j, (col, label, color) in enumerate(zip(rate_cols, rate_labels, rate_colors)):
+    for j, (col, label, color) in enumerate(zip(share_cols, share_labels, share_colors)):
         offset = (j - (n_bars - 1) / 2) * w
         vals = agg[col].values
         bars = ax.bar(
@@ -297,9 +275,9 @@ def plot_error_type_rates(df: pd.DataFrame, output_path: Path) -> None:
 
     ax.set_xticks(x)
     ax.set_xticklabels([_model_label(m) for m in models], fontsize=10)
-    ax.set_ylabel("Error Type Share", fontsize=11)
+    ax.set_ylabel("Share of Total Errors", fontsize=11)
     ax.set_title(
-        "Normalised Insertion, Deletion & Substitution Rates",
+        "Insertion, Deletion & Substitution Shares by Model",
         fontsize=13,
         fontweight="bold",
         pad=12,
@@ -309,86 +287,7 @@ def plot_error_type_rates(df: pd.DataFrame, output_path: Path) -> None:
     fig.tight_layout()
     fig.savefig(output_path)
     plt.close(fig)
-    logger.info(f"Saved error type rates plot -> {output_path}")
-
-
-def plot_error_distribution(df: pd.DataFrame, output_path: Path) -> None:
-    """
-    Generate a grouped stacked bar chart of error types by model and dataset.
-
-    For every (model, dataset) pair a stacked bar is drawn with insertion,
-    deletion, and substitution rates.  Different datasets are distinguished
-    by varying alpha transparency so multiple datasets can be compared
-    within the same model column.
-
-    :param df: evaluation summary DataFrame as returned by
-        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
-    :param output_path: file path to write the plot image to.
-    """
-    _apply_style()
-    df = df.copy()
-
-    total_errors = df["substitutions"] + df["insertions"] + df["deletions"]
-    df["insertion_rate"] = df["insertions"] / total_errors
-    df["deletion_rate"] = df["deletions"] / total_errors
-    df["substitution_rate"] = df["substitutions"] / total_errors
-
-    grouped = df.groupby(["model", "dataset"])[
-        ["insertion_rate", "deletion_rate", "substitution_rate"]
-    ].mean()
-
-    models = grouped.index.get_level_values("model").unique()
-    datasets = grouped.index.get_level_values("dataset").unique()
-    model_labels = [_model_label(m) for m in models]
-
-    stack_colors = {
-        "ins": "#a90000",
-        "del": "#004a8b",
-        "sub": "#009639",
-    }
-
-    fig, ax = plt.subplots(figsize=(max(10, 3 * len(models)), 6))
-    x = np.arange(len(models))
-    width = 0.8 / max(len(datasets), 1)
-
-    for i, dataset in enumerate(datasets):
-        subset = grouped.xs(dataset, level="dataset").reindex(models)
-        alpha = 0.3 + i * (0.7 / max(len(datasets) - 1, 1))
-        ins = subset["insertion_rate"].values
-        dels = subset["deletion_rate"].values
-        subs = subset["substitution_rate"].values
-
-        ax.bar(
-            x + i * width, ins, width,
-            label=f"{dataset} - insertions",
-            color=stack_colors["ins"], alpha=alpha, zorder=3,
-        )
-        ax.bar(
-            x + i * width, dels, width,
-            label=f"{dataset} - deletions",
-            color=stack_colors["del"], alpha=alpha, bottom=ins, zorder=3,
-        )
-        ax.bar(
-            x + i * width, subs, width,
-            label=f"{dataset} - substitutions",
-            color=stack_colors["sub"], alpha=alpha, bottom=ins + dels, zorder=3,
-        )
-
-    ax.set_xticks(x + width * (len(datasets) - 1) / 2)
-    ax.set_xticklabels(model_labels, fontsize=12)
-    ax.set_ylabel("Error Type Share", fontsize=11)
-    ax.set_title(
-        "Error Type Distribution by Model and Dataset",
-        fontsize=13,
-        fontweight="bold",
-        pad=12,
-    )
-    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
-    ax.set_axisbelow(True)
-    fig.tight_layout()
-    fig.savefig(output_path)
-    plt.close(fig)
-    logger.info(f"Saved error distribution plot -> {output_path}")
+    logger.info(f"Saved error type shares plot -> {output_path}")
 
 
 def plot_wer_heatmap(df: pd.DataFrame, output_path: Path) -> None:
@@ -586,6 +485,9 @@ _PIPELINE_LABELS: dict[tuple[str, bool, bool], str] = {
     ("htdemucs_ft_vocals.wav", True, False): "Demucs + VAD",
     ("mixture.wav", True, False): "VAD-guided Mix",
     ("mixture.wav", False, False): "Raw Mix",
+    ("htdemucs_ft_vocals.wav", False, True): "Demucs + Chunked",
+    ("htdemucs_ft_vocals.wav", True, True): "Demucs + VAD + Chunked",
+    ("mixture.wav", True, True): "VAD-guided Mix + Chunked",
 }
 
 
@@ -593,9 +495,10 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
     """
     Generate a scatter plot of pipeline error-profile shifts.
 
-    Filters to ``musdb_alt`` and the five key pipeline configurations,
-    plots all models on a single axes colour-coded by model, with
-    human-readable pipeline labels.  The baseline is clean stems
+    Filters to ``musdb_alt`` and the key pipeline configurations, plots
+    all models on a single axes colour-coded by model, with human-readable
+    pipeline labels.  Axes are changes in insertion and deletion rate
+    (errors per reference word) relative to the clean stems baseline
     (vocals.wav, no VAD, no chunking).
 
     :param df: evaluation summary DataFrame as returned by
@@ -609,11 +512,10 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
     df = df[df["dataset"] == "musdb_alt"]
     df = df.drop_duplicates(subset=["model", "filename", "vad", "chunked"])
 
-    total_errors = df["substitutions"] + df["insertions"] + df["deletions"]
-    df["insertion_prop"] = df["insertions"] / total_errors
-    df["deletion_prop"] = df["deletions"] / total_errors
+    ref_words = df["hits"] + df["substitutions"] + df["deletions"]
+    df["insertion_rate"] = df["insertions"] / ref_words
+    df["deletion_rate"] = df["deletions"] / ref_words
 
-    # Keep only the key pipeline configs
     df["_key"] = list(zip(df["filename"], df["vad"], df["chunked"]))
     df = df[df["_key"].isin(_PIPELINE_LABELS)].copy()
     df["label"] = df["_key"].map(_PIPELINE_LABELS)
@@ -627,8 +529,8 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
         m = df[df["model"] == model_id].copy()
 
         baseline = m[m["label"] == "Clean Stems"].iloc[0]
-        m["d_insertion"] = m["insertion_prop"] - baseline["insertion_prop"]
-        m["d_deletion"] = m["deletion_prop"] - baseline["deletion_prop"]
+        m["d_insertion"] = m["insertion_rate"] - baseline["insertion_rate"]
+        m["d_deletion"] = m["deletion_rate"] - baseline["deletion_rate"]
 
         color = colors[model_id]
         ax.scatter(
@@ -658,8 +560,8 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
 
     ax.axhline(0, color="#888888", linewidth=0.8, linestyle="--", zorder=1)
     ax.axvline(0, color="#888888", linewidth=0.8, linestyle="--", zorder=1)
-    ax.set_xlabel("Change in Insertion Proportion", fontsize=11)
-    ax.set_ylabel("Change in Deletion Proportion", fontsize=11)
+    ax.set_xlabel("Change in Insertion Rate (per reference word)", fontsize=11)
+    ax.set_ylabel("Change in Deletion Rate (per reference word)", fontsize=11)
     ax.legend(
         fontsize=10,
         loc="upper center",
@@ -711,8 +613,7 @@ def generate_all_plots(
     df = pd.DataFrame(all_stats)
 
     plot_baseline_wer(df, output_dir / "baseline_wer.pdf")
-    plot_error_type_rates(df, output_dir / "error_type_rates.pdf")
-    plot_error_distribution(df, output_dir / "error_distribution.pdf")
+    plot_error_type_shares(df, output_dir / "error_type_shares.pdf")
     plot_wer_heatmap(df, output_dir / "wer_heatmap.pdf")
     plot_error_type_breakdown(df, output_dir / "error_type_breakdown.pdf")
     plot_pipeline_shift(df, output_dir / "pipeline_shift.pdf")
