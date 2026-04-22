@@ -310,45 +310,20 @@ The `evaluate` commands compute Word Error Rate (WER) and other metrics to check
 
 #### `lyricscribe evaluate run`
 
-Evaluates a single transcription job directory against the dataset's ground truth lyrics.
+Recursively evaluates all complete transcription subdirectories inside a base jobs directory and, in one pass, writes everything into `--output-dir`: an aggregated CSV sorted by WER, paper-ready LaTeX tables under `tables/`, and analysis PDF plots covering baseline WER comparisons, error type breakdowns, and pipeline error-profile shifts.
 
 ```bash
-uv run lyricscribe evaluate run --job-dir ./jobs/whisper_vocals
-```
-
-Options:
-
-- `--job-dir`: Path to job directory (required)
-
-#### `lyricscribe evaluate summarize`
-
-Recursively evaluates all complete transcription subdirectories inside a base jobs directory, computes their statistics, and aggregates the results into a single CSV file sorted by the best Mean WER.
-
-```bash
-uv run lyricscribe evaluate summarize --jobs-dir ./jobs --output evaluation_summary.csv
-```
-
-Options:
-
-- `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
-- `--output`: Output CSV file path (default: `evaluation_summary.csv`)
-
-#### `lyricscribe evaluate plot`
-
-Generates analysis PDF plots by reading evaluation data directly from job directories. Produces six charts covering baseline WER comparisons, error type breakdowns, error distribution by dataset, and pipeline error-profile shifts.
-
-```bash
-# Core evaluation plots
-uv run lyricscribe evaluate plot \
+# Core evaluation outputs (CSV + LaTeX tables + plots, all in ./results)
+uv run lyricscribe evaluate run \
     --jobs-dir ./jobs \
-    --output-dir ./plots
+    --output-dir ./results
 
 # Include the artifact quartile chart (builds word-level data in memory).
 # Alignments are read from each song's lyrics.json — run
 # `lyricscribe dataset align` on the MUSDB directory first.
-uv run lyricscribe evaluate plot \
+uv run lyricscribe evaluate run \
     --jobs-dir ./jobs \
-    --output-dir ./plots \
+    --output-dir ./results \
     --features-dir ./features \
     --results-file ./jobs/whisper_vocals/results.jsonl \
     --results-file ./jobs/parakeet_vocals/results.jsonl \
@@ -359,9 +334,10 @@ uv run lyricscribe evaluate plot \
 Options:
 
 - `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
-- `--output-dir`: Directory to save the generated PDF plots (required)
+- `--output-dir`: Directory for all outputs — `evaluation_summary.csv`, `tables/*.tex`, and the PDF plots (required)
 - `--features-dir`: Directory of artifact feature JSON files (enables artifact chart)
 - `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (enables artifact chart)
+- `--results-job-name`: Job subdirectory name to auto-discover `results*.jsonl` across all model directories under `--jobs-dir` (enables artifact chart)
 - `--musdb-dir`: Root MUSDB directory (alignments + ground truth both from each song's `lyrics.json`, enables artifact chart)
 
 Output files:
@@ -400,7 +376,7 @@ Options:
 
 #### `lyricscribe artifacts build`
 
-Builds a word-level CSV dataset that combines MFA alignments, artifact features, ground-truth lyrics, and model transcription errors. Each row represents one word for one model, with the artifact features averaged over that word's time window, the error type (correct, deletion, substitution) from jiwer alignment, and the count of hypothesis words inserted adjacent to this reference word. This CSV is useful for notebook exploration; plotting is handled by `evaluate plot`.
+Builds a word-level CSV dataset that combines MFA alignments, artifact features, ground-truth lyrics, and model transcription errors. Each row represents one word for one model, with the artifact features averaged over that word's time window, the error type (correct, deletion, substitution) from jiwer alignment, and the count of hypothesis words inserted adjacent to this reference word. This CSV is useful for notebook exploration; plotting is handled by `evaluate run`.
 
 Run `lyricscribe dataset align` on the MUSDB directory first so alignments are present in each song's `lyrics.json`.
 
@@ -428,6 +404,8 @@ Options:
 
 The `finetune` commands finetune ASR models (Whisper, Canary, or Parakeet) using epoch-level checkpointing for SLURM cluster training. Training is split into chunks (blocks of epochs) with checkpoints saved after every epoch. Each song directory must contain a `lyrics.json` file and at least one of the audio files specified via `--filename`.
 
+**Audio files must be PCM WAV.** Lossy formats like MP3 report a header duration that can differ from the decoded sample count by up to ~1s, which causes Lhotse to reject cuts near the end of a song. Pre-decode to WAV before running setup (16 kHz mono matches what the models consume internally, but any PCM WAV works).
+
 #### `lyricscribe finetune setup`
 
 Set up a finetuning experiment by scanning dataset directories and creating manifests and chunk files.
@@ -446,7 +424,7 @@ lyricscribe finetune setup /path/to/final_train \
     --val-dir /path/to/final_validation \
     --model nvidia/canary-1b-v2 \
     --filename htdemucs_ft_vocals.wav \
-    --filename audio.mp3
+    --filename audio.wav
 ```
 
 Options:

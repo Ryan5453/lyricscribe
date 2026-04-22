@@ -311,64 +311,12 @@ def dataset_musdb_alt(
 
 
 @evaluate_app.command("run")
-def evaluate(
-    job_dir: Path = typer.Option(
-        ..., "--job-dir", help="Path to job directory"
-    ),
-):
-    """Evaluate transcription quality against ground-truth lyrics."""
-    from lyricscribe.evaluate import evaluate_job
-
-    stats = evaluate_job(job_dir, verbose=True)
-    if not stats:
-        return
-
-    logger.info(f"--- Summary ({stats['n_songs']} songs) ---")
-    logger.info(f"WER: {stats['wer']:.2%}")
-    logger.info(f"Total insertions: {stats['insertions']}")
-    logger.info(f"Total deletions: {stats['deletions']}")
-    logger.info(f"Total substitutions: {stats['substitutions']}")
-
-
-@evaluate_app.command("summarize")
-def evaluate_summarize(
-    jobs_dir: Path = typer.Option(
-        ..., "--jobs-dir", help="Path to base jobs directory containing model subdirectories"
-    ),
-    output: Path = typer.Option(
-        "evaluation_summary.csv", "--output", help="Output CSV file path"
-    ),
-):
-    """Aggregate evaluation results across all jobs into a CSV file."""
-    from lyricscribe.evaluate import collect_evaluation_data
-
-    all_stats = collect_evaluation_data(jobs_dir)
-
-    if not all_stats:
-        logger.error("No successful evaluations found to summarize.")
-        return
-
-    with open(output, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "job_dir", "model", "dataset", "filename", "vad", "chunked",
-                "wer", "n_songs", "insertions", "deletions", "substitutions", "hits"
-            ]
-        )
-        writer.writeheader()
-        writer.writerows(all_stats)
-
-    logger.info(f"Successfully summarized {len(all_stats)} jobs -> {output}")
-
-
-@evaluate_app.command("plot")
-def evaluate_plot(
+def evaluate_run(
     jobs_dir: Path = typer.Option(
         ..., "--jobs-dir", help="Path to base jobs directory containing model subdirectories"
     ),
     output_dir: Path = typer.Option(
-        ..., "--output-dir", help="Directory to save the generated PDF plots"
+        ..., "--output-dir", help="Directory to write all outputs: CSV, LaTeX tables, and PDF plots"
     ),
     features_dir: Path | None = typer.Option(
         None, "--features-dir", help="Directory of artifact feature JSON files (enables artifact chart)"
@@ -385,15 +333,53 @@ def evaluate_plot(
         None, "--musdb-dir", help="Root MUSDB directory (alignments + ground-truth both come from each song's lyrics.json)"
     ),
 ):
-    """Generate evaluation plots from job directories.
+    """Aggregate evaluation results into a CSV + LaTeX tables and generate analysis plots.
+
+    All outputs land in --output-dir:
+      - evaluation_summary.csv
+      - tables/full_results.tex, tables/headline_results.tex
+      - *.pdf plots
 
     To include the artifact quartile chart, pass --features-dir, --musdb-dir,
     and --results-file (repeat for multiple models). Alignments are read from
     the ``alignment`` field of each song's ``lyrics.json``, so run
     ``lyricscribe dataset align`` on the MUSDB directory first.
     """
+    import pandas as pd
+
     from lyricscribe import plots
+    from lyricscribe.evaluate import collect_evaluation_data
+    from lyricscribe.latex_tables import (
+        write_full_results_tex,
+        write_headline_results_tex,
+    )
     from lyricscribe.transcribe.artifacts import correlation
+
+    all_stats = collect_evaluation_data(jobs_dir)
+
+    if not all_stats:
+        logger.error("No successful evaluations found to summarize.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / "evaluation_summary.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "job_dir", "model", "dataset", "filename", "vad", "chunked",
+                "wer", "n_songs", "insertions", "deletions", "substitutions", "hits"
+            ]
+        )
+        writer.writeheader()
+        writer.writerows(all_stats)
+
+    logger.info(f"Successfully summarized {len(all_stats)} jobs -> {csv_path}")
+
+    tables_dir = output_dir / "tables"
+    df = pd.DataFrame(all_stats)
+    write_full_results_tex(df, tables_dir / "full_results.tex")
+    write_headline_results_tex(df, tables_dir / "headline_results.tex")
 
     word_dataset = None
     result_files = _collect_result_files(

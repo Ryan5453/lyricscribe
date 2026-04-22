@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from lyricscribe.evaluate import collect_evaluation_data
+from lyricscribe.latex_tables import DATASET_DISPLAY
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,8 @@ def _config_label(row: pd.Series) -> str:
     :returns: newline-separated label string suitable for tick labels.
     """
     stem = Path(row["filename"]).stem
-    label = f"{row['dataset']}\n({stem})"
+    ds = DATASET_DISPLAY.get(row["dataset"], row["dataset"])
+    label = f"{ds}\n({stem})"
     if row.get("vad"):
         label += "\n+vad"
     if row.get("chunked"):
@@ -314,7 +316,8 @@ def plot_wer_heatmap(df: pd.DataFrame, output_path: Path) -> None:
         :returns: compact label string, e.g. ``'jam-alt / mix (+vad)'``.
         """
         stem = Path(row["filename"]).stem
-        label = f"{row['dataset']} / {stem}"
+        ds = DATASET_DISPLAY.get(row["dataset"], row["dataset"])
+        label = f"{ds} / {stem}"
         flags = []
         if row.get("vad"):
             flags.append("vad")
