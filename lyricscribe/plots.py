@@ -209,7 +209,7 @@ def plot_artifact_quartile_error(
 
     ax.set_xticks(x)
     ax.set_xticklabels(quartile_labels, fontsize=10)
-    ax.set_ylabel("Error Rate (%)", fontsize=11)
+    ax.set_ylabel("WER (%)", fontsize=11)
     ax.set_title(
         "Error Rate Across Artifact Noise Quartiles",
         fontsize=13,

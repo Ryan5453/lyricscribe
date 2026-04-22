@@ -346,14 +346,16 @@ def analyse(
             if not q_rows:
                 continue
             n = len(q_rows)
+            sub_del = sum(1 for r in q_rows if r["error_type"] != "correct")
+            insertions = sum(r["insertion_count"] for r in q_rows)
             quartile_rows.append({
                 "model":    model_name,
                 "quartile": q_label,
                 "n_words":  n,
-                "error_rate":         round(sum(1 for r in q_rows if r["error_type"] != "correct") / n, 4),
+                "error_rate":         round((sub_del + insertions) / n, 4),
                 "deletion_rate":      round(sum(1 for r in q_rows if r["error_type"] == "deletion") / n, 4),
                 "substitution_rate":  round(sum(1 for r in q_rows if r["error_type"] == "substitution") / n, 4),
-                "mean_insertions_per_word": round(sum(r["insertion_count"] for r in q_rows) / n, 4),
+                "mean_insertions_per_word": round(insertions / n, 4),
                 "mean_artifact_to_signal": round(float(np.mean([r["artifact_to_signal_ratio"] for r in q_rows])), 4),
             })
 
