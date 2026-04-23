@@ -18,12 +18,19 @@ _SILENCE_LABELS = {"", "sp", "sil", "<eps>"}
 
 DEFAULT_MFA_DOCKER_REF = "docker://mmcauliffe/montreal-forced-aligner:latest"
 
-_DICTIONARY = "english_mfa"
-_ACOUSTIC_MODEL = "english_mfa"
+_MFA_MODEL_BY_LANGUAGE = {
+    "en": "english_mfa",
+    "es": "spanish_mfa",
+}
 _WORK_MOUNT = "/mfa_work"
 _MFA_ROOT_MOUNT = "/mfa_root"
 _SEGMENT_PADDING_S = 0.15
 _MIN_SEGMENT_S = 0.2
+
+
+def _language_key(lyrics_data: dict) -> str:
+    lang = (lyrics_data.get("detected_language") or "en").lower()
+    return lang.split("-")[0].split("_")[0]
 
 
 def _clean_lyrics(text: str) -> str:
@@ -188,25 +195,45 @@ def align(
     if num_chunks > 1:
         song_dirs = song_dirs[chunk_id::num_chunks]
 
-    if skip_existing:
-        def _already_aligned(song_dir: Path) -> bool:
-            lyrics_path = song_dir / "lyrics.json"
-            if not lyrics_path.exists():
-                return False
-            try:
-                data = json.loads(lyrics_path.read_text())
-                return data.get("alignment") is not None
-            except (json.JSONDecodeError, OSError):
-                return False
+    # Group songs by the MFA model their detected_language dictates.
+    # Songs whose existing alignment already used the correct model are
+    # dropped when skip_existing=True; this lets reruns be safe across
+    # languages without re-aligning the already-correct ones.
+    songs_by_model: dict[str, list[Path]] = {}
+    unmapped: list[str] = []
+    for song_dir in song_dirs:
+        lyrics_path = song_dir / "lyrics.json"
+        if not lyrics_path.exists():
+            continue
+        try:
+            data = json.loads(lyrics_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        lang_key = _language_key(data)
+        mfa_model = _MFA_MODEL_BY_LANGUAGE.get(lang_key)
+        if mfa_model is None:
+            unmapped.append(song_dir.name)
+            continue
+        if skip_existing:
+            existing = data.get("alignment")
+            if existing is not None and existing.get("mfa_model") == mfa_model:
+                continue
+        songs_by_model.setdefault(mfa_model, []).append(song_dir)
 
-        song_dirs = [d for d in song_dirs if not _already_aligned(d)]
+    if unmapped:
+        logger.warning(
+            "Skipping %s songs with unsupported detected_language "
+            "(no MFA model mapped)",
+            len(unmapped),
+        )
 
+    total_to_align = sum(len(v) for v in songs_by_model.values())
     logger.info(
         f"Found {total_found} songs in {dataset_dir}; "
-        f"processing {len(song_dirs)} (chunk {chunk_id}/{num_chunks}, "
-        f"skip_existing={skip_existing})"
+        f"aligning {total_to_align} across {len(songs_by_model)} language group(s) "
+        f"(chunk {chunk_id}/{num_chunks}, skip_existing={skip_existing})"
     )
-    if not song_dirs:
+    if not songs_by_model:
         logger.info("Nothing to align — exiting.")
         return
 
@@ -219,177 +246,195 @@ def align(
         mfa_host.mkdir(parents=True, exist_ok=True)
 
     try:
-        with tempfile.TemporaryDirectory(prefix="lyricscribe_mfa_") as tmp:
-            tmp_path = Path(tmp)
-            corpus_dir = tmp_path / "corpus"
-            mfa_output = tmp_path / "aligned"
-            corpus_dir.mkdir()
-            mfa_output.mkdir()
-
-            prepared = 0
-            prepared_segments = 0
-            segment_index: dict[str, dict] = {}
-            for song_dir in song_dirs:
-                vocals_path = song_dir / filename
-                lyrics_path = song_dir / "lyrics.json"
-
-                if not vocals_path.exists() or not lyrics_path.exists():
-                    logger.warning(
-                        f"Missing {filename} or lyrics.json in {song_dir.name}"
-                    )
-                    continue
-
-                with open(lyrics_path) as f:
-                    lyrics_data = json.load(f)
-
-                segments = _iter_synced_segments(lyrics_data)
-                if not segments:
-                    logger.warning(f"No usable synced lyric segments for {song_dir.name}")
-                    continue
-
-                name = song_dir.name
-                waveform, sample_rate = torchaudio.load(vocals_path)
-                num_frames = waveform.shape[1]
-
-                for segment in segments:
-                    start_s = max(0.0, segment["start_s"] - _SEGMENT_PADDING_S)
-                    end_s = min(
-                        num_frames / sample_rate,
-                        segment["end_s"] + _SEGMENT_PADDING_S,
-                    )
-                    if end_s - start_s < _MIN_SEGMENT_S:
-                        continue
-
-                    start_frame = max(0, int(start_s * sample_rate))
-                    end_frame = min(num_frames, int(end_s * sample_rate))
-                    if end_frame <= start_frame:
-                        continue
-
-                    utterance_id = f"{name}__seg{segment['index']:04d}"
-                    segment_waveform = waveform[:, start_frame:end_frame]
-                    torchaudio.save(
-                        str(corpus_dir / f"{utterance_id}.wav"),
-                        segment_waveform,
-                        sample_rate,
-                    )
-                    (corpus_dir / f"{utterance_id}.lab").write_text(segment["text"])
-                    segment_index[utterance_id] = {
-                        "song_id": name,
-                        "offset_s": start_s,
-                    }
-                    prepared_segments += 1
-
-                prepared += 1
-
+        for mfa_model, group_song_dirs in songs_by_model.items():
             logger.info(
-                "Prepared %s songs and %s synced lyric segments for MFA alignment",
-                prepared,
-                prepared_segments,
+                "=== MFA pass: %s (%s songs) ===", mfa_model, len(group_song_dirs)
             )
-
-            cmd: list[str] = [
-                runtime,
-                "exec",
-                "--env",
-                f"MFA_ROOT_DIR={_MFA_ROOT_MOUNT}",
-                "-B",
-                f"{tmp_path.resolve()}:{_WORK_MOUNT}",
-                "-B",
-                f"{mfa_host.resolve()}:{_MFA_ROOT_MOUNT}",
-                image_arg,
-                "mfa",
-                "align",
-                f"{_WORK_MOUNT}/corpus",
-                _DICTIONARY,
-                _ACOUSTIC_MODEL,
-                f"{_WORK_MOUNT}/aligned",
-                "--output_format",
-                "json",
-                "--clean",
-                "--temporary_directory",
-                f"{_WORK_MOUNT}/mfa_tmp",
-            ]
-
-            logger.info(f"Running: {runtime} exec ... mfa align ...")
-            result = subprocess.run(
-                cmd,
-                text=True,
-                check=False,
-            )
-            # A single bad audio file can make MFA exit non-zero, but it
-            # usually produces per-utterance JSON for every utterance it
-            # managed to align before the crash. Keep going so we salvage
-            # the successful ones; re-running the chunk with
-            # skip_existing will only retry songs that still have no
-            # alignment field.
-            if result.returncode != 0:
-                logger.warning(
-                    f"MFA align exited {result.returncode}; some songs may not be "
-                    "aligned. Re-run with --skip-existing to retry only the gaps."
-                )
-
-            # Collect MFA word outputs, keyed by song_id, in seconds.
-            song_words: dict[str, list[dict]] = {}
-            for json_path in sorted(mfa_output.glob("**/*.json")):
-                utterance_id = json_path.stem
-                if utterance_id not in segment_index:
-                    logger.warning("Skipping unexpected MFA output: %s", utterance_id)
-                    continue
-
-                words = _parse_mfa_json(json_path)
-                mapping = segment_index[utterance_id]
-                song_id = mapping["song_id"]
-                offset_s = mapping["offset_s"]
-                song_words.setdefault(song_id, []).extend(
-                    {
-                        "word": word["word"],
-                        "start": word["start"] + offset_s,
-                        "end": word["end"] + offset_s,
-                    }
-                    for word in words
-                )
-
-            # Mutate each song's lyrics.json with the new alignment.
-            # Use Lyrics.model_validate/model_dump_json so the whole file is
-            # revalidated against the schema on write — catches bit rot.
-            generated_at = datetime.now(timezone.utc)
-            song_dirs_by_name = {d.name: d for d in song_dirs}
-            success = 0
-            for song_id, words in sorted(song_words.items()):
-                words.sort(key=lambda x: (x["start"], x["end"]))
-                aligned_words = [
-                    AlignedWord(
-                        word=w["word"],
-                        start=round(w["start"] * 1000),
-                        duration=round((w["end"] - w["start"]) * 1000),
-                    )
-                    for w in words
-                ]
-                alignment = Alignment(
-                    words=aligned_words,
-                    source_audio=filename,
-                    mfa_model=_ACOUSTIC_MODEL,
-                    generated_at=generated_at,
-                )
-
-                song_dir = song_dirs_by_name.get(song_id)
-                if song_dir is None:
-                    logger.warning(
-                        "MFA output for %s has no matching song dir (post-chunk?)",
-                        song_id,
-                    )
-                    continue
-
-                lyrics_path = song_dir / "lyrics.json"
-                lyrics = Lyrics.model_validate_json(lyrics_path.read_text())
-                lyrics.alignment = alignment
-                lyrics_path.write_text(lyrics.model_dump_json(indent=2))
-                success += 1
-
-            logger.info(
-                "Wrote alignments for %s songs into their lyrics.json files",
-                success,
+            _run_mfa_pass(
+                song_dirs=group_song_dirs,
+                mfa_model=mfa_model,
+                filename=filename,
+                mfa_host=mfa_host,
+                image_arg=image_arg,
+                runtime=runtime,
             )
     finally:
         if mfa_root_temp is not None:
             mfa_root_temp.cleanup()
+
+
+def _run_mfa_pass(
+    *,
+    song_dirs: list[Path],
+    mfa_model: str,
+    filename: str,
+    mfa_host: Path,
+    image_arg: str,
+    runtime: str,
+) -> None:
+    """Build an MFA corpus from *song_dirs*, run alignment with *mfa_model*,
+    then write per-song alignments back into each song's ``lyrics.json``."""
+
+    with tempfile.TemporaryDirectory(prefix="lyricscribe_mfa_") as tmp:
+        tmp_path = Path(tmp)
+        corpus_dir = tmp_path / "corpus"
+        mfa_output = tmp_path / "aligned"
+        corpus_dir.mkdir()
+        mfa_output.mkdir()
+
+        prepared = 0
+        prepared_segments = 0
+        segment_index: dict[str, dict] = {}
+        for song_dir in song_dirs:
+            vocals_path = song_dir / filename
+            lyrics_path = song_dir / "lyrics.json"
+
+            if not vocals_path.exists() or not lyrics_path.exists():
+                logger.warning(
+                    f"Missing {filename} or lyrics.json in {song_dir.name}"
+                )
+                continue
+
+            with open(lyrics_path) as f:
+                lyrics_data = json.load(f)
+
+            segments = _iter_synced_segments(lyrics_data)
+            if not segments:
+                logger.warning(f"No usable synced lyric segments for {song_dir.name}")
+                continue
+
+            name = song_dir.name
+            waveform, sample_rate = torchaudio.load(vocals_path)
+            num_frames = waveform.shape[1]
+
+            for segment in segments:
+                start_s = max(0.0, segment["start_s"] - _SEGMENT_PADDING_S)
+                end_s = min(
+                    num_frames / sample_rate,
+                    segment["end_s"] + _SEGMENT_PADDING_S,
+                )
+                if end_s - start_s < _MIN_SEGMENT_S:
+                    continue
+
+                start_frame = max(0, int(start_s * sample_rate))
+                end_frame = min(num_frames, int(end_s * sample_rate))
+                if end_frame <= start_frame:
+                    continue
+
+                utterance_id = f"{name}__seg{segment['index']:04d}"
+                segment_waveform = waveform[:, start_frame:end_frame]
+                torchaudio.save(
+                    str(corpus_dir / f"{utterance_id}.wav"),
+                    segment_waveform,
+                    sample_rate,
+                )
+                (corpus_dir / f"{utterance_id}.lab").write_text(segment["text"])
+                segment_index[utterance_id] = {
+                    "song_id": name,
+                    "offset_s": start_s,
+                }
+                prepared_segments += 1
+
+            prepared += 1
+
+        logger.info(
+            "Prepared %s songs and %s synced lyric segments for %s",
+            prepared,
+            prepared_segments,
+            mfa_model,
+        )
+
+        if prepared == 0:
+            return
+
+        cmd: list[str] = [
+            runtime,
+            "exec",
+            "--env",
+            f"MFA_ROOT_DIR={_MFA_ROOT_MOUNT}",
+            "-B",
+            f"{tmp_path.resolve()}:{_WORK_MOUNT}",
+            "-B",
+            f"{mfa_host.resolve()}:{_MFA_ROOT_MOUNT}",
+            image_arg,
+            "mfa",
+            "align",
+            f"{_WORK_MOUNT}/corpus",
+            mfa_model,
+            mfa_model,
+            f"{_WORK_MOUNT}/aligned",
+            "--output_format",
+            "json",
+            "--clean",
+            "--temporary_directory",
+            f"{_WORK_MOUNT}/mfa_tmp",
+        ]
+
+        logger.info(f"Running: {runtime} exec ... mfa align ({mfa_model}) ...")
+        result = subprocess.run(cmd, text=True, check=False)
+        if result.returncode != 0:
+            logger.warning(
+                f"MFA align ({mfa_model}) exited {result.returncode}; "
+                "some songs may not be aligned. Re-run with --skip-existing to "
+                "retry only the gaps."
+            )
+
+        song_words: dict[str, list[dict]] = {}
+        for json_path in sorted(mfa_output.glob("**/*.json")):
+            utterance_id = json_path.stem
+            if utterance_id not in segment_index:
+                logger.warning("Skipping unexpected MFA output: %s", utterance_id)
+                continue
+
+            words = _parse_mfa_json(json_path)
+            mapping = segment_index[utterance_id]
+            song_id = mapping["song_id"]
+            offset_s = mapping["offset_s"]
+            song_words.setdefault(song_id, []).extend(
+                {
+                    "word": word["word"],
+                    "start": word["start"] + offset_s,
+                    "end": word["end"] + offset_s,
+                }
+                for word in words
+            )
+
+        generated_at = datetime.now(timezone.utc)
+        song_dirs_by_name = {d.name: d for d in song_dirs}
+        success = 0
+        for song_id, words in sorted(song_words.items()):
+            words.sort(key=lambda x: (x["start"], x["end"]))
+            aligned_words = [
+                AlignedWord(
+                    word=w["word"],
+                    start=round(w["start"] * 1000),
+                    duration=round((w["end"] - w["start"]) * 1000),
+                )
+                for w in words
+            ]
+            alignment = Alignment(
+                words=aligned_words,
+                source_audio=filename,
+                mfa_model=mfa_model,
+                generated_at=generated_at,
+            )
+
+            song_dir = song_dirs_by_name.get(song_id)
+            if song_dir is None:
+                logger.warning(
+                    "MFA output for %s has no matching song dir (post-chunk?)",
+                    song_id,
+                )
+                continue
+
+            lyrics_path = song_dir / "lyrics.json"
+            lyrics = Lyrics.model_validate_json(lyrics_path.read_text())
+            lyrics.alignment = alignment
+            lyrics_path.write_text(lyrics.model_dump_json(indent=2))
+            success += 1
+
+        logger.info(
+            "Wrote %s alignments (%s) back into lyrics.json files",
+            success,
+            mfa_model,
+        )
