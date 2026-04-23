@@ -9,6 +9,11 @@ logger = logging.getLogger(__name__)
 
 _TOKENIZER = LyricsTokenizer()
 
+# Cache normalized references per dataset directory. Keyed on resolved Path.
+# Jobs that share a dataset (all Whisper musdb_alt configs, etc.) walk the
+# directory + tokenize every reference exactly once instead of once per job.
+_DATASET_CACHE: dict[Path, dict] = {}
+
 
 def _language_for(lyrics_data: dict) -> str:
     lang = lyrics_data.get("detected_language") or "en"
@@ -18,6 +23,37 @@ def _language_for(lyrics_data: dict) -> str:
 def _normalized(text: str, language: str) -> str:
     tokens = _TOKENIZER(text, language=language)
     return " ".join(t.text.lower() for t in tokens_as_words(tokens) if WORD in t.tags)
+
+
+def _load_dataset(directory: Path) -> dict:
+    """
+    Walk *directory* once, load every song's ``lyrics.json``, and
+    pre-normalize the reference text. Cached by resolved path so repeated
+    calls for the same dataset are free.
+    """
+    key = directory.resolve()
+    cached = _DATASET_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    refs_normalized: dict[str, str] = {}
+    languages: dict[str, str] = {}
+    for song_dir in directory.iterdir():
+        if not song_dir.is_dir():
+            continue
+        lyrics_path = song_dir / "lyrics.json"
+        if not lyrics_path.exists():
+            continue
+        with open(lyrics_path) as f:
+            lyrics_data = json.load(f)
+        lang = _language_for(lyrics_data)
+        ref = lyrics_data["unsynced"]["data"]
+        languages[song_dir.name] = lang
+        refs_normalized[song_dir.name] = _normalized(ref, lang)
+
+    result = {"refs_normalized": refs_normalized, "languages": languages}
+    _DATASET_CACHE[key] = result
+    return result
 
 
 def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
@@ -43,20 +79,14 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
             logger.warning("Job config has no directories")
         return None
 
-    references: dict[str, str] = {}
+    refs_normalized: dict[str, str] = {}
     languages: dict[str, str] = {}
     for directory in directories:
-        for song_dir in directory.iterdir():
-            if not song_dir.is_dir():
-                continue
-            lyrics_path = song_dir / "lyrics.json"
-            if lyrics_path.exists():
-                with open(lyrics_path) as f:
-                    lyrics_data = json.load(f)
-                references[song_dir.name] = lyrics_data["unsynced"]["data"]
-                languages[song_dir.name] = _language_for(lyrics_data)
+        cache = _load_dataset(directory)
+        refs_normalized.update(cache["refs_normalized"])
+        languages.update(cache["languages"])
 
-    if not references:
+    if not refs_normalized:
         if verbose:
             logger.warning("No ground-truth lyrics found in dataset directories")
         return None
@@ -76,69 +106,51 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
                         logger.warning(f"Skipping invalid JSON line in {results_path}")
                     continue
 
-    results = list(results_map.values())
-
-    if not results:
+    if not results_map:
         if verbose:
             logger.warning("No results found in job directory")
         return None
 
-    n = 0
-    totals = {"insertions": 0, "deletions": 0, "substitutions": 0, "hits": 0}
-    for r in results:
-        song_id = r["song_id"]
-        hypothesis = r["transcription"]
-
+    # Collect paired refs/hyps for a single corpus-level jiwer call.
+    refs_list: list[str] = []
+    hyps_list: list[str] = []
+    for song_id, r in results_map.items():
+        hypothesis = r.get("transcription")
         if hypothesis is None:
             if verbose:
                 logger.warning(f"{song_id}: skipped (no transcription)")
             continue
-
-        if song_id not in references:
+        ref_norm = refs_normalized.get(song_id)
+        if ref_norm is None:
             if verbose:
                 logger.warning(f"{song_id}: skipped (no ground truth)")
             continue
-
-        lang = languages[song_id]
-        ref_norm = _normalized(references[song_id], lang)
-        hyp_norm = _normalized(hypothesis, lang)
         if not ref_norm:
             if verbose:
                 logger.warning(f"{song_id}: skipped (empty reference after normalization)")
             continue
+        lang = languages[song_id]
+        hyp_norm = _normalized(hypothesis, lang)
+        refs_list.append(ref_norm)
+        hyps_list.append(hyp_norm)
 
-        measures = jiwer.process_words([ref_norm], [hyp_norm])
-
-        if verbose:
-            ref_len = measures.substitutions + measures.deletions + measures.hits
-            wer = (measures.substitutions + measures.deletions + measures.insertions) / ref_len if ref_len else 0.0
-            logger.debug(
-                f"{song_id} [{lang}]: WER={wer:.2%}  "
-                f"I={measures.insertions}  "
-                f"D={measures.deletions}  "
-                f"S={measures.substitutions}"
-            )
-
-        totals["insertions"] += measures.insertions
-        totals["deletions"] += measures.deletions
-        totals["substitutions"] += measures.substitutions
-        totals["hits"] += measures.hits
-        n += 1
-
+    n = len(refs_list)
     if n == 0:
         if verbose:
             logger.warning("No songs could be evaluated")
         return None
 
-    ref_length = totals["substitutions"] + totals["deletions"] + totals["hits"]
-    errors = totals["substitutions"] + totals["deletions"] + totals["insertions"]
+    measures = jiwer.process_words(refs_list, hyps_list)
+
+    ref_length = measures.substitutions + measures.deletions + measures.hits
+    errors = measures.substitutions + measures.deletions + measures.insertions
     return {
         "n_songs": n,
         "wer": errors / ref_length if ref_length else 0.0,
-        "insertions": totals["insertions"],
-        "deletions": totals["deletions"],
-        "substitutions": totals["substitutions"],
-        "hits": totals["hits"],
+        "insertions": measures.insertions,
+        "deletions": measures.deletions,
+        "substitutions": measures.substitutions,
+        "hits": measures.hits,
         "config": config,
     }
 

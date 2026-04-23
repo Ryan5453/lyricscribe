@@ -588,6 +588,7 @@ def generate_all_plots(
     jobs_dir: Path,
     output_dir: Path,
     word_dataset: list[dict] | None = None,
+    df: pd.DataFrame | None = None,
 ) -> None:
     """
     Collect evaluation data from job directories and produce all analysis plots.
@@ -604,16 +605,20 @@ def generate_all_plots(
     :param word_dataset: optional word-level dataset as returned by
         :func:`~lyricscribe.transcribe.artifacts.correlation.build_dataset`.
         When provided, the artifact quartile error chart is included.
+    :param df: pre-computed DataFrame from :func:`collect_evaluation_data`.
+        When provided, job evaluation is skipped and this frame is used
+        directly — useful when the caller has already paid that cost.
     """
     from lyricscribe.transcribe.artifacts.correlation import analyse
 
-    all_stats = collect_evaluation_data(jobs_dir)
-    if not all_stats:
-        logger.error("No evaluation data found in job directories.")
-        return
+    if df is None:
+        all_stats = collect_evaluation_data(jobs_dir)
+        if not all_stats:
+            logger.error("No evaluation data found in job directories.")
+            return
+        df = pd.DataFrame(all_stats)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    df = pd.DataFrame(all_stats)
 
     plot_baseline_wer(df, output_dir / "baseline_wer.pdf")
     plot_error_type_shares(df, output_dir / "error_type_shares.pdf")

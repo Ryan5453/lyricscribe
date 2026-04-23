@@ -399,7 +399,7 @@ def evaluate_run(
             "one or more --results-file values or --results-job-name. "
             "Skipping artifact chart."
         )
-    plots.generate_all_plots(jobs_dir, output_dir, word_dataset=word_dataset)
+    plots.generate_all_plots(jobs_dir, output_dir, word_dataset=word_dataset, df=df)
 
 
 @artifacts_app.command("extract")
