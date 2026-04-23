@@ -540,6 +540,11 @@ def finetune_setup(
     learning_rate: float = typer.Option(
         None, "--learning-rate", help="Peak learning rate (default: arch-dependent)"
     ),
+    warmup_epochs: float = typer.Option(
+        None,
+        "--warmup-epochs",
+        help="Epochs (can be fractional) spent on linear LR warmup before cosine decay. Default: 5.",
+    ),
     no_augment: bool = typer.Option(
         False, "--no-augment", help="Disable SpecAugment"
     ),
@@ -588,6 +593,7 @@ def finetune_setup(
             "max_epochs": max_epochs,
             "epochs_per_job": epochs_per_job,
             "learning_rate": learning_rate,
+            "warmup_epochs": warmup_epochs,
             "batch_duration": batch_duration,
             "freeze_encoder": freeze_encoder if freeze_encoder else None,
             "eval_subset_size": eval_subset_size,
