@@ -922,10 +922,19 @@ def finetune_tune_batch(
              "more VRAM. Must match production.",
     ),
     start: int = typer.Option(
-        1, "--start", help="Smallest batch size to try."
+        1,
+        "--start",
+        help="Smallest value to try. For Whisper/Parakeet this is "
+             "batch_size (samples); for Canary it is batch_duration "
+             "(seconds of audio per batch). Values outside the default "
+             "per-architecture candidate list are filtered out.",
     ),
     max_bs: int = typer.Option(
-        128, "--max", help="Largest batch size to try.",
+        2400,
+        "--max",
+        help="Largest value to try. Default covers Canary's full "
+             "duration range up to 2400s; Whisper/Parakeet candidates "
+             "cap at 128 regardless.",
     ),
     safety_margin_pct: float = typer.Option(
         15.0,

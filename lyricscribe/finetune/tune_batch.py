@@ -1,120 +1,179 @@
+"""
+Batch-size sweep orchestrator.
+
+Drives :mod:`lyricscribe.finetune.probe` to find the largest fitting
+batch size for a given (model, audio-filename, GPU, DDP rank count)
+combination. Builds one shared manifest from the real dataset, then
+invokes each probe trial as a fresh ``torchrun`` subprocess so an OOM
+kills the whole DDP group without poisoning the orchestrator's CUDA
+state between trials.
+"""
+
+import json
 import logging
-import multiprocessing as mp
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
+# Whisper / Parakeet sweep batch_size (per-rank sample count).
 # 24 is the Whisper default, 48 and 96 are common non-power-of-2 stops.
 # Sweep stops at the first OOM; bisection fills in the gap afterwards.
-DEFAULT_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
+_BATCH_SIZE_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
+
+# Canary uses Lhotse duration batching — batch_size is ignored by its
+# training dataloader. Sweep batch_duration (seconds of audio per batch)
+# instead. Production default is 1440s; stop-points chosen to cover
+# common GPU budgets from 40 GB up through H200-class.
+_BATCH_DURATION_CANDIDATES: tuple[int, ...] = (60, 120, 300, 600, 900, 1200, 1440, 1800, 2400)
 
 
-def _worker(kwargs: dict, queue: "mp.Queue") -> None:
+def _candidates_for(architecture: str) -> tuple[int, ...]:
+    return _BATCH_DURATION_CANDIDATES if architecture == "canary" else _BATCH_SIZE_CANDIDATES
+
+
+def _param_label(architecture: str) -> str:
+    return "batch_duration (s)" if architecture == "canary" else "batch_size"
+
+
+def _build_shared_manifest(
+    dataset_dir: Path,
+    filename: str,
+    model_name: str,
+    work_dir: Path,
+) -> Path:
     """
-    Multiprocessing target. Runs one VRAM probe, sends the result back
-    through the queue, exits non-zero on OOM or crash so the parent can
-    also detect failure via exit code.
+    Build one NeMo manifest from real audio + ``lyrics.json`` under
+    *dataset_dir*, shared across all trials. One window per song is
+    enough for the probe — the manifest's only job is to supply the
+    dataloader with representative real samples.
+
+    Matches :func:`lyricscribe.finetune.data.create_manifest` exactly
+    so the audio + text distribution the probe sees matches production.
     """
-    import sys
-    try:
-        import torch
-        from lyricscribe.finetune.probe import probe_batch_size
-        result = probe_batch_size(**kwargs)
-        queue.put({"status": "success", **result})
-    except torch.cuda.OutOfMemoryError as e:
-        queue.put({"status": "oom", "error": str(e)[:200]})
-        sys.exit(1)
-    except RuntimeError as e:
-        # Numba / CUDA sometimes surfaces OOM as a generic RuntimeError
-        # with "out of memory" in the message — treat the same.
-        if "out of memory" in str(e).lower():
-            queue.put({"status": "oom", "error": str(e)[:200]})
-            sys.exit(1)
-        queue.put({"status": "crash", "error": f"{type(e).__name__}: {e}"[:300]})
-        sys.exit(2)
-    except Exception as e:
-        queue.put({"status": "crash", "error": f"{type(e).__name__}: {e}"[:300]})
-        sys.exit(2)
+    from lyricscribe.finetune import data as finetune_data
+    from lyricscribe.finetune.config import detect_architecture
+
+    architecture = detect_architecture(model_name)
+    manifest_path = work_dir / "probe_manifest.jsonl"
+    dataset = finetune_data.LyricsDataset(dataset_dir, [filename])
+    n = finetune_data.create_manifest(
+        dataset,
+        manifest_path,
+        architecture=architecture,
+        model_name=model_name,
+        windows_per_song_multiplier=1,
+    )
+    logger.info(f"Built probe manifest with {n} entries at {manifest_path}")
+    return manifest_path
 
 
 def _run_trial(
-    dataset_dir: Path,
-    filename: str,
+    manifest: Path,
     model_name: str,
     bs: int,
     freeze_encoder: bool,
     max_duration_s: float,
+    num_gpus: int,
     timeout_s: int,
+    work_dir: Path,
     phase: str,
+    n_steps: int = 5,
 ) -> dict:
     """
-    Spawn a fresh worker process, run one probe, return the result.
+    Launch one probe trial as ``torchrun --nproc_per_node=num_gpus``
+    subprocess. Exit code != 0 is treated as an OOM (the whole DDP
+    group dies as a unit, so either all ranks succeeded or none did).
 
-    Uses ``spawn`` (not ``fork``) so the child doesn't inherit the
-    parent's CUDA context — if it did, an OOM in the child would
-    poison the parent and make subsequent trials unrecoverable.
+    :returns: Result dict including ``status`` ∈ {success, oom, timeout,
+        crash} plus the fields the probe writes to its output file.
     """
     print(f"\n{'=' * 72}")
-    print(f"  Trial ({phase}): batch_size = {bs}")
+    print(f"  Trial ({phase}): bs={bs} (world_size={num_gpus})")
     print(f"{'=' * 72}")
 
-    ctx = mp.get_context("spawn")
-    q = ctx.Queue()
-    p = ctx.Process(
-        target=_worker,
-        args=(
-            dict(
-                dataset_dir=dataset_dir,
-                filename=filename,
-                model_name=model_name,
-                bs=bs,
-                freeze_encoder=freeze_encoder,
-                max_duration_s=max_duration_s,
-            ),
-            q,
-        ),
-    )
-    p.start()
-    p.join(timeout=timeout_s)
+    result_file = work_dir / f"probe_result_{bs}_{phase}.json"
+    result_file.unlink(missing_ok=True)
 
-    if p.is_alive():
-        # Hung — likely deadlocked on model download or dataloader init.
-        p.kill()
-        p.join(timeout=5)
-        result = {"bs": bs, "phase": phase, "status": "timeout"}
-        print(f"  [bs={bs}] TIMEOUT after {timeout_s}s")
-        return result
+    cmd = [
+        "torchrun",
+        f"--nproc_per_node={num_gpus}",
+        "--standalone",
+        "-m",
+        "lyricscribe.finetune.probe",
+        "--manifest",
+        str(manifest),
+        "--model",
+        model_name,
+        "--bs",
+        str(bs),
+        "--max-duration",
+        str(max_duration_s),
+        "--n-steps",
+        str(n_steps),
+        "--output",
+        str(result_file),
+    ]
+    if freeze_encoder:
+        cmd.append("--freeze-encoder")
 
-    # Trust the queue over exit code when both exist — the worker may
-    # have posted a result before exiting non-zero.
-    msg = None
     try:
-        if not q.empty():
-            msg = q.get_nowait()
-    except Exception:
-        pass
-
-    if msg is None:
-        # Worker died before posting anything (segfault or OOM-kill).
-        status = "oom" if p.exitcode != 0 else "no_result"
-        msg = {"status": status, "exitcode": p.exitcode}
-
-    result = {"bs": bs, "phase": phase, **msg}
-    if result["status"] == "success":
-        print(
-            f"  [bs={bs}] OK. "
-            f"VRAM reserved peak: {result['peak_reserved_gb']:.1f}/{result['total_gb']:.1f} GiB "
-            f"({100*result['peak_reserved_gb']/result['total_gb']:.0f}%), "
-            f"median step: {result['median_step_ms']:.0f} ms"
+        proc = subprocess.run(
+            cmd,
+            timeout=timeout_s,
+            check=False,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
         )
-    elif result["status"] == "oom":
-        print(f"  [bs={bs}] OOM")
-    elif result["status"] == "crash":
-        print(f"  [bs={bs}] CRASH: {result.get('error', '?')}")
-    else:
-        print(f"  [bs={bs}] {result['status'].upper()}")
-    return result
+    except subprocess.TimeoutExpired:
+        print(f"  [bs={bs}] TIMEOUT after {timeout_s}s")
+        return {"bs": bs, "phase": phase, "status": "timeout"}
+
+    # Success path: result file was written by rank 0 with all metrics.
+    if result_file.exists():
+        try:
+            payload = json.loads(result_file.read_text())
+        except json.JSONDecodeError:
+            payload = {}
+        if proc.returncode == 0 and "peak_reserved_gb" in payload:
+            result = {"bs": bs, "phase": phase, "status": "success", **payload}
+            print(
+                f"  [bs={bs}] OK. "
+                f"VRAM reserved peak: {payload['peak_reserved_gb']:.1f}/"
+                f"{payload['total_gb']:.1f} GiB "
+                f"({100 * payload['peak_reserved_gb'] / payload['total_gb']:.0f}%), "
+                f"mean step: {payload.get('mean_step_ms', 0):.0f} ms"
+            )
+            return result
+
+    # Non-zero exit code → DDP group died. Most common cause is OOM on
+    # at least one rank. Distinguishing genuine crashes from OOMs from
+    # the parent is unreliable — torchrun reports 1 for both. Treat as
+    # OOM so the sweep correctly bisects below; a real crash will still
+    # be visible in the stderr output above.
+    print(f"  [bs={bs}] OOM (torchrun exit={proc.returncode})")
+    return {"bs": bs, "phase": phase, "status": "oom", "exitcode": proc.returncode}
+
+
+def _detect_num_gpus() -> int:
+    """
+    Best-effort GPU count. Prefers ``CUDA_VISIBLE_DEVICES`` (honors
+    SLURM-managed device masking) and falls back to the device count
+    ``torch`` reports on the orchestrator process.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cvd:
+        return len([x for x in cvd.split(",") if x.strip()])
+    try:
+        import torch
+
+        return max(torch.cuda.device_count(), 1)
+    except Exception:
+        return 1
 
 
 def tune_batch_size(
@@ -128,17 +187,18 @@ def tune_batch_size(
     min_gap: int = 2,
     timeout_s: int = 900,
     safety_margin_pct: float = 15.0,
+    n_steps: int = 5,
 ) -> list[dict]:
     """
     Find the largest fitting batch size for a given model / audio /
-    GPU combination.
+    DDP rank count.
 
     Two phases: a doubling sweep through :data:`DEFAULT_CANDIDATES`
     until the first OOM, then bisection between the last success and
     the first OOM until the gap is within ``min_gap``.
 
-    :param dataset_dir: Directory of song subdirectories to draw real
-        audio from.
+    :param dataset_dir: Directory of song subdirectories. The probe
+        builds a single manifest from this and shares it across trials.
     :param filename: Audio filename inside each song subdirectory.
     :param model_name: Model identifier.
     :param freeze_encoder: Match what production training will use —
@@ -148,70 +208,88 @@ def tune_batch_size(
     :param max_bs: Upper bound of the sweep (inclusive).
     :param min_gap: Bisection stops when ``(first_oom - last_success)
         <= min_gap``.
-    :param timeout_s: Per-trial timeout. Hung trials are killed.
+    :param timeout_s: Per-trial timeout (includes model download/load).
     :param safety_margin_pct: Fallback margin applied to the VRAM
         ceiling when no throughput sweet spot is found.
+    :param n_steps: Training steps per trial (after PL's warmup).
     :return: Per-trial result dicts, one per attempted batch size.
     """
-    candidates = [b for b in DEFAULT_CANDIDATES if start <= b <= max_bs]
+    from lyricscribe.finetune.config import detect_architecture
+
+    architecture = detect_architecture(model_name)
+    candidates = [b for b in _candidates_for(architecture) if start <= b <= max_bs]
     if not candidates:
-        logger.error(f"No sweep candidates in [{start}, {max_bs}]")
+        logger.error(
+            f"No {_param_label(architecture)} candidates in [{start}, {max_bs}]"
+        )
         return []
+
+    num_gpus = _detect_num_gpus()
 
     print("Sweep config (must match production training):")
     print(f"  dataset_dir    = {dataset_dir}")
     print(f"  filename       = {filename}")
-    print(f"  model          = {model_name}")
+    print(f"  model          = {model_name}  ({architecture})")
+    print(f"  sweeping       = {_param_label(architecture)}")
     print(f"  freeze_encoder = {freeze_encoder}")
     print(f"  max_duration_s = {max_duration_s}")
+    print(f"  num_gpus (DDP) = {num_gpus}")
+    print(f"  n_steps/trial  = {n_steps}")
     print(
-        "\nCheck freeze_encoder + max_duration match your real training —\n"
-        "each shifts VRAM by many GiB.\n"
+        "\nCheck freeze_encoder + max_duration + num_gpus match your real\n"
+        "training — each shifts VRAM by many GiB.\n"
     )
 
     results: list[dict] = []
     last_success: int | None = None
     first_oom: int | None = None
 
-    for bs in candidates:
-        r = _run_trial(
-            dataset_dir, filename, model_name, bs,
-            freeze_encoder, max_duration_s, timeout_s, phase="double",
+    with tempfile.TemporaryDirectory(prefix="lyricscribe_tune_") as tmp:
+        work_dir = Path(tmp)
+        manifest = _build_shared_manifest(
+            dataset_dir, filename, model_name, work_dir
         )
-        results.append(r)
-        if r["status"] == "success":
-            last_success = bs
-        else:
-            if r["status"] == "oom":
-                first_oom = bs
-            break
 
-    if (
-        last_success is not None
-        and first_oom is not None
-        and first_oom - last_success > min_gap
-    ):
-        print(
-            f"\n--- bisecting between {last_success} (OK) and {first_oom} (OOM), "
-            f"stop when gap ≤ {min_gap} ---"
-        )
-        lo, hi = last_success, first_oom
-        while hi - lo > min_gap:
-            mid = (lo + hi) // 2
-            if mid == lo or mid == hi:
-                break
+        for bs in candidates:
             r = _run_trial(
-                dataset_dir, filename, model_name, mid,
-                freeze_encoder, max_duration_s, timeout_s, phase="bisect",
+                manifest, model_name, bs, freeze_encoder, max_duration_s,
+                num_gpus, timeout_s, work_dir, phase="double", n_steps=n_steps,
             )
             results.append(r)
             if r["status"] == "success":
-                lo = mid
-            elif r["status"] == "oom":
-                hi = mid
+                last_success = bs
             else:
-                # Timeout or crash — can't tell which side, stop.
+                if r["status"] == "oom":
+                    first_oom = bs
                 break
+
+        if (
+            last_success is not None
+            and first_oom is not None
+            and first_oom - last_success > min_gap
+        ):
+            print(
+                f"\n--- bisecting between {last_success} (OK) and {first_oom} "
+                f"(OOM), stop when gap ≤ {min_gap} ---"
+            )
+            lo, hi = last_success, first_oom
+            while hi - lo > min_gap:
+                mid = (lo + hi) // 2
+                if mid == lo or mid == hi:
+                    break
+                r = _run_trial(
+                    manifest, model_name, mid, freeze_encoder, max_duration_s,
+                    num_gpus, timeout_s, work_dir, phase="bisect",
+                    n_steps=n_steps,
+                )
+                results.append(r)
+                if r["status"] == "success":
+                    lo = mid
+                elif r["status"] == "oom":
+                    hi = mid
+                else:
+                    # Timeout or crash — can't tell which side, stop.
+                    break
 
     _print_summary(results, safety_margin_pct)
     return results
@@ -236,7 +314,8 @@ def _find_throughput_sweet_spot(
         return None
 
     def tput(r: dict) -> float:
-        return r["bs"] / (r["median_step_ms"] / 1000) if r["median_step_ms"] else 0
+        step_ms = r.get("mean_step_ms", 0)
+        return r["bs"] / (step_ms / 1000) if step_ms else 0
 
     for i in range(len(successes) - 1):
         cur, nxt = successes[i], successes[i + 1]
@@ -262,8 +341,9 @@ def _print_summary(results: list[dict], safety_margin_pct: float) -> None:
         if r["status"] == "success":
             pct = 100 * r["peak_reserved_gb"] / r["total_gb"]
             vram = f"{r['peak_reserved_gb']:.1f}/{r['total_gb']:.1f} GiB ({pct:.0f}%)"
-            step = f"{r['median_step_ms']:.0f}"
-            tput = r["bs"] / (r["median_step_ms"] / 1000) if r["median_step_ms"] else 0
+            step_ms = r.get("mean_step_ms", 0)
+            step = f"{step_ms:.0f}"
+            tput = r["bs"] / (step_ms / 1000) if step_ms else 0
             tput_s = f"{tput:.1f} samp/s"
         else:
             vram = "-"
@@ -289,15 +369,17 @@ def _print_summary(results: list[dict], safety_margin_pct: float) -> None:
     largest = successes[-1]
     sweet = _find_throughput_sweet_spot(successes, threshold=0.10)
 
+    l_step = largest.get("mean_step_ms", 0)
     print(
         f"\nLargest fitting:      bs={largest['bs']}  "
         f"({largest['peak_reserved_gb']:.1f}/{largest['total_gb']:.1f} GiB, "
-        f"{largest['bs'] / (largest['median_step_ms'] / 1000):.1f} samp/s)"
+        f"{(largest['bs'] / (l_step / 1000)) if l_step else 0:.1f} samp/s)"
     )
     if sweet and sweet["bs"] < largest["bs"]:
-        s_tput = sweet["bs"] / (sweet["median_step_ms"] / 1000)
-        l_tput = largest["bs"] / (largest["median_step_ms"] / 1000)
-        gain = 100 * (l_tput - s_tput) / s_tput
+        s_step = sweet.get("mean_step_ms", 0)
+        s_tput = sweet["bs"] / (s_step / 1000) if s_step else 0
+        l_tput = largest["bs"] / (l_step / 1000) if l_step else 0
+        gain = 100 * (l_tput - s_tput) / s_tput if s_tput else 0
         print(
             f"Throughput sweet spot: bs={sweet['bs']}  "
             f"({sweet['peak_reserved_gb']:.1f}/{sweet['total_gb']:.1f} GiB, "
@@ -313,7 +395,7 @@ def _print_summary(results: list[dict], safety_margin_pct: float) -> None:
     else:
         recommended = max(1, int(round(largest["bs"] * (1 - safety_margin_pct / 100))))
         rationale = (
-            f"{safety_margin_pct:.0f}% margin on VRAM ceiling for DDP + "
+            f"{safety_margin_pct:.0f}% margin on VRAM ceiling for "
             "per-sample length variance"
         )
     print(f"\nRecommended batch_size: {recommended}  ({rationale})")

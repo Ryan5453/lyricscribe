@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import shutil
+import tempfile
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -649,6 +650,46 @@ class NeMoTrainer:
 
         return metrics
 
+    def train_n_steps(self, n: int) -> None:
+        """
+        Run exactly *n* training steps against the already-configured
+        training dataloader. Used by the VRAM probe so the memory profile
+        matches production 1:1 — same PL strategy, DDP rank count,
+        precision, gradient clipping, bad-batch skipping callbacks, and
+        Lhotse vs. standard-dataloader dispatch — minus the
+        epoch-level bookkeeping, ModelCheckpoint, and resume logic.
+
+        :param n: Number of training steps to run.
+        """
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        uses_lhotse = self.model.cfg.train_ds.get("use_lhotse", False)
+
+        callbacks = [
+            _SkipBadBatchCallback(),
+            _SkipNaNOrInfLossCallback(),
+        ]
+
+        trainer_kwargs = dict(
+            max_epochs=1,
+            max_steps=n,
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices=num_gpus,
+            strategy="ddp" if num_gpus > 1 else "auto",
+            precision="bf16-mixed" if torch.cuda.is_available() else 32,
+            gradient_clip_val=1.0,
+            enable_progress_bar=False,
+            logger=False,
+            enable_checkpointing=False,
+            callbacks=callbacks,
+            log_every_n_steps=1,
+        )
+        if uses_lhotse:
+            trainer_kwargs["use_distributed_sampler"] = False
+            trainer_kwargs["limit_train_batches"] = n
+
+        probe_trainer = pl.Trainer(**trainer_kwargs)
+        probe_trainer.fit(self.model)
+
     def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
         """
         Save a NeMo ``.nemo`` checkpoint.
@@ -1039,6 +1080,53 @@ class WhisperTrainer:
                 metrics["train_loss"] = last_log["loss"]
 
         return metrics
+
+    def train_n_steps(self, n: int) -> None:
+        """
+        Run exactly *n* training steps against the training manifest.
+        Used by the VRAM probe so the memory profile matches production
+        1:1 — same HF ``Seq2SeqTrainer``, DDP rank count (picked up from
+        torchrun env vars), precision, gradient clipping, collator —
+        minus checkpointing, evaluation, logging-to-disk.
+
+        :param n: Number of training steps to run.
+        """
+        train_dataset = WhisperFinetuneDataset(self.train_manifest, self.processor)
+
+        tmp_dir = tempfile.mkdtemp(prefix="lyricscribe_probe_whisper_")
+        try:
+            training_args = Seq2SeqTrainingArguments(
+                output_dir=tmp_dir,
+                per_device_train_batch_size=self.config["batch_size"],
+                gradient_accumulation_steps=self.config.get("grad_accum", 1),
+                learning_rate=self.config["learning_rate"],
+                warmup_ratio=0.0,
+                max_steps=n,
+                num_train_epochs=1,
+                fp16=torch.cuda.is_available(),
+                save_strategy="no",
+                logging_steps=1,
+                remove_unused_columns=False,
+                label_names=["labels"],
+                weight_decay=0.01,
+                max_grad_norm=1.0,
+                dataloader_num_workers=2,
+                dataloader_pin_memory=True,
+                predict_with_generate=False,
+                report_to="none",
+                run_name="lyricscribe_probe",
+            )
+
+            hf_trainer = Seq2SeqTrainer(
+                model=self.model,
+                args=training_args,
+                train_dataset=train_dataset,
+                data_collator=WhisperDataCollator(processor=self.processor),
+                tokenizer=self.processor,
+            )
+            hf_trainer.train()
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
         """
