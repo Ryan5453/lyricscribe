@@ -82,7 +82,7 @@ def create_finetune_config(
         "output_dir": str(output_dir),
         "exp_name": exp_name,
         "filenames": filenames,
-        "batch_size": kwargs.get("batch_size", 48 if architecture == "parakeet" else 24),
+        "batch_size": kwargs.get("batch_size", 16 if architecture == "parakeet" else 24),
         "max_epochs": kwargs.get("max_epochs", 10),
         "epochs_per_job": kwargs.get("epochs_per_job", 5 if architecture == "whisper" else 3),
         "learning_rate": kwargs.get("learning_rate", default_lr),

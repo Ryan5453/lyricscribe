@@ -32,6 +32,11 @@ export HF_HOME=/projects/fahey.rya/music2text/.cache/huggingface
 export TORCH_HOME=/projects/fahey.rya/music2text/.cache/torch
 export NEMO_CACHE_DIR=/projects/fahey.rya/music2text/.cache/nemo
 
+# Use expandable segments to avoid caching-allocator fragmentation that
+# causes Parakeet OOMs mid-training even at low batch sizes (the "X GiB
+# reserved by PyTorch but unallocated" pattern).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 cd /projects/fahey.rya/music2text/lyricscribe
 source .venv/bin/activate
 
