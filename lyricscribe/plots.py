@@ -11,16 +11,30 @@ from lyricscribe.latex_tables import DATASET_DISPLAY
 
 logger = logging.getLogger(__name__)
 
-_MODEL_PALETTE = ["#378ADD", "#1D9E75", "#D85A30", "#7F77DD", "#E24B4A", "#6B6B6B"]
-_ERROR_COLORS = {"sub": "#7F77DD", "del": "#D85A30", "ins": "#1D9E75"}
+_MODEL_PALETTE = [
+    "#006BA4",  # blue
+    "#FF800E",  # orange
+    "#595959",  # dark gray
+    "#5F9ED1",  # light blue
+    "#C85200",  # dark orange
+    "#ABABAB",  # gray
+]
+_ERROR_COLORS = {
+    "ins": "#FF800E",  # orange
+    "del": "#006BA4",  # blue
+    "sub": "#595959",  # dark gray
+}
 
 
 def _apply_style() -> None:
     """
     Apply a consistent matplotlib style to all plots.
 
-    Sets font, hides top/right spines, and enables a subtle dashed grid.
+    Uses the ``tableau-colorblind10`` style recommended by ISMIR for
+    accessibility (distinguishable both to colorblind readers and when
+    printed in grayscale).
     """
+    plt.style.use("tableau-colorblind10")
     plt.rcParams.update(
         {
             "font.family": "DejaVu Sans",
