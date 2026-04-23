@@ -401,11 +401,15 @@ def plot_wer_heatmap(df: pd.DataFrame, output_path: Path) -> None:
 
 def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
     """
-    Generate a stacked bar chart of error type percentages per model.
+    Stacked bar chart of error type percentages per model on the
+    MUSDB-ALT clean-stems baseline.
 
-    Aggregates insertions, deletions, and substitutions across all jobs
-    for each model and displays them as a single 100% stacked bar with
-    percentage labels inside each segment.
+    Restricted to one row per model: ``dataset == musdb_alt``,
+    ``filename == vocals.wav``, no VAD, no chunking. Pooling across all
+    configurations would let mix+VAD collapse runs (where Silero VAD
+    misclassifies instrumental regions and drives WER to 72–85%) swamp
+    the deletion counts, hiding the per-architecture profile the paper's
+    Section 5 claims.
 
     :param df: evaluation summary DataFrame as returned by
         :func:`~lyricscribe.evaluate.collect_evaluation_data`.
@@ -413,7 +417,15 @@ def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
     """
     _apply_style()
 
-    agg = df.groupby("model")[["insertions", "deletions", "substitutions"]].sum()
+    baseline = df[
+        (df["dataset"] == "musdb_alt")
+        & (df["filename"] == "vocals.wav")
+        & (~df["vad"])
+        & (~df["chunked"])
+    ]
+    agg = baseline.groupby("model")[
+        ["insertions", "deletions", "substitutions"]
+    ].sum()
     models = agg.index.tolist()
 
     ins = agg["insertions"].values.astype(float)
@@ -478,7 +490,10 @@ def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
     ax.set_xticklabels(model_labels, fontsize=10)
     ax.set_ylabel("% of total errors", fontsize=11)
     ax.set_title(
-        "Error Type Breakdown by Model", fontsize=13, fontweight="bold", pad=12
+        "Error Type Breakdown by Model (MUSDB-ALT clean stems)",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
     )
     ax.set_ylim(0, 105)
     ax.legend(
@@ -634,9 +649,6 @@ def generate_all_plots(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    plot_baseline_wer(df, output_dir / "baseline_wer.pdf")
-    plot_error_type_shares(df, output_dir / "error_type_shares.pdf")
-    plot_wer_heatmap(df, output_dir / "wer_heatmap.pdf")
     plot_error_type_breakdown(df, output_dir / "error_type_breakdown.pdf")
     plot_pipeline_shift(df, output_dir / "pipeline_shift.pdf")
 
