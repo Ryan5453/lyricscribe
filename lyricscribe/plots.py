@@ -602,7 +602,7 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
         frameon=False,
     )
     ax.set_title(
-        "Pipeline Shift vs. Clean Stems Baseline (MUSDB18)",
+        "Pipeline Shift vs MUSDB-ALT Clean Stems",
         fontsize=12,
         fontweight="bold",
     )
