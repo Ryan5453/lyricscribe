@@ -1005,6 +1005,12 @@ class WhisperTrainer:
                 label_names=["labels"],
                 weight_decay=0.01,
                 max_grad_norm=1.0,
+                # Prevent decoder over-confidence on repeated-token targets.
+                # Without smoothing the cross-entropy pushes P(same token | ..)
+                # arbitrarily high on repetitive music hooks, which at
+                # inference produces "i i i i..." loops once teacher forcing
+                # ends. 0.1 is the seq2seq standard.
+                label_smoothing_factor=0.1,
                 dataloader_num_workers=16,
                 # Keep workers alive across epoch boundaries instead of
                 # re-spawning — eliminates the ~2 s per-epoch cold start

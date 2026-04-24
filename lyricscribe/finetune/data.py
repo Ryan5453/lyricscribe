@@ -102,7 +102,7 @@ def create_manifest(
     model_name: str | None = None,
     window_seconds: float = 30.0,
     max_tokens: int = 440,
-    windows_per_song_multiplier: int = 3,
+    windows_per_song_multiplier: int = 1,
     line_overlap_threshold: float = 0.7,
 ) -> int:
     """
@@ -241,21 +241,13 @@ def create_manifest(
                     window_end_ms = window_start_ms + window_ms
 
                     if aligned_words is not None:
-                        # Word-level MFA filter: keep only words whose full
-                        # audio extent falls inside the window. Labels lose
-                        # the punctuation/capitalization the provider's
-                        # synced text carried (MFA lowercases and strips)
-                        # but in exchange every label word is supervised on
-                        # complete audio the model can actually hear.
                         kept = [
                             w for w in aligned_words
                             if w["start"] >= window_start_ms
                             and w["start"] + w["duration"] <= window_end_ms
                         ]
-                        text = " ".join(w["word"] for w in kept).strip()
+                        raw_words = [w["word"] for w in kept]
                     else:
-                        # No MFA alignment for this song — fall back to
-                        # line-level overlap-ratio filtering.
                         lines_in_window = []
                         for line in synced:
                             if not line.get("text", "").strip():
@@ -263,8 +255,6 @@ def create_manifest(
                             line_start = line.get("start", 0)
                             line_dur = line.get("duration", 0)
                             if line_dur <= 0:
-                                # Provider only ships start times — fall
-                                # back to start-in-window.
                                 if window_start_ms <= line_start < window_end_ms:
                                     lines_in_window.append(line)
                                 continue
@@ -274,9 +264,31 @@ def create_manifest(
                             overlap = max(0, overlap_end - overlap_start)
                             if overlap / line_dur >= line_overlap_threshold:
                                 lines_in_window.append(line)
-                        text = " ".join(
+                        joined = " ".join(
                             line["text"].strip() for line in lines_in_window
                         ).strip()
+                        raw_words = joined.split()
+
+                    # Providers ship chorus vocalisations as one synced line
+                    # per beat ("la la la, la la la" × 14 consecutive lines
+                    # for a 30s chorus). MFA faithfully aligns each, producing
+                    # 50-80-run sequences of identical words. Whisper's
+                    # cross-entropy loss on those targets teaches the decoder
+                    # that arbitrarily long token repetition is valid — which
+                    # generalises at inference to "i i i i..." collapse even
+                    # on non-chorus audio. Cap runs at 2 to keep legitimate
+                    # doublings ("yeah yeah") while killing the pathology.
+                    deduped_words: list[str] = []
+                    for w in raw_words:
+                        wl = w.lower()
+                        if (
+                            len(deduped_words) >= 2
+                            and deduped_words[-1].lower() == wl
+                            and deduped_words[-2].lower() == wl
+                        ):
+                            continue
+                        deduped_words.append(w)
+                    text = " ".join(deduped_words).strip()
 
                     if tokenizer is not None and text:
                         token_count = len(tokenizer(text).input_ids)

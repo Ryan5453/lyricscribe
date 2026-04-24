@@ -564,7 +564,7 @@ def finetune_setup(
         help="Fixed number of validation samples both Whisper and NeMo evaluate against each epoch (default: 200)",
     ),
     windows_per_song: int = typer.Option(
-        3,
+        1,
         "--windows-per-song",
         help="Random 30s windows sampled per song (per ~30s of song duration). Higher = more diverse coverage across epochs. Raise toward your total epoch count for approximate per-epoch randomization.",
     ),
