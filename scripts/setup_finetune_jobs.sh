@@ -22,7 +22,7 @@ DATASET=/projects/fahey.rya/music2text/dataset
 EXPDIR=/projects/fahey.rya/music2text/experiments
 
 MODELS=(
-    "nvidia/parakeet-tdt-0.6b-v3"
+    # "nvidia/parakeet-tdt-0.6b-v3"  # Parakeet held until Whisper retrain validates the dedup fix.
     "openai/whisper-large-v3"
     # "nvidia/canary-1b-v2"  # Canary skipped: too slow to finish by deadline. Re-enable when time allows.
 )
