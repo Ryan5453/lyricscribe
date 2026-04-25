@@ -168,6 +168,7 @@ def collect_evaluation_data(jobs_dir: Path) -> list[dict]:
         if stats is None:
             continue
         config = stats["config"]
+        vad_on = config.get("vad", False)
         all_stats.append(
             {
                 "job_dir": str(job_dir.relative_to(jobs_dir)),
@@ -176,7 +177,14 @@ def collect_evaluation_data(jobs_dir: Path) -> list[dict]:
                     Path(d).name for d in config.get("directories", [])
                 ),
                 "filename": config.get("filename", ""),
-                "vad": config.get("vad", False),
+                "vad": vad_on,
+                # ``vad_method`` was added when RMS-VAD landed; older configs
+                # have no field — implicitly Silero. Report blank when VAD
+                # is off so the column reads cleanly.
+                "vad_method": (
+                    config.get("vad_method", "silero") if vad_on else ""
+                ),
+                "vad_source": config.get("vad_filename") or "",
                 "chunked": config.get("chunked", False),
                 "wer": stats["wer"],
                 "n_songs": stats["n_songs"],
