@@ -184,6 +184,13 @@ def align(
             raise FileNotFoundError(f"MFA container image not found: {image_path}")
         image_arg = str(image_path)
 
+    if num_chunks < 1:
+        raise ValueError(f"num_chunks must be >= 1, got {num_chunks}")
+    if chunk_id < 0 or chunk_id >= num_chunks:
+        raise ValueError(
+            f"chunk_id must be in [0, {num_chunks - 1}] for num_chunks={num_chunks}, got {chunk_id}"
+        )
+
     runtime = _find_container_runtime()
 
     song_dirs = sorted([d for d in dataset_dir.iterdir() if d.is_dir()])

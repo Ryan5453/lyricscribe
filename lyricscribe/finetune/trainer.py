@@ -1244,10 +1244,12 @@ def run_training_job(
     ``epochs_per_job`` epochs, saves a checkpoint after each epoch, and
     writes metrics to ``metrics.jsonl``.
 
-    On ``torch.cuda.OutOfMemoryError`` the batch size is halved, the
-    discovered value is persisted to ``config.json``, the trainer is
+    On ``torch.cuda.OutOfMemoryError`` the per-step workload is halved
+    (``batch_size`` for Whisper/Parakeet, ``batch_duration`` for Canary),
+    the discovered value is persisted to ``config.json``, the trainer is
     recreated from the latest checkpoint, and the chunk is retried. This
-    repeats until either training succeeds or batch size hits 1.
+    repeats until either training succeeds or the workload can no longer
+    be reduced.
 
     :param config: Job configuration dictionary.
     :param train_manifest: Path to the training manifest JSONL file.
@@ -1266,16 +1268,29 @@ def run_training_job(
                 config, train_manifest, val_manifest, chunk_end_epoch, job_dir,
             )
         except torch.cuda.OutOfMemoryError as e:
-            current_bs = config.get("batch_size", 1)
-            if current_bs <= 1:
-                logger.error("OOM at batch_size=1, cannot reduce further")
-                raise
-            new_bs = max(1, current_bs // 2)
-            logger.warning(
-                f"OOM at batch_size={current_bs} ({e}). "
-                f"Halving to batch_size={new_bs} and retrying."
-            )
-            config["batch_size"] = new_bs
+            architecture = str(config.get("architecture", "")).lower()
+            if architecture == "canary":
+                current_duration = float(config.get("batch_duration") or 600.0)
+                if current_duration <= 1.0:
+                    logger.error("OOM at batch_duration=1s, cannot reduce further")
+                    raise
+                new_duration = max(1.0, current_duration / 2.0)
+                logger.warning(
+                    f"OOM at batch_duration={current_duration:g}s ({e}). "
+                    f"Halving to batch_duration={new_duration:g}s and retrying."
+                )
+                config["batch_duration"] = new_duration
+            else:
+                current_bs = int(config.get("batch_size") or 1)
+                if current_bs <= 1:
+                    logger.error("OOM at batch_size=1, cannot reduce further")
+                    raise
+                new_bs = max(1, current_bs // 2)
+                logger.warning(
+                    f"OOM at batch_size={current_bs} ({e}). "
+                    f"Halving to batch_size={new_bs} and retrying."
+                )
+                config["batch_size"] = new_bs
             with open(job_dir / "config.json", "w") as f:
                 json.dump(config, f, indent=2)
             # Force garbage collection of the old trainer/model before

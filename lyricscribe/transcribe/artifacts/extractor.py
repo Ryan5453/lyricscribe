@@ -138,6 +138,7 @@ def process_dataset(musdb_dir: Path, output_dir: Path) -> None:
 
         if output_path.exists():
             logger.info(f"Skipping {song_dir.name}, it already exists")
+            skipped += 1
             continue
 
         try:
@@ -159,6 +160,5 @@ def process_dataset(musdb_dir: Path, output_dir: Path) -> None:
 
 
     
-
 
 

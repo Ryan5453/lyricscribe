@@ -556,13 +556,22 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
     colors = _model_colors(models)
 
     fig, ax = plt.subplots(figsize=(8, 5.5))
+    plotted_models: list[str] = []
 
     for model_id in models:
         m = df[df["model"] == model_id].copy()
 
-        baseline = m[m["label"] == "Clean Stems"].iloc[0]
+        baseline_rows = m[m["label"] == "Clean Stems"]
+        if baseline_rows.empty:
+            logger.warning(
+                "Skipping %s in pipeline shift plot: missing Clean Stems baseline",
+                model_id,
+            )
+            continue
+        baseline = baseline_rows.iloc[0]
         m["d_insertion"] = m["insertion_rate"] - baseline["insertion_rate"]
         m["d_deletion"] = m["deletion_rate"] - baseline["deletion_rate"]
+        plotted_models.append(model_id)
 
         color = colors[model_id]
         ax.scatter(
@@ -590,6 +599,13 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
                 path_effects=[pe.withStroke(linewidth=2.5, foreground="white")],
             )
 
+    if not plotted_models:
+        plt.close(fig)
+        logger.warning(
+            "No model rows with a Clean Stems baseline; skipping pipeline shift plot"
+        )
+        return
+
     ax.axhline(0, color="#888888", linewidth=0.8, linestyle="--", zorder=1)
     ax.axvline(0, color="#888888", linewidth=0.8, linestyle="--", zorder=1)
     ax.set_xlabel("Change in Insertion Rate (per reference word)", fontsize=11)
@@ -598,7 +614,7 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
         fontsize=10,
         loc="upper center",
         bbox_to_anchor=(0.5, -0.12),
-        ncol=len(models),
+        ncol=len(plotted_models),
         frameon=False,
     )
     ax.set_title(

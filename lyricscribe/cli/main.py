@@ -91,7 +91,12 @@ def separate_setup(
         help="Audio filename to process within each subdirectory (e.g. mix.wav)",
     ),
     model: str = typer.Option("htdemucs", "--model", help="Demucs model to use"),
-    chunks: int = typer.Option(5, "--chunks", help="Number of chunks to split into"),
+    chunks: int = typer.Option(
+        5,
+        "--chunks",
+        min=1,
+        help="Number of chunks to split into",
+    ),
     stem: str | None = typer.Option(
         None,
         "--stem",
@@ -174,7 +179,12 @@ def transcribe_setup(
     model: str = typer.Option(
         ..., "--model", help="HuggingFace model ID (e.g. openai/whisper-large-v3)"
     ),
-    chunks: int = typer.Option(1, "--chunks", help="Number of chunks to split into"),
+    chunks: int = typer.Option(
+        1,
+        "--chunks",
+        min=1,
+        help="Number of chunks to split into",
+    ),
     batch_size: int = typer.Option(
         1,
         "--batch-size",
@@ -390,7 +400,8 @@ def evaluate_run(
         writer = csv.DictWriter(
             f,
             fieldnames=[
-                "job_dir", "model", "dataset", "filename", "vad", "chunked",
+                "job_dir", "model", "dataset", "filename", "vad", "vad_method",
+                "vad_source", "chunked",
                 "wer", "n_songs", "insertions", "deletions", "substitutions", "hits"
             ]
         )
@@ -461,11 +472,13 @@ def dataset_align(
     num_chunks: int = typer.Option(
         1,
         "--num-chunks",
+        min=1,
         help="Total number of shards to partition the dataset into",
     ),
     chunk_id: int = typer.Option(
         0,
         "--chunk-id",
+        min=0,
         help="0-indexed shard to process (requires --num-chunks > 1)",
     ),
     skip_existing: bool = typer.Option(

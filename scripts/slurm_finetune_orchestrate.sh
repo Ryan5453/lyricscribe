@@ -336,8 +336,8 @@ with open(sys.argv[1] + '/chunks/chunk_' + sys.argv[2] + '.json') as f:
     # or jobs we lost track of for any other reason.
     reset_orphaned_chunks || true
 
-    # Count currently submitted GPU jobs
-    GPU_SUBMITTED=$(squeue -u "$USER" -p gpu -h 2>/dev/null | wc -l)
+    # Count currently submitted GPU jobs across both relevant partitions.
+    GPU_SUBMITTED=$(squeue -u "$USER" -p gpu,multigpu -h 2>/dev/null | wc -l)
 
     # Submit new chunks where possible
     for exp in "${EXPERIMENTS[@]}"; do

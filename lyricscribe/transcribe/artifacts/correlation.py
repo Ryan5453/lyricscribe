@@ -243,7 +243,7 @@ def build_dataset(
     models = sorted(set(model for _, model in results.keys()))
 
     result_songs = set(song_id for song_id, _ in results.keys())
-    common_songs = set(alignments) & set(features) & result_songs
+    common_songs = set(alignments) & set(features) & set(ground_truth) & result_songs
 
     rows: list[dict] = []
     songs_processed = 0
@@ -325,6 +325,14 @@ def analyse(
     :returns: list of quartile summary dicts.
     """
     rows = [r for r in rows if r["artifact_to_signal_ratio"] != float("inf")]
+    if not rows:
+        logger.warning("No finite artifact rows found; skipping quartile analysis")
+        if csv_output is not None:
+            csv_output.parent.mkdir(parents=True, exist_ok=True)
+            with open(csv_output, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_QUARTILE_FIELDS)
+                writer.writeheader()
+        return []
 
     models = sorted(set(r["model_name"] for r in rows))
     logger.info(f"Models found: {models}")

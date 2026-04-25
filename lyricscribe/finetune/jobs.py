@@ -120,7 +120,7 @@ def update_chunk_status(
 
     :param job_dir: Path to job directory
     :param chunk_id: Which chunk was processed
-    :param status: New status (pending, success, failed)
+    :param status: New status (pending, running, success, failed)
     """
     lock_path = job_dir / ".status.lock"
     with open(lock_path, "w") as lock_file:
@@ -134,6 +134,14 @@ def update_chunk_status(
 
             if status == "success":
                 job_status["current_epoch"] = chunk_data["end_epoch"]
+            elif (
+                status in ("pending", "running")
+                and job_status.get("status") in ("complete", "complete_with_failures")
+            ):
+                # A chunk was reopened after a previous completion state
+                # (manual retry/orchestrator recovery). Clear stale top-level
+                # completion so monitors show the experiment as active again.
+                job_status["status"] = "pending"
 
             all_chunks = list((job_dir / "chunks").glob("chunk_*.json"))
             chunk_statuses = [

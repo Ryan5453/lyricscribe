@@ -103,6 +103,9 @@ def setup_job(
         subdirs.extend(d for d in directory.iterdir() if d.is_dir())
     total = len(subdirs)
 
+    if num_chunks < 1:
+        raise ValueError(f"num_chunks must be >= 1, got {num_chunks}")
+
     if total == 0:
         logger.warning("No subdirectories found")
         return
@@ -112,7 +115,7 @@ def setup_job(
 
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clean up old results when running setup to avoid duplicate appends during run
+    # Clean up old results when running setup to avoid duplicate appends during run.
     results_path = job_dir / "results.jsonl"
     if results_path.exists():
         results_path.unlink()
@@ -135,14 +138,10 @@ def setup_job(
     with open(job_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
 
-    chunk_size = total // num_chunks
-
     for chunk_id in range(1, num_chunks + 1):
-        start = (chunk_id - 1) * chunk_size
-        end = total if chunk_id == num_chunks else chunk_id * chunk_size
-
         files = []
-        for subdir in subdirs[start:end]:
+        for idx in range(chunk_id - 1, total, num_chunks):
+            subdir = subdirs[idx]
             name = subdir.name
             input_file = subdir / filename
 
