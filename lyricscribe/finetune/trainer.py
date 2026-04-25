@@ -95,6 +95,7 @@ from transformers import (
     WhisperForConditionalGeneration,
     WhisperProcessor,
 )
+from transformers.models.whisper.modeling_whisper import shift_tokens_right
 
 from lyricscribe.finetune.config import get_latest_checkpoint
 
@@ -836,16 +837,22 @@ class WhisperDataCollator:
     positions with ``-100`` so they are ignored by the loss.
 
     :param processor: A ``WhisperProcessor`` instance.
+    :param decoder_start_token_id: Whisper SOT token id used to seed
+        teacher-forcing inputs.
+    :param pad_token_id: Token id used to fill shifted-out positions.
     """
 
     processor: WhisperProcessor
+    decoder_start_token_id: int
+    pad_token_id: int
 
     def __call__(self, features: list[dict]) -> dict:
         """
         Collate a list of samples into a padded batch.
 
         :param features: List of sample dicts from ``WhisperFinetuneDataset``.
-        :return: Batched dict with ``input_features`` and ``labels``.
+        :return: Batched dict with ``input_features``, ``labels``, and
+            ``decoder_input_ids``.
         """
 
         input_features = [{"input_features": f["input_features"]} for f in features]
@@ -858,11 +865,23 @@ class WhisperDataCollator:
             label_features, return_tensors="pt"
         )
 
+        # Compute decoder_input_ids before -100 masking so teacher-forcing
+        # inputs are actual token ids. HF's Trainer pops ``labels`` before
+        # the model forward when label_smoothing_factor > 0, so Whisper's
+        # built-in labels -> decoder_input_ids shift never runs and forward
+        # crashes. Pre-computing here makes the batch self-sufficient.
+        decoder_input_ids = shift_tokens_right(
+            labels_batch["input_ids"],
+            self.pad_token_id,
+            self.decoder_start_token_id,
+        )
+
         labels = labels_batch["input_ids"].masked_fill(
             labels_batch.attention_mask.ne(1), -100
         )
 
         batch["labels"] = labels
+        batch["decoder_input_ids"] = decoder_input_ids
         return batch
 
 
@@ -1041,7 +1060,11 @@ class WhisperTrainer:
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
                 compute_metrics=self._compute_metrics,
-                data_collator=WhisperDataCollator(processor=self.processor),
+                data_collator=WhisperDataCollator(
+                    processor=self.processor,
+                    decoder_start_token_id=self.model.config.decoder_start_token_id,
+                    pad_token_id=self.model.config.pad_token_id,
+                ),
                 tokenizer=self.processor,
             )
 
@@ -1127,7 +1150,11 @@ class WhisperTrainer:
                 model=self.model,
                 args=training_args,
                 train_dataset=train_dataset,
-                data_collator=WhisperDataCollator(processor=self.processor),
+                data_collator=WhisperDataCollator(
+                    processor=self.processor,
+                    decoder_start_token_id=self.model.config.decoder_start_token_id,
+                    pad_token_id=self.model.config.pad_token_id,
+                ),
                 tokenizer=self.processor,
             )
             hf_trainer.train()
