@@ -12,6 +12,11 @@ from silero_vad import get_speech_timestamps
 from torch.jit import ScriptModule
 
 from lyricscribe.transcribe.base import Transcriber
+from lyricscribe.transcribe.rms_vad import (
+    RmsVadOptions,
+    get_speech_timestamps_rms,
+    merge_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,7 @@ class NemoTranscriber(Transcriber):
         use_chunked: bool = False,
         language: str | None = None,
         vad_source: str | None = None,
+        vad_method: str = "silero",
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
@@ -87,8 +93,13 @@ class NemoTranscriber(Transcriber):
         total_duration = wav.shape[1] / sr
 
         if use_vad:
-            if vad_model is None:
-                raise ValueError("vad_model must be provided when use_vad=True")
+            if vad_method == "silero" and vad_model is None:
+                raise ValueError(
+                    "vad_model must be provided when use_vad=True and vad_method='silero'"
+                )
+            if vad_method not in ("silero", "rms"):
+                raise ValueError(f"Unknown vad_method: {vad_method!r}")
+
             if vad_source is not None:
                 vad_wav, vad_sr = torchaudio.load(vad_source)
                 if vad_wav.shape[0] > 1:
@@ -98,12 +109,30 @@ class NemoTranscriber(Transcriber):
                 vad_1d = vad_wav.squeeze(0)
             else:
                 vad_1d = wav.squeeze(0)
-            timestamps = get_speech_timestamps(
-                vad_1d,
-                vad_model,
-                sampling_rate=16000,
-                return_seconds=True,
-            )
+
+            if vad_method == "silero":
+                timestamps = get_speech_timestamps(
+                    vad_1d,
+                    vad_model,
+                    sampling_rate=16000,
+                    return_seconds=True,
+                )
+            else:
+                # RMS-VAD returns sample indices; merge into <=30s chunks
+                # then convert to seconds for NeMo's manifest format.
+                rms_segments = get_speech_timestamps_rms(
+                    vad_1d.numpy(),
+                    vad_options=RmsVadOptions(),
+                    window_size_samples=512,
+                    sampling_rate=16000,
+                )
+                merged = merge_segments(
+                    rms_segments, max_length_s=30, sampling_rate=16000
+                )
+                timestamps = [
+                    {"start": seg["start"] / 16000.0, "end": seg["end"] / 16000.0}
+                    for seg in merged
+                ]
             if not timestamps:
                 return ""
         else:

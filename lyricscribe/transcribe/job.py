@@ -79,6 +79,7 @@ def setup_job(
     chunked: bool = False,
     lyrics_filename: str | None = None,
     vad_filename: str | None = None,
+    vad_method: str = "silero",
 ) -> None:
     """
     Initialize a transcription job by scanning directories and writing
@@ -122,6 +123,7 @@ def setup_job(
         "model": model,
         "batch_size": batch_size,
         "vad": vad,
+        "vad_method": vad_method,
         "chunked": chunked,
         "lyrics_filename": lyrics_filename,
         "vad_filename": vad_filename,
@@ -192,6 +194,7 @@ def _transcribe_with_oom_retry(
     vad_model: ScriptModule | None,
     language: str | None = None,
     vad_source: str | None = None,
+    vad_method: str = "silero",
 ) -> str:
     """
     Attempt transcription with automatic OOM recovery.
@@ -219,6 +222,7 @@ def _transcribe_with_oom_retry(
                 use_chunked=use_chunked,
                 language=language,
                 vad_source=vad_source,
+                vad_method=vad_method,
             )
         except torch.cuda.OutOfMemoryError:
             if transcriber.batch_size <= 1:
@@ -248,6 +252,15 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
         batch_size = 1  # Legacy: treat old "auto" (0) as default (1)
     use_vad = config.get("vad", False)
     use_chunked = config.get("chunked", False)
+    vad_method = config.get("vad_method", "silero")
+    vad_filename = config.get("vad_filename")
+
+    if use_vad and vad_method == "rms" and not vad_filename:
+        raise ValueError(
+            "vad_method='rms' requires vad_filename to point at a separated "
+            "vocal track or stem; RMS amplitude on a mixed track is dominated "
+            "by accompaniment."
+        )
 
     transcriber = _create_transcriber(model_name, batch_size)
     transcriber.load()
@@ -255,9 +268,11 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     logger.info(f"Using batch_size={transcriber.batch_size}")
 
     vad_model = None
-    if use_vad:
+    if use_vad and vad_method == "silero":
         vad_model = load_silero_vad()
         logger.info("Loaded Silero VAD model")
+    elif use_vad and vad_method == "rms":
+        logger.info("Using RMS-amplitude VAD on the (separated) vocal track")
 
     with open(job_dir / f"chunk_{chunk_id}.json") as f:
         chunk_data = json.load(f)
@@ -301,6 +316,7 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
                 vad_model,
                 language=entry.get("language"),
                 vad_source=entry.get("vad_path"),
+                vad_method=vad_method,
             )
 
             duration = time.time() - start_time

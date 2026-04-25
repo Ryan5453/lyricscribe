@@ -181,7 +181,14 @@ def transcribe_setup(
         help="Batch size for inference.",
     ),
     vad: bool = typer.Option(
-        False, "--vad", help="Enable VAD-based segmentation with Silero"
+        False, "--vad", help="Enable VAD-based segmentation"
+    ),
+    vad_method: str = typer.Option(
+        "silero",
+        "--vad-method",
+        help="VAD algorithm: 'silero' (neural, speech-trained) or 'rms' "
+             "(RMS-amplitude on separated vocals, MSS-ALT-style). "
+             "Only used when --vad is set.",
     ),
     chunked: bool = typer.Option(
         False, "--chunked", help="Use fixed-length chunked inference instead of full-context"
@@ -203,6 +210,21 @@ def transcribe_setup(
     """
     from lyricscribe.transcribe import job as transcribe_job
 
+    if vad_method not in ("silero", "rms"):
+        raise typer.BadParameter(
+            f"--vad-method must be 'silero' or 'rms', got {vad_method!r}"
+        )
+    if vad and vad_method == "rms" and not vad_source_file:
+        # RMS-VAD thresholds amplitude. Run on a mixed track and the drums,
+        # bass, etc. drown the vocal-presence signal — segments end up
+        # near-useless. Require an explicit separated-vocals or stems file.
+        raise typer.BadParameter(
+            "--vad-method=rms requires --vad-source pointing to a separated "
+            "vocal track (e.g. htdemucs_ft_vocals.wav) or a true vocal stem "
+            "(e.g. vocals.wav). RMS amplitude on a mixed track is dominated "
+            "by accompaniment and produces garbage segments."
+        )
+
     transcribe_job.setup_job(
         directories=directories,
         job_dir=job_dir,
@@ -214,6 +236,7 @@ def transcribe_setup(
         chunked=chunked,
         lyrics_filename=lyrics_file,
         vad_filename=vad_source_file,
+        vad_method=vad_method,
     )
 
 

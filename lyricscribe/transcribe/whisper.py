@@ -7,6 +7,11 @@ from torch.jit import ScriptModule
 from transformers import pipeline
 
 from lyricscribe.transcribe.base import Transcriber
+from lyricscribe.transcribe.rms_vad import (
+    RmsVadOptions,
+    get_speech_timestamps_rms,
+    merge_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +75,16 @@ class WhisperTranscriber(Transcriber):
         use_chunked: bool = False,
         language: str | None = None,
         vad_source: str | None = None,
+        vad_method: str = "silero",
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
         """
-        generate_kwargs = {"task": "transcribe"}
+        generate_kwargs = {
+            "task": "transcribe",
+            "repetition_penalty": 1.7,
+            "no_repeat_ngram_size": 5,
+        }
         if language:
             generate_kwargs["language"] = language
 
@@ -87,8 +97,12 @@ class WhisperTranscriber(Transcriber):
             kwargs["stride_length_s"] = (4, 2)
 
         if use_vad:
-            if vad_model is None:
-                raise ValueError("vad_model must be provided when use_vad=True")
+            if vad_method == "silero" and vad_model is None:
+                raise ValueError(
+                    "vad_model must be provided when use_vad=True and vad_method='silero'"
+                )
+            if vad_method not in ("silero", "rms"):
+                raise ValueError(f"Unknown vad_method: {vad_method!r}")
 
             wav, sample_rate = torchaudio.load(audio_path)
             if wav.shape[0] > 1:
@@ -107,12 +121,26 @@ class WhisperTranscriber(Transcriber):
             else:
                 vad_1d = wav.squeeze(0)
 
-            timestamps = get_speech_timestamps(
-                vad_1d,
-                vad_model,
-                sampling_rate=16000,
-                return_seconds=False,
-            )
+            if vad_method == "silero":
+                timestamps = get_speech_timestamps(
+                    vad_1d,
+                    vad_model,
+                    sampling_rate=16000,
+                    return_seconds=False,
+                )
+            else:
+                # RMS-VAD on the (separated) vocal track. The raw segment
+                # output is fine-grained — merge into <=30s chunks so each
+                # call to Whisper sees as much context as it can handle.
+                rms_segments = get_speech_timestamps_rms(
+                    vad_1d.numpy(),
+                    vad_options=RmsVadOptions(),
+                    window_size_samples=512,
+                    sampling_rate=16000,
+                )
+                timestamps = merge_segments(
+                    rms_segments, max_length_s=30, sampling_rate=16000
+                )
 
             if not timestamps:
                 return ""
