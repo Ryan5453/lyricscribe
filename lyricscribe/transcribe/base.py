@@ -41,6 +41,9 @@ class Transcriber(ABC):
         use_chunked: bool = False,
         language: str | None = None,
         vad_source: str | None = None,
+        vad_method: str = "silero",
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
@@ -52,6 +55,12 @@ class Transcriber(ABC):
         :param language: Optional language code hint.
         :param vad_source: Optional path to an audio file to use as VAD source
             (timestamps from this file, transcription from audio_path).
+        :param vad_method: VAD algorithm — ``"silero"`` (default) or
+            ``"rms"`` (RMS-amplitude on a separated vocal track).
+        :param repetition_penalty: Decoder ``repetition_penalty`` for
+            Whisper. ``1.0`` disables it. Whisper-only.
+        :param no_repeat_ngram_size: Decoder ``no_repeat_ngram_size`` for
+            Whisper. ``0`` disables it. Whisper-only.
         :return: Transcribed text.
         """
         ...

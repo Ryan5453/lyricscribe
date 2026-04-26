@@ -76,20 +76,28 @@ class WhisperTranscriber(Transcriber):
         language: str | None = None,
         vad_source: str | None = None,
         vad_method: str = "silero",
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
         """
-        generate_kwargs = {
-            "task": "transcribe",
-            "repetition_penalty": 1.7,
-            "no_repeat_ngram_size": 5,
-        }
+        generate_kwargs = {"task": "transcribe"}
         if language:
             generate_kwargs["language"] = language
+        # Decoder anti-stutter knobs. Both ``1.0`` / ``0`` disable the
+        # corresponding constraint; defaults reproduce a vanilla Whisper
+        # decode unless the caller opts in via job config.
+        if repetition_penalty and repetition_penalty != 1.0:
+            generate_kwargs["repetition_penalty"] = repetition_penalty
+        if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+            generate_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
 
         kwargs = {
-            "batch_size": self.batch_size if use_chunked else 1,
+            # VAD also feeds the pipeline a list of <=30s segments, so it
+            # benefits from batching just like the chunked path. Without
+            # this, every VAD segment was decoded sequentially at bs=1.
+            "batch_size": self.batch_size if (use_chunked or use_vad) else 1,
             "generate_kwargs": generate_kwargs,
         }
         if use_chunked:

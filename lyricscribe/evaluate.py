@@ -186,6 +186,21 @@ def collect_evaluation_data(jobs_dir: Path) -> list[dict]:
                 ),
                 "vad_source": config.get("vad_filename") or "",
                 "chunked": config.get("chunked", False),
+                # ``repetition_penalty`` and ``no_repeat_ngram_size`` are
+                # HF-generation-only knobs. NeMo's RNNT/Canary decoders
+                # don't expose them, so emit ``-`` for those models to
+                # avoid implying ``1.0``/``0`` (vanilla decode) — which
+                # would be a category error.
+                "repetition_penalty": (
+                    float(config.get("repetition_penalty", 1.0) or 1.0)
+                    if "whisper" in config.get("model", "").lower()
+                    else "-"
+                ),
+                "no_repeat_ngram_size": (
+                    int(config.get("no_repeat_ngram_size", 0) or 0)
+                    if "whisper" in config.get("model", "").lower()
+                    else "-"
+                ),
                 "wer": stats["wer"],
                 "n_songs": stats["n_songs"],
                 "insertions": stats["insertions"],

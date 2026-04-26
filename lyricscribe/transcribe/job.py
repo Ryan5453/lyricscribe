@@ -80,6 +80,8 @@ def setup_job(
     lyrics_filename: str | None = None,
     vad_filename: str | None = None,
     vad_method: str = "silero",
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
 ) -> None:
     """
     Initialize a transcription job by scanning directories and writing
@@ -97,6 +99,10 @@ def setup_job(
         to read ``detected_language`` from in each subdirectory.
     :param vad_filename: Optional audio filename to use as VAD source
         (timestamps from this file, transcription from ``filename``).
+    :param repetition_penalty: Whisper decode-time anti-stutter knob.
+        ``1.0`` disables (vanilla decode).
+    :param no_repeat_ngram_size: Whisper decode-time anti-loop knob.
+        ``0`` disables.
     """
     subdirs = []
     for directory in directories:
@@ -130,6 +136,8 @@ def setup_job(
         "chunked": chunked,
         "lyrics_filename": lyrics_filename,
         "vad_filename": vad_filename,
+        "repetition_penalty": repetition_penalty,
+        "no_repeat_ngram_size": no_repeat_ngram_size,
         "num_chunks": num_chunks,
         "total_files": total,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -194,6 +202,8 @@ def _transcribe_with_oom_retry(
     language: str | None = None,
     vad_source: str | None = None,
     vad_method: str = "silero",
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
 ) -> str:
     """
     Attempt transcription with automatic OOM recovery.
@@ -222,6 +232,8 @@ def _transcribe_with_oom_retry(
                 language=language,
                 vad_source=vad_source,
                 vad_method=vad_method,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
             )
         except torch.cuda.OutOfMemoryError:
             if transcriber.batch_size <= 1:
@@ -253,6 +265,8 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     use_chunked = config.get("chunked", False)
     vad_method = config.get("vad_method", "silero")
     vad_filename = config.get("vad_filename")
+    repetition_penalty = float(config.get("repetition_penalty", 1.0) or 1.0)
+    no_repeat_ngram_size = int(config.get("no_repeat_ngram_size", 0) or 0)
 
     if use_vad and vad_method == "rms" and not vad_filename:
         raise ValueError(
@@ -313,6 +327,8 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
                 use_vad,
                 use_chunked,
                 vad_model,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
                 language=entry.get("language"),
                 vad_source=entry.get("vad_path"),
                 vad_method=vad_method,

@@ -214,6 +214,27 @@ def transcribe_setup(
         help="Audio filename to use as VAD source (e.g. htdemucs_ft_vocals.wav). "
              "VAD runs on this file, transcription runs on --filename.",
     ),
+    repetition_penalty: float = typer.Option(
+        1.0,
+        "--repetition-penalty",
+        help="Whisper decoder ``repetition_penalty``. ``1.0`` disables. "
+             "Recommended ``1.7`` to suppress autoregressive stutter on music. "
+             "Whisper-only.",
+    ),
+    no_repeat_ngram_size: int = typer.Option(
+        0,
+        "--no-repeat-ngram-size",
+        help="Whisper decoder ``no_repeat_ngram_size``. ``0`` disables. "
+             "Recommended ``5`` to ban repeating 5-grams (gentle on real "
+             "chorus repetition). Whisper-only.",
+    ),
+    mit: bool = typer.Option(
+        False,
+        "--mit",
+        help="Shortcut: enable both ``--repetition-penalty 1.7`` and "
+             "``--no-repeat-ngram-size 5`` together. Overrides explicit "
+             "values for those two flags.",
+    ),
 ):
     """
     Initialize a transcription job by registering files into chunks.
@@ -224,6 +245,10 @@ def transcribe_setup(
         raise typer.BadParameter(
             f"--vad-method must be 'silero' or 'rms', got {vad_method!r}"
         )
+
+    if mit:
+        repetition_penalty = 1.7
+        no_repeat_ngram_size = 5
     if vad and vad_method == "rms" and not vad_source_file:
         # RMS-VAD thresholds amplitude. Run on a mixed track and the drums,
         # bass, etc. drown the vocal-presence signal — segments end up
@@ -247,6 +272,8 @@ def transcribe_setup(
         lyrics_filename=lyrics_file,
         vad_filename=vad_source_file,
         vad_method=vad_method,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
     )
 
 
@@ -401,7 +428,7 @@ def evaluate_run(
             f,
             fieldnames=[
                 "job_dir", "model", "dataset", "filename", "vad", "vad_method",
-                "vad_source", "chunked",
+                "vad_source", "chunked", "repetition_penalty", "no_repeat_ngram_size",
                 "wer", "n_songs", "insertions", "deletions", "substitutions", "hits"
             ]
         )

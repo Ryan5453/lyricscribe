@@ -79,7 +79,12 @@ class NemoTranscriber(Transcriber):
         language: str | None = None,
         vad_source: str | None = None,
         vad_method: str = "silero",
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> str:
+        # NeMo's RNNT/Canary decoders don't expose HF-style
+        # ``repetition_penalty`` / ``no_repeat_ngram_size``; ignored here.
+        del repetition_penalty, no_repeat_ngram_size
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
         """
