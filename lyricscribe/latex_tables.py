@@ -74,18 +74,33 @@ def _row_full(r) -> str:
 def _row_headline(r) -> str:
     return (
         f"{r.model_label} & {r.config_label} & {r.wer * 100:.1f} & "
-        f"{r.i_ref:.3f} & {r.d_ref:.3f} & {r.s_ref:.3f} \\\\"
+        f"{int(r.insertions):,} & {int(r.deletions):,} & {int(r.substitutions):,} \\\\"
     )
 
 
 def write_full_results_tex(df: pd.DataFrame, out_path: Path) -> None:
+    """
+    Write the full per-config results table as a standalone LaTeX document.
+    This is intended to be compiled directly (``pdflatex full_results.tex``)
+    as a reference appendix; it is NOT meant to be ``\\input{}``-ed into
+    the main paper, since it can run hundreds of rows long.
+    """
     df = _derive_columns(df)
     lines = [
         "% Auto-generated — do not edit by hand.",
-        "\\begin{tabular}{llrrrrr}",
-        "\\hline",
+        "\\documentclass[10pt]{article}",
+        "\\usepackage[margin=1in]{geometry}",
+        "\\usepackage{longtable}",
+        "\\usepackage{booktabs}",
+        "\\begin{document}",
+        "\\begin{center}",
+        "\\textbf{\\large Full ALT evaluation results}",
+        "\\end{center}",
+        "\\begin{longtable}{llrrrrr}",
+        "\\toprule",
         "Model & Config & n & WER & I/ref & D/ref & S/ref \\\\",
-        "\\hline",
+        "\\midrule",
+        "\\endhead",
     ]
     for ds in DATASET_ORDER:
         sub = df[df["dataset"] == ds].sort_values("wer")
@@ -97,8 +112,10 @@ def write_full_results_tex(df: pd.DataFrame, out_path: Path) -> None:
         )
         for r in sub.itertuples():
             lines.append(_row_full(r))
-        lines.append("\\hline")
-    lines.append("\\end{tabular}")
+        lines.append("\\midrule")
+    lines.append("\\bottomrule")
+    lines.append("\\end{longtable}")
+    lines.append("\\end{document}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines) + "\n")
     logger.info(f"Wrote {out_path}")
@@ -110,7 +127,7 @@ def write_headline_results_tex(df: pd.DataFrame, out_path: Path) -> None:
         "% Auto-generated — do not edit by hand.",
         "\\begin{tabular}{llrrrr}",
         "\\hline",
-        "Model & Config & WER & I/ref & D/ref & S/ref \\\\",
+        "Model & Config & WER & Ins & Del & Sub \\\\",
         "\\hline",
     ]
     for ds in DATASET_ORDER:
