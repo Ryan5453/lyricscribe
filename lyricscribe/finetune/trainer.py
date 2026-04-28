@@ -1370,15 +1370,6 @@ def _run_training_job_inner(
             with open(job_dir / "metrics.jsonl", "a") as f:
                 f.write(json.dumps(metrics_entry) + "\n")
 
-            # Clean up mid-epoch step checkpoints after a successful epoch.
-            # The .nemo epoch checkpoint is the durable artifact; step
-            # checkpoints are only needed for mid-epoch SLURM timeout recovery.
-            step_ckpt_dir = job_dir / "pl_step_checkpoints"
-            if step_ckpt_dir.exists():
-                for ckpt in step_ckpt_dir.glob("*.ckpt"):
-                    ckpt.unlink()
-                logger.info("Cleaned up mid-epoch step checkpoints")
-
         logger.info(f"Epoch {epoch} complete, checkpoint saved")
 
     return {
