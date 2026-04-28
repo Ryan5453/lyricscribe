@@ -52,9 +52,18 @@ class NemoTranscriber(Transcriber):
         """
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Loading NeMo model: {self.model_name}")
-        self.model = nemo_asr.models.ASRModel.from_pretrained(
-            model_name=self.model_name
-        )
+        # ``from_pretrained`` only accepts HF-hub repo IDs; local
+        # ``.nemo`` checkpoints (e.g. our finetune outputs) must be
+        # loaded via ``restore_from``.
+        from pathlib import Path
+        if Path(self.model_name).is_file():
+            self.model = nemo_asr.models.ASRModel.restore_from(
+                restore_path=self.model_name
+            )
+        else:
+            self.model = nemo_asr.models.ASRModel.from_pretrained(
+                model_name=self.model_name
+            )
         self.is_multitask = isinstance(self.model, EncDecMultiTaskModel)
 
         # Disable CUDA graphs for RNNT/TDT models (e.g. Parakeet).

@@ -24,12 +24,30 @@ def _create_transcriber(model_name: str, batch_size: int) -> Transcriber:
 
     Whisper models use HuggingFace Transformers, all others use NeMo.
 
-    :param model_name: HuggingFace model identifier.
+    :param model_name: HuggingFace model identifier or path to local
+        checkpoint directory.
     :param batch_size: Batch size for inference.
     :return: An unloaded :class:`Transcriber` instance.
     """
     if "whisper" in model_name.lower():
         return WhisperTranscriber(model_name, batch_size)
+
+    # Local checkpoint dirs (e.g. finetune outputs) won't have "whisper" in
+    # their path. Fall back to reading the HF ``config.json`` and routing
+    # based on the architecture string so finetuned Whisper checkpoints
+    # don't get mis-dispatched to the NeMo loader.
+    ckpt_path = Path(model_name)
+    if ckpt_path.is_dir():
+        cfg_path = ckpt_path / "config.json"
+        if cfg_path.exists():
+            try:
+                with open(cfg_path) as f:
+                    cfg = json.load(f)
+                arch = (cfg.get("architectures") or [""])[0].lower()
+                if "whisper" in arch:
+                    return WhisperTranscriber(model_name, batch_size)
+            except Exception:
+                pass
 
     return NemoTranscriber(model_name, batch_size)
 

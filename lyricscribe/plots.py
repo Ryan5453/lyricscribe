@@ -423,6 +423,13 @@ def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
         & (~df["vad"])
         & (~df["chunked"])
     ]
+    # For Whisper the (no-VAD, no-chunked) filter matches both MIT and
+    # no-MIT rows. Keep only the no-MIT row so the per-model breakdown is
+    # comparable: NeMo models have no MIT toggle, so they're already at
+    # default decode. Whisper's repetition_penalty is "1.0" with no MIT
+    # and 1.7 with MIT (the column is "-" for NeMo).
+    is_whisper = baseline["model"].str.contains("whisper", case=False, na=False)
+    baseline = baseline[~is_whisper | (baseline["repetition_penalty"].astype(str) == "1.0")]
     agg = baseline.groupby("model")[
         ["insertions", "deletions", "substitutions"]
     ].sum()
@@ -542,6 +549,10 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
 
     # Filter to musdb_alt (only dataset with clean stems baseline)
     df = df[df["dataset"] == "musdb_alt"]
+    # Drop Whisper MIT rows so the cross-model comparison uses default
+    # decode for all three models (NeMo models have no MIT toggle).
+    is_whisper = df["model"].str.contains("whisper", case=False, na=False)
+    df = df[~is_whisper | (df["repetition_penalty"].astype(str) == "1.0")]
     df = df.drop_duplicates(subset=["model", "filename", "vad", "chunked"])
 
     ref_words = df["hits"] + df["substitutions"] + df["deletions"]

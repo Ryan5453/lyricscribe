@@ -94,13 +94,20 @@ class WhisperTranscriber(Transcriber):
             generate_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
 
         kwargs = {
-            # VAD also feeds the pipeline a list of <=30s segments, so it
-            # benefits from batching just like the chunked path. Without
-            # this, every VAD segment was decoded sequentially at bs=1.
-            "batch_size": self.batch_size if (use_chunked or use_vad) else 1,
+            # RMS-VAD pre-splits audio into <=30s segments
+            # (``merge_segments(max_length_s=30)``). Setting
+            # ``chunk_length_s`` routes those segments through the
+            # pipeline's chunking collator so bs>1 batches cleanly; without
+            # it the pipeline crashes on variable-length inputs at bs>1.
+            # Each segment is already <=30s so the internal chunker
+            # produces a single padded window per segment — no behavioral
+            # change vs. the explicit chunked path.
+            # Silero VAD is intentionally left at bs=1 to avoid changing
+            # its behavior vs. prior runs (it has no segment-length cap).
+            "batch_size": self.batch_size if (use_chunked or (use_vad and vad_method == "rms")) else 1,
             "generate_kwargs": generate_kwargs,
         }
-        if use_chunked:
+        if use_chunked or (use_vad and vad_method == "rms"):
             kwargs["chunk_length_s"] = 30
             kwargs["stride_length_s"] = (4, 2)
 
