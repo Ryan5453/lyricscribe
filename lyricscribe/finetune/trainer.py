@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import random
 import shutil
 import tempfile
 import types
@@ -92,6 +93,7 @@ import torchaudio
 from transformers import (
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerCallback,
     WhisperForConditionalGeneration,
     WhisperProcessor,
 )
@@ -391,6 +393,23 @@ def _count_manifest_lines(manifest_path: Path) -> int:
         return sum(1 for _ in f)
 
 
+def _sum_manifest_durations(manifest_path: Path) -> float:
+    """
+    Sum the ``duration`` field over a manifest JSONL file, in seconds.
+
+    :param manifest_path: Path to the manifest file.
+    :return: Total audio duration in seconds.
+    """
+    total = 0.0
+    with open(manifest_path) as f:
+        for line in f:
+            try:
+                total += float(json.loads(line).get("duration") or 0.0)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+    return total
+
+
 class NeMoTrainer:
     """
     Trainer for NeMo ASR models (Parakeet, Canary) using PyTorch Lightning.
@@ -541,14 +560,26 @@ class NeMoTrainer:
         cfg.optim.weight_decay = 0.01
         cfg.optim.sched.name = "CosineAnnealing"
 
-        num_train_samples = _count_manifest_lines(self.train_manifest)
-        batch_size = self.config.get("batch_size") or max(1, 600 // 180)
-        steps_per_epoch = math.ceil(num_train_samples / max(batch_size, 1))
+        steps_per_epoch = self._estimate_steps_per_epoch()
         total_steps = self.config["max_epochs"] * steps_per_epoch
 
         warmup_epochs = self.config.get("warmup_epochs", 5)
         cfg.optim.sched.warmup_steps = warmup_epochs * steps_per_epoch
         cfg.optim.sched.max_steps = total_steps
+
+    def _estimate_steps_per_epoch(self) -> int:
+        """
+        Estimate optimizer steps per epoch from the training manifest:
+        total duration / ``batch_duration`` for Canary's duration-based
+        Lhotse batching, sample count / ``batch_size`` otherwise.
+        """
+        if self.config["architecture"] == "canary":
+            total_duration = _sum_manifest_durations(self.train_manifest)
+            batch_duration = float(self.config.get("batch_duration") or 600.0)
+            return max(1, math.ceil(total_duration / batch_duration))
+        num_train_samples = _count_manifest_lines(self.train_manifest)
+        batch_size = int(self.config.get("batch_size") or 1)
+        return max(1, math.ceil(num_train_samples / max(batch_size, 1)))
 
     def train_one_epoch(self, target_epoch: int) -> dict:
         """
@@ -582,6 +613,18 @@ class NeMoTrainer:
                 filename="step-{step:08d}",
             )
 
+            # Epoch-boundary checkpoint so the next fit() resumes
+            # optimizer/scheduler state instead of restarting warmup.
+            # Must be its own ModelCheckpoint: save_on_train_epoch_end
+            # is a no-op on one that sets every_n_train_steps.
+            epoch_checkpoint = ModelCheckpoint(
+                dirpath=str(self._step_ckpt_dir),
+                every_n_epochs=1,
+                save_top_k=-1,
+                filename="step-{step:08d}",
+                save_on_train_epoch_end=True,
+            )
+
             # Both NeMo architectures can produce non-finite losses on rare
             # bad samples (Canary: bf16 attention overflow on long prompts;
             # Parakeet: bf16 RNNT logit overflow). Skip those batches
@@ -589,6 +632,7 @@ class NeMoTrainer:
             # subsequent step to NaN.
             callbacks = [
                 step_checkpoint,
+                epoch_checkpoint,
                 _SkipBadBatchCallback(),
                 _SkipNaNOrInfLossCallback(),
             ]
@@ -614,11 +658,8 @@ class NeMoTrainer:
 
             if uses_lhotse:
                 # Lhotse iterable datasets don't have __len__.
-                num_train_samples = _count_manifest_lines(self.train_manifest)
-                batch_size_est = self.config.get("batch_size") or max(1, 600 // 180)
-                steps_per_epoch = max(1, num_train_samples // max(batch_size_est, 1))
                 trainer_kwargs["use_distributed_sampler"] = False
-                trainer_kwargs["limit_train_batches"] = steps_per_epoch
+                trainer_kwargs["limit_train_batches"] = self._estimate_steps_per_epoch()
 
             self.trainer = pl.Trainer(**trainer_kwargs)
 
@@ -732,17 +773,65 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
     and tokenizes the transcript. Chunks are pre-sized during manifest
     creation to fit within Whisper's 448-token decoder limit.
 
+    Labels follow Whisper's dual-mode format: with probability
+    ``timestamp_prob`` (when the entry carries ``segments``) the label is
+    built in timestamp mode, otherwise in ``<|notimestamps|>`` mode.
+    Training only one mode unlearns the other; long-form (>30s) decoding
+    requires timestamps.
+
     :param manifest_path: Path to the JSONL manifest file.
     :param processor: A ``WhisperProcessor`` instance for feature extraction
         and tokenization.
+    :param timestamp_prob: Probability of building a timestamp-mode label
+        for entries that have ``segments``. Use 0.0 for eval datasets.
     """
 
-    def __init__(self, manifest_path: Path, processor: WhisperProcessor):
+    # Whisper's decoder context cap.
+    MAX_LABEL_TOKENS = 448
+    TIME_PRECISION = 0.02  # seconds per timestamp token step
+
+    def __init__(
+        self,
+        manifest_path: Path,
+        processor: WhisperProcessor,
+        timestamp_prob: float = 0.0,
+    ):
         self.processor = processor
+        self.timestamp_prob = timestamp_prob
         self.entries = []
         with open(manifest_path) as f:
             for line in f:
                 self.entries.append(json.loads(line))
+        tokenizer = processor.tokenizer
+        self._notimestamps_id = tokenizer.convert_tokens_to_ids("<|notimestamps|>")
+        self._timestamp_begin = self._notimestamps_id + 1
+        # <|0.00|> .. <|30.00|> — 1501 tokens at 0.02s resolution.
+        self._max_timestamp_index = 1500
+
+    def _timestamp_token(self, seconds: float) -> int:
+        idx = round(seconds / self.TIME_PRECISION)
+        return self._timestamp_begin + max(0, min(self._max_timestamp_index, idx))
+
+    def _build_timestamp_labels(self, entry: dict) -> list[int] | None:
+        """
+        Build timestamp-mode label ids from the entry's ``segments``.
+        Returns ``None`` if the result exceeds the decoder cap.
+        """
+        tokenizer = self.processor.tokenizer
+        # [<|sot|>, <|lang|>, <|transcribe|>] — no <|notimestamps|>.
+        ids = list(tokenizer.prefix_tokens)
+        prev_end = 0.0
+        for start_s, end_s, seg_text in entry["segments"]:
+            start_s = max(float(start_s), prev_end)
+            end_s = max(float(end_s), start_s)
+            ids.append(self._timestamp_token(start_s))
+            ids.extend(tokenizer(seg_text, add_special_tokens=False).input_ids)
+            ids.append(self._timestamp_token(end_s))
+            prev_end = end_s
+        ids.append(tokenizer.eos_token_id)
+        if len(ids) > self.MAX_LABEL_TOKENS:
+            return None
+        return ids
 
     def __len__(self) -> int:
         """
@@ -819,11 +908,26 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         # with the correct <|lang|><|transcribe|> prefix Whisper expects.
         # Each DataLoader worker has its own dataset/processor copy and
         # __getitem__ runs sequentially within a worker, so mutating the
-        # tokenizer state here is safe.
-        self.processor.tokenizer.set_prefix_tokens(
-            language=entry["language"], task="transcribe"
+        # tokenizer state here is safe. ``predict_timestamps`` must be set
+        # explicitly on every call because it persists on the tokenizer.
+        labels = None
+        use_timestamps = (
+            self.timestamp_prob > 0
+            and entry.get("segments")
+            and random.random() < self.timestamp_prob
         )
-        labels = self.processor.tokenizer(entry["text"]).input_ids
+        if use_timestamps:
+            self.processor.tokenizer.set_prefix_tokens(
+                language=entry["language"], task="transcribe",
+                predict_timestamps=True,
+            )
+            labels = self._build_timestamp_labels(entry)
+        if labels is None:
+            self.processor.tokenizer.set_prefix_tokens(
+                language=entry["language"], task="transcribe",
+                predict_timestamps=False,
+            )
+            labels = self.processor.tokenizer(entry["text"]).input_ids
 
         return {"input_features": input_features, "labels": labels}
 
@@ -865,24 +969,55 @@ class WhisperDataCollator:
             label_features, return_tensors="pt"
         )
 
+        label_ids = labels_batch["input_ids"]
+        attention_mask = labels_batch.attention_mask
+
+        # Labels already start with <|startoftranscript|> and
+        # shift_tokens_right prepends it again; strip it so decoder
+        # inputs match generation's [SOT, lang, ...] seeding.
+        if (label_ids[:, 0] == self.decoder_start_token_id).all():
+            label_ids = label_ids[:, 1:]
+            attention_mask = attention_mask[:, 1:]
+
         # Compute decoder_input_ids before -100 masking so teacher-forcing
         # inputs are actual token ids. HF's Trainer pops ``labels`` before
         # the model forward when label_smoothing_factor > 0, so Whisper's
         # built-in labels -> decoder_input_ids shift never runs and forward
         # crashes. Pre-computing here makes the batch self-sufficient.
         decoder_input_ids = shift_tokens_right(
-            labels_batch["input_ids"],
+            label_ids,
             self.pad_token_id,
             self.decoder_start_token_id,
         )
 
-        labels = labels_batch["input_ids"].masked_fill(
-            labels_batch.attention_mask.ne(1), -100
-        )
+        labels = label_ids.masked_fill(attention_mask.ne(1), -100)
 
         batch["labels"] = labels
         batch["decoder_input_ids"] = decoder_input_ids
         return batch
+
+
+class _StopAndSaveAfterEpochCallback(TrainerCallback):
+    """
+    Stop training (and save a checkpoint) once ``target_epoch`` epochs
+    are complete. Keeping ``num_train_epochs`` at ``max_epochs`` lets
+    the LR schedule span the whole run; the save gives the next
+    ``train()`` call an epoch-boundary checkpoint to resume
+    optimizer/scheduler state from.
+    """
+
+    def __init__(self):
+        self.target_epoch: int | None = None
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if (
+            self.target_epoch is not None
+            and state.epoch is not None
+            and state.epoch >= self.target_epoch - 1e-3
+        ):
+            control.should_save = True
+            control.should_training_stop = True
+        return control
 
 
 class WhisperTrainer:
@@ -980,15 +1115,22 @@ class WhisperTrainer:
         :return: Dict of metrics (train loss, eval WER if validation set
             is available).
         """
-        train_dataset = WhisperFinetuneDataset(self.train_manifest, self.processor)
+        train_dataset = WhisperFinetuneDataset(
+            self.train_manifest,
+            self.processor,
+            timestamp_prob=self.config.get("whisper_timestamp_prob", 0.5),
+        )
         eval_dataset = None
         if self.val_manifest:
             # The val manifest passed in here is the fixed-size subset
             # materialized at setup time (``val_subset_manifest.jsonl``),
             # so we don't re-subset in Python. That keeps this eval pool
             # identical to what NeMo sees. Full-corpus eval runs
-            # separately via the inference harness.
-            eval_dataset = WhisperFinetuneDataset(self.val_manifest, self.processor)
+            # separately via the inference harness. Timestamp mode is
+            # disabled for eval so in-loop WER is deterministic.
+            eval_dataset = WhisperFinetuneDataset(
+                self.val_manifest, self.processor, timestamp_prob=0.0
+            )
 
         job_dir = Path(self.config["output_dir"]) / self.config["exp_name"]
 
@@ -1054,6 +1196,7 @@ class WhisperTrainer:
                 torch_compile=self.config.get("torch_compile", False),
             )
 
+            self._stop_callback = _StopAndSaveAfterEpochCallback()
             self.hf_trainer = Seq2SeqTrainer(
                 model=self.model,
                 args=training_args,
@@ -1066,6 +1209,7 @@ class WhisperTrainer:
                     pad_token_id=self.model.config.pad_token_id,
                 ),
                 tokenizer=self.processor,
+                callbacks=[self._stop_callback],
             )
 
         else:
@@ -1073,7 +1217,9 @@ class WhisperTrainer:
             if eval_dataset is not None:
                 self.hf_trainer.eval_dataset = eval_dataset
 
-        self.hf_trainer.args.num_train_epochs = target_epoch
+        # num_train_epochs stays at max_epochs (full-run LR schedule);
+        # the callback stops training once target_epoch is reached.
+        self._stop_callback.target_epoch = target_epoch
 
         # Resume from the latest *complete* HF step checkpoint if one
         # exists. Incomplete checkpoints (from SLURM-killed mid-save) are
@@ -1120,7 +1266,11 @@ class WhisperTrainer:
 
         :param n: Number of training steps to run.
         """
-        train_dataset = WhisperFinetuneDataset(self.train_manifest, self.processor)
+        train_dataset = WhisperFinetuneDataset(
+            self.train_manifest,
+            self.processor,
+            timestamp_prob=self.config.get("whisper_timestamp_prob", 0.5),
+        )
 
         tmp_dir = tempfile.mkdtemp(prefix="lyricscribe_probe_whisper_")
         try:

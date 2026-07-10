@@ -1,3 +1,4 @@
+import difflib
 import json
 import logging
 import os
@@ -74,6 +75,47 @@ def _parse_mfa_json(json_path: Path) -> list[dict]:
             if label not in _SILENCE_LABELS:
                 words.append({"word": label, "start": start, "end": end})
     return words
+
+
+def _display_word_map(orig_text: str) -> tuple[list[str], list[str]]:
+    """
+    Parallel (cleaned_word, display_word) sequences for one line:
+    ``cleaned`` is what MFA saw, ``display`` the original token. Tokens
+    the cleaner drops or splits keep their cleaned form.
+    """
+    cleaned_seq: list[str] = []
+    display_seq: list[str] = []
+    for orig in orig_text.split():
+        cleaned = _clean_lyrics(orig).split()
+        if len(cleaned) == 1:
+            cleaned_seq.append(cleaned[0])
+            display_seq.append(orig)
+        else:
+            cleaned_seq.extend(cleaned)
+            display_seq.extend(cleaned)
+    return cleaned_seq, display_seq
+
+
+def _recase_segment_words(words: list[dict], orig_text: str) -> list[dict]:
+    """
+    Map MFA's cleaned words back to their original cased/punctuated
+    forms from the source line. Positional when counts match (also
+    recovers ``<unk>``), sequence-matched otherwise; unmatched words
+    keep the cleaned form.
+    """
+    cleaned_seq, display_seq = _display_word_map(orig_text)
+    out = [dict(w) for w in words]
+    if len(out) == len(cleaned_seq):
+        for w, display in zip(out, display_seq):
+            w["word"] = display
+        return out
+    matcher = difflib.SequenceMatcher(
+        a=[w["word"] for w in out], b=cleaned_seq, autojunk=False
+    )
+    for block in matcher.get_matching_blocks():
+        for k in range(block.size):
+            out[block.a + k]["word"] = display_seq[block.b + k]
+    return out
 
 
 def _find_container_runtime() -> str:
@@ -336,9 +378,11 @@ def _run_mfa_pass(
                     sample_rate,
                 )
                 (corpus_dir / f"{utterance_id}.lab").write_text(segment["text"])
+                raw_line = lyrics_data["synced"]["data"][segment["index"]]
                 segment_index[utterance_id] = {
                     "song_id": name,
                     "offset_s": start_s,
+                    "orig_text": str(raw_line.get("text", "")),
                 }
                 prepared_segments += 1
 
@@ -395,6 +439,7 @@ def _run_mfa_pass(
 
             words = _parse_mfa_json(json_path)
             mapping = segment_index[utterance_id]
+            words = _recase_segment_words(words, mapping.get("orig_text", ""))
             song_id = mapping["song_id"]
             offset_s = mapping["offset_s"]
             song_words.setdefault(song_id, []).extend(

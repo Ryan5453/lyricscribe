@@ -12,7 +12,7 @@
 # ``alignment`` field). No separate alignments/ directory.
 #
 # Usage:
-#   sbatch --array=0-49 scripts/slurm_align.sh <dataset_dir> <filename> [num_chunks]
+#   sbatch --array=0-49 scripts/slurm_align.sh <dataset_dir> <filename> [num_chunks] [extra_flags]
 #
 # Example:
 #   sbatch --array=0-49 scripts/slurm_align.sh \
@@ -29,6 +29,9 @@
 #   ``lyricscribe dataset align`` skips songs whose lyrics.json already has
 #   a non-null ``alignment`` field, so rerunning the array reprocesses only
 #   failures and gaps.
+#
+# Force full re-alignment:
+#   sbatch --array=0-49 scripts/slurm_align.sh <dataset_dir> <filename> 50 --no-skip-existing
 
 set -euo pipefail
 
@@ -41,6 +44,7 @@ fi
 DATASET_DIR="$1"
 FILENAME="$2"
 NUM_CHUNKS="${3:-${SLURM_ARRAY_TASK_COUNT:-50}}"
+EXTRA_FLAGS="${4:-}"
 
 CHUNK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 
@@ -66,7 +70,8 @@ lyricscribe dataset align \
     --container /projects/fahey.rya/music2text/mfa.sif \
     --mfa-root /projects/fahey.rya/music2text/mfa_cache \
     --num-chunks "$NUM_CHUNKS" \
-    --chunk-id "$CHUNK_ID"
+    --chunk-id "$CHUNK_ID" \
+    $EXTRA_FLAGS
 
 echo "=== Done chunk ${CHUNK_ID}/${NUM_CHUNKS} ==="
 date

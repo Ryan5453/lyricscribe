@@ -636,6 +636,16 @@ def finetune_setup(
         "--line-overlap-threshold",
         help="Minimum fraction of a synced line's duration that must fall inside a window for its text to be included in that window's label. Guards against partial-audio hallucination and deletion bias.",
     ),
+    whisper_timestamp_prob: float = typer.Option(
+        None,
+        "--whisper-timestamp-prob",
+        help="Whisper only: fraction of samples trained with timestamp labels (0 breaks >30s long-form decoding).",
+    ),
+    dedup_max_run: int = typer.Option(
+        0,
+        "--dedup-max-run",
+        help="Cap runs of consecutive identical words in labels (0 = off).",
+    ),
 ):
     """
     Setup a finetuning experiment with epoch-level checkpointing.
@@ -660,6 +670,8 @@ def finetune_setup(
             "batch_duration": batch_duration,
             "freeze_encoder": freeze_encoder if freeze_encoder else None,
             "eval_subset_size": eval_subset_size,
+            "whisper_timestamp_prob": whisper_timestamp_prob,
+            "dedup_max_run": dedup_max_run if dedup_max_run else None,
         }.items()
         if v is not None
     }
@@ -704,6 +716,7 @@ def finetune_setup(
         model_name=config['base_model'],
         windows_per_song_multiplier=windows_per_song,
         line_overlap_threshold=line_overlap_threshold,
+        dedup_max_run=config.get("dedup_max_run", 0),
     )
     logger.info(f"Training: {n_train} chunks (synced-line segments)")
 
@@ -723,6 +736,7 @@ def finetune_setup(
             model_name=config['base_model'],
             windows_per_song_multiplier=1,
             line_overlap_threshold=line_overlap_threshold,
+            dedup_max_run=config.get("dedup_max_run", 0),
         )
         logger.info(f"Validation: {n_val} chunks")
 

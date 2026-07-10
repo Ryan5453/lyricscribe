@@ -91,6 +91,11 @@ def create_finetune_config(
         "batch_duration": kwargs.get("batch_duration", 1440),
         "freeze_encoder": kwargs.get("freeze_encoder", False),
         "eval_subset_size": kwargs.get("eval_subset_size", 200),
+        # Fraction of Whisper samples trained with timestamp labels.
+        # 0 unlearns timestamps and breaks >30s long-form decoding.
+        "whisper_timestamp_prob": kwargs.get("whisper_timestamp_prob", 0.5),
+        # Cap on consecutive identical label words (0 = off).
+        "dedup_max_run": kwargs.get("dedup_max_run", 0),
         "current_epoch": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }

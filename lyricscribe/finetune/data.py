@@ -13,6 +13,30 @@ logger = logging.getLogger(__name__)
 _RNG = random.Random(42)
 
 
+def _window_has_vocals(
+    synced: list[dict], window_start_ms: float, window_end_ms: float
+) -> bool:
+    """
+    True if any non-empty synced line has most of its duration inside
+    the window.
+    """
+    for line in synced:
+        if not line.get("text", "").strip():
+            continue
+        line_start = line.get("start", 0)
+        line_dur = line.get("duration", 0)
+        if line_dur <= 0:
+            if window_start_ms <= line_start < window_end_ms:
+                return True
+            continue
+        overlap = min(line_start + line_dur, window_end_ms) - max(
+            line_start, window_start_ms
+        )
+        if overlap > 0.5 * line_dur:
+            return True
+    return False
+
+
 class LyricsDataset:
     """
     Dataset that iterates over song directories, yielding audio paths
@@ -104,6 +128,7 @@ def create_manifest(
     max_tokens: int = 440,
     windows_per_song_multiplier: int = 1,
     line_overlap_threshold: float = 0.7,
+    dedup_max_run: int = 0,
 ) -> int:
     """
     Create a manifest JSONL by sampling random fixed-length audio windows
@@ -141,12 +166,11 @@ def create_manifest(
     :param max_tokens: Whisper decoder token cap. Only applied when
         ``architecture == "whisper"``.
     :param windows_per_song_multiplier: Multiplier on the base
-        ``ceil(song_duration / window_seconds)`` window count. Default 3
-        gives ~3 random windows per ``window_seconds`` of song, which
-        approximates per-epoch randomization over a ~3-epoch run
+        ``ceil(song_duration / window_seconds)`` window count. Default 1
+        gives ~1 random window per ``window_seconds`` of song. Raising
+        it toward the epoch count approximates per-epoch randomization
         (the model sees different slices of each song within the
-        manifest, just in shuffled order across epochs). For longer
-        runs, raise proportionally.
+        manifest, just in shuffled order across epochs).
     :param line_overlap_threshold: Minimum fraction of a synced line's
         duration that must fall inside a window for that line to be
         kept as part of the window's label. Used only when a song has
@@ -156,13 +180,20 @@ def create_manifest(
         audible vocals that have no text label (deletion bias).
         Default 0.7 means we keep a line only if at least 70% of its
         duration is inside the window.
+    :param dedup_max_run: If > 0, cap runs of consecutive identical
+        words in the label at this length. Off by default — capping
+        measurably hurt WER.
 
     When a song's ``lyrics.json`` carries an ``alignment`` field (from
     ``lyricscribe dataset align``), word-level MFA times are used
     directly: a word is kept only if its full ``[start, start+duration]``
-    falls inside the window. This replaces the line-level overlap
-    heuristic with per-word precision, eliminating partial-word
-    supervision at window boundaries.
+    falls inside the window. Windows with vocals (per synced lines) but
+    no aligned words are skipped — the gap is an alignment failure, not
+    silence.
+
+    For Whisper, each entry also carries ``segments``
+    (``[start_s, end_s, text]`` relative to window start) for
+    timestamp-mode labels.
 
     :return: Number of manifest entries written.
     """
@@ -183,6 +214,7 @@ def create_manifest(
     skipped_no_sync = 0
     skipped_too_short = 0
     skipped_too_long = 0
+    skipped_mfa_gap = 0
     total = len(dataset)
 
     with open(output_path, "w") as f:
@@ -240,15 +272,40 @@ def create_manifest(
                     window_start_ms = offset * 1000
                     window_end_ms = window_start_ms + window_ms
 
+                    # (start_ms, end_ms, [words]) segments; joined words
+                    # form the text label.
+                    segments_raw: list[list] = []
                     if aligned_words is not None:
                         kept = [
                             w for w in aligned_words
                             if w["start"] >= window_start_ms
                             and w["start"] + w["duration"] <= window_end_ms
                         ]
-                        raw_words = [w["word"] for w in kept]
+                        # Split into segments at pauses >1s.
+                        for w in kept:
+                            w_start = w["start"]
+                            w_end = w["start"] + w["duration"]
+                            if (
+                                segments_raw
+                                and w_start - segments_raw[-1][1] <= 1000
+                            ):
+                                segments_raw[-1][1] = max(
+                                    segments_raw[-1][1], w_end
+                                )
+                                segments_raw[-1][2].append(w["word"])
+                            else:
+                                segments_raw.append(
+                                    [w_start, w_end, [w["word"]]]
+                                )
+
+                        # Vocals present but no aligned words: alignment
+                        # gap, skip.
+                        if not segments_raw and _window_has_vocals(
+                            synced, window_start_ms, window_end_ms
+                        ):
+                            skipped_mfa_gap += 1
+                            continue
                     else:
-                        lines_in_window = []
                         for line in synced:
                             if not line.get("text", "").strip():
                                 continue
@@ -256,39 +313,42 @@ def create_manifest(
                             line_dur = line.get("duration", 0)
                             if line_dur <= 0:
                                 if window_start_ms <= line_start < window_end_ms:
-                                    lines_in_window.append(line)
+                                    segments_raw.append(
+                                        [line_start, line_start,
+                                         line["text"].strip().split()]
+                                    )
                                 continue
                             line_end = line_start + line_dur
                             overlap_start = max(line_start, window_start_ms)
                             overlap_end = min(line_end, window_end_ms)
                             overlap = max(0, overlap_end - overlap_start)
                             if overlap / line_dur >= line_overlap_threshold:
-                                lines_in_window.append(line)
-                        joined = " ".join(
-                            line["text"].strip() for line in lines_in_window
-                        ).strip()
-                        raw_words = joined.split()
+                                segments_raw.append(
+                                    [max(line_start, window_start_ms),
+                                     min(line_end, window_end_ms),
+                                     line["text"].strip().split()]
+                                )
 
-                    # Providers ship chorus vocalisations as one synced line
-                    # per beat ("la la la, la la la" × 14 consecutive lines
-                    # for a 30s chorus). MFA faithfully aligns each, producing
-                    # 50-80-run sequences of identical words. Whisper's
-                    # cross-entropy loss on those targets teaches the decoder
-                    # that arbitrarily long token repetition is valid — which
-                    # generalises at inference to "i i i i..." collapse even
-                    # on non-chorus audio. Cap runs at 2 to keep legitimate
-                    # doublings ("yeah yeah") while killing the pathology.
-                    deduped_words: list[str] = []
-                    for w in raw_words:
-                        wl = w.lower()
-                        if (
-                            len(deduped_words) >= 2
-                            and deduped_words[-1].lower() == wl
-                            and deduped_words[-2].lower() == wl
-                        ):
-                            continue
-                        deduped_words.append(w)
-                    text = " ".join(deduped_words).strip()
+                    if dedup_max_run > 0:
+                        for seg in segments_raw:
+                            deduped: list[str] = []
+                            for w in seg[2]:
+                                wl = w.lower()
+                                if (
+                                    len(deduped) >= dedup_max_run
+                                    and all(
+                                        d.lower() == wl
+                                        for d in deduped[-dedup_max_run:]
+                                    )
+                                ):
+                                    continue
+                                deduped.append(w)
+                            seg[2] = deduped
+
+                    segments_raw = [s for s in segments_raw if s[2]]
+                    text = " ".join(
+                        w for seg in segments_raw for w in seg[2]
+                    ).strip()
 
                     if tokenizer is not None and text:
                         token_count = len(tokenizer(text).input_ids)
@@ -309,15 +369,25 @@ def create_manifest(
                         "text": text,
                         "language": detected_language,
                     }
+                    if architecture == "whisper" and segments_raw:
+                        # Window-relative seconds, clamped and monotonic.
+                        segs = []
+                        prev_end = 0.0
+                        for s_ms, e_ms, words in segments_raw:
+                            s = min(max((s_ms - window_start_ms) / 1000.0, prev_end), duration)
+                            e = min(max((e_ms - window_start_ms) / 1000.0, s), duration)
+                            segs.append([round(s, 3), round(e, 3), " ".join(words)])
+                            prev_end = e
+                        entry["segments"] = segs
                     if architecture == "canary":
                         entry["answer"] = text
                         entry["source_lang"] = detected_language
                         entry["target_lang"] = detected_language
-                        # Ground-truth lyrics keep punctuation and capitalization,
-                        # so tell Canary's prompt to predict them too. With
-                        # pnc="no" Canary's tokenizer would strip them from
-                        # the target, creating a train/infer distribution gap.
-                        entry["pnc"] = "yes"
+                        # pnc must reflect the target's actual style.
+                        has_style = any(c.isupper() for c in text) or any(
+                            c in text for c in ".,!?;:"
+                        )
+                        entry["pnc"] = "yes" if has_style else "no"
 
                     f.write(json.dumps(entry) + "\n")
                     count += 1
@@ -330,7 +400,8 @@ def create_manifest(
         f"Created manifest with {count} windows "
         f"({skipped_no_sync} songs skipped for missing synced lyrics, "
         f"{skipped_too_short} songs skipped for being too short, "
-        f"{skipped_too_long} windows dropped for exceeding {max_tokens} tokens)"
+        f"{skipped_too_long} windows dropped for exceeding {max_tokens} tokens, "
+        f"{skipped_mfa_gap} windows dropped for MFA alignment gaps over vocals)"
     )
     return count
 

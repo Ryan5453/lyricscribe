@@ -25,7 +25,9 @@ class AlignedWord(BaseModel):
     for consistency — callers that want word ``end`` can compute
     ``start + duration``.
 
-    :param word: Word text (lowercased, punctuation-stripped by MFA).
+    :param word: Word text in its original cased/punctuated form,
+        recovered from the synced line at alignment write-back. Consumers
+        that need a normalized form should lowercase/clean at the use site.
     :param start: Start time in milliseconds.
     :param duration: Duration in milliseconds.
     """
