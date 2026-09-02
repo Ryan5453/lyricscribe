@@ -1208,7 +1208,7 @@ class WhisperTrainer:
                     decoder_start_token_id=self.model.config.decoder_start_token_id,
                     pad_token_id=self.model.config.pad_token_id,
                 ),
-                tokenizer=self.processor,
+                processing_class=self.processor,
                 callbacks=[self._stop_callback],
             )
 
@@ -1305,7 +1305,7 @@ class WhisperTrainer:
                     decoder_start_token_id=self.model.config.decoder_start_token_id,
                     pad_token_id=self.model.config.pad_token_id,
                 ),
-                tokenizer=self.processor,
+                processing_class=self.processor,
             )
             hf_trainer.train()
         finally:
