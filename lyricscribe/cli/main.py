@@ -7,7 +7,7 @@ from pathlib import Path
 import typer
 
 # Lightweight imports only — heavy modules (torch, transformers, nemo,
-# demucs, librosa) are imported lazily inside the commands that need them
+# unblend, librosa) are imported lazily inside the commands that need them
 # so the CLI starts in well under a second for status/retry/inspect.
 from lyricscribe.finetune import jobs as finetune_jobs
 from lyricscribe.finetune.config import (
@@ -33,6 +33,12 @@ artifacts_app = typer.Typer(help = "Artifacts feature extraction commands")
 cli.add_typer(artifacts_app, name="artifacts")
 finetune_app = typer.Typer(help="Model finetuning commands")
 cli.add_typer(finetune_app, name="finetune")
+
+from lyricscribe.cli.analyze import analyze_app  # noqa: E402
+from lyricscribe.cli.ensemble import ensemble_app  # noqa: E402
+
+cli.add_typer(ensemble_app, name="ensemble")
+cli.add_typer(analyze_app, name="analyze")
 
 
 def _collect_result_files(
@@ -90,31 +96,61 @@ def separate_setup(
         "--filename",
         help="Audio filename to process within each subdirectory (e.g. mix.wav)",
     ),
-    model: str = typer.Option("htdemucs", "--model", help="Demucs model to use"),
+    model: str = typer.Option(
+        "htdemucs",
+        "--model",
+        help="Unblend model name (see `unblend models list`). Custom "
+        "checkpoints such as unwa Kim-FT2 are added with `unblend models "
+        "import`.",
+    ),
     chunks: int = typer.Option(
         5,
         "--chunks",
         min=1,
-        help="Number of chunks to split into",
+        help="Number of chunks to split into.",
     ),
     stem: str | None = typer.Option(
         None,
         "--stem",
         help="Which stem to isolate (vocals, drums, bass, other). If not specified, all stems are saved.",
     ),
+    output_filename: str | None = typer.Option(
+        None,
+        "--output-filename",
+        help="Output filename for the isolated stem (default "
+             "{model}_{stem}.wav), e.g. vocals.wav.",
+    ),
+    shifts: int = typer.Option(
+        1, "--shifts", min=0, max=20,
+        help="Random time-shift passes to average (0 = deterministic).",
+    ),
+    split_overlap: float = typer.Option(
+        0.25, "--split-overlap",
+        help="Overlap between consecutive model segments, in [0, 1).",
+    ),
+    seed: int = typer.Option(0, "--seed", help="Seed for the shift offsets."),
+    dtype: str = typer.Option(
+        "auto", "--dtype",
+        help="Compute precision: auto (FP16 on CUDA), float32, float16, bfloat16.",
+    ),
 ):
     """
     Initialize separation job by registering files into chunks.
     """
-    from lyricscribe import demucs
+    from lyricscribe import unblend
 
-    demucs.setup_job(
+    unblend.setup_job(
         directories=directories,
         job_dir=job_dir,
         filename=filename,
         model=model,
         num_chunks=chunks,
         stem=stem,
+        output_filename=output_filename,
+        shifts=shifts,
+        split_overlap=split_overlap,
+        seed=seed,
+        dtype=dtype,
     )
 
 
@@ -128,9 +164,9 @@ def separate_run(
     """
     Process one chunk of the separation job.
     """
-    from lyricscribe import demucs
+    from lyricscribe import unblend
 
-    demucs.process_chunk(job_dir=job_dir, chunk_id=chunk_id)
+    unblend.process_chunk(job_dir=job_dir, chunk_id=chunk_id)
 
 
 @separate_app.command("inspect")
@@ -158,9 +194,9 @@ def separate_reset(
 
     Deletes separated output files and resets all chunk statuses to pending.
     """
-    from lyricscribe import demucs
+    from lyricscribe import unblend
 
-    demucs.reset_job(job_dir)
+    unblend.reset_job(job_dir)
 
 
 @transcribe_app.command("setup")
@@ -224,9 +260,11 @@ def transcribe_setup(
     no_repeat_ngram_size: int = typer.Option(
         0,
         "--no-repeat-ngram-size",
-        help="Whisper decoder ``no_repeat_ngram_size``. ``0`` disables. "
-             "Recommended ``5`` to ban repeating 5-grams (gentle on real "
-             "chorus repetition). Whisper-only.",
+        help="Decoder ``no_repeat_ngram_size``. ``0`` disables. Applies to "
+             "Whisper, Canary, Qwen3-ASR and the audio-LLMs; ignored by "
+             "Parakeet. Typical values: 20 for Whisper, 10 for Qwen3-ASR / "
+             "Voxtral, 5 for Music Flamingo; for Qwen3-Omni use 0 with "
+             "--deloop-max-run 5.",
     ),
     mit: bool = typer.Option(
         False,
@@ -234,6 +272,73 @@ def transcribe_setup(
         help="Shortcut: enable both ``--repetition-penalty 1.7`` and "
              "``--no-repeat-ngram-size 5`` together. Overrides explicit "
              "values for those two flags.",
+    ),
+    num_beams: int = typer.Option(
+        5,
+        "--num-beams",
+        min=1,
+        help="Whisper beam width (default 5, matching the HF ASR pipeline); "
+             "1 is greedy. Whisper-only.",
+    ),
+    condition_on_prev: bool = typer.Option(
+        True,
+        "--condition-on-prev/--no-condition-on-prev",
+        help="Whisper long-form ``condition_on_prev_tokens``. Only affects "
+             "the sequential (non-chunked) path. Whisper-only.",
+    ),
+    temperature_fallback: bool = typer.Option(
+        False,
+        "--temperature-fallback",
+        help="Whisper temperature fallback (0.0..1.0) gated by the "
+             "compression-ratio / logprob thresholds. Only affects the "
+             "sequential (non-chunked) path. Whisper-only.",
+    ),
+    compression_ratio_threshold: float | None = typer.Option(
+        None, "--compression-ratio-threshold",
+        help="Fallback trigger (default 2.4 with --temperature-fallback).",
+    ),
+    logprob_threshold: float | None = typer.Option(
+        None, "--logprob-threshold",
+        help="Fallback trigger (default -1.0 with --temperature-fallback).",
+    ),
+    prompt_from_dirname: bool = typer.Option(
+        False,
+        "--prompt-from-dirname",
+        help="Derive a per-song prompt from the song directory name "
+             "(``A_-_B``; no artist/title order is assumed): Whisper's "
+             "decoder prompt, or Qwen3-ASR's context. Ignored by other "
+             "backends.",
+    ),
+    backend: str | None = typer.Option(
+        None,
+        "--backend",
+        help="Force the backend: whisper, nemo, qwen3_asr, qwen3_omni, "
+             "voxtral, musicflamingo, gemini. Default: detected from the "
+             "model id / checkpoint config.json.",
+    ),
+    max_new_tokens: int | None = typer.Option(
+        None,
+        "--max-new-tokens",
+        help="Per-chunk generation cap for LLM-decoder backends (Qwen3-ASR, "
+             "audio-LLMs). Default 1024.",
+    ),
+    adapter: str | None = typer.Option(
+        None,
+        "--adapter",
+        help="PEFT LoRA adapter dir merged into the Qwen3-Omni thinker.",
+    ),
+    auto_language: bool = typer.Option(
+        False,
+        "--auto-language",
+        help="Qwen3-ASR: don't force the --lyrics-file language; let the "
+             "model identify it (qwen-asr's default).",
+    ),
+    deloop_max_run: int | None = typer.Option(
+        None,
+        "--deloop-max-run",
+        min=1,
+        help="Post-hoc repair: collapse any <=25-word cycle repeated more "
+             "than this many times. Raw text is kept as transcription_raw.",
     ),
 ):
     """
@@ -274,6 +379,17 @@ def transcribe_setup(
         vad_method=vad_method,
         repetition_penalty=repetition_penalty,
         no_repeat_ngram_size=no_repeat_ngram_size,
+        num_beams=num_beams,
+        condition_on_prev=condition_on_prev,
+        temperature_fallback=temperature_fallback,
+        compression_ratio_threshold=compression_ratio_threshold,
+        logprob_threshold=logprob_threshold,
+        prompt_from_dirname=prompt_from_dirname,
+        backend=backend,
+        max_new_tokens=max_new_tokens,
+        adapter=adapter,
+        auto_language=auto_language,
+        deloop_max_run=deloop_max_run,
     )
 
 
@@ -646,6 +762,93 @@ def finetune_setup(
         "--dedup-max-run",
         help="Cap runs of consecutive identical words in labels (0 = off).",
     ),
+    max_unlabeled_vocal_frac: float = typer.Option(
+        None,
+        "--max-unlabeled-vocal-frac",
+        help="Reject windows where more than this fraction of sung time "
+             "(synced-line spans) has no label text; offsets are re-drawn "
+             "up to 8 times per window. Counters the deletion bias learned "
+             "from labels that drop boundary words/lines. Recommended 0.2. "
+             "Unset = off.",
+    ),
+    ref_selfwer_file: Path = typer.Option(
+        None,
+        "--ref-selfwer-file",
+        help="Per-song reference self-WER artifact (JSONL with song_id + "
+             "self_wer, from `lyricscribe analyze selfwer`). Used with "
+             "--max-ref-self-wer to skip songs whose unsynced/synced "
+             "references disagree heavily. Datasets are never modified.",
+    ),
+    max_ref_self_wer: float = typer.Option(
+        None,
+        "--max-ref-self-wer",
+        help="Skip songs whose reference self-WER exceeds this value "
+             "(requires --ref-selfwer-file). Recommended 0.3. Songs absent "
+             "from the artifact (or with no self-WER) are kept.",
+    ),
+    no_mfa_alignment: bool = typer.Option(
+        False,
+        "--no-mfa-alignment",
+        help="Ignore MFA word alignments and build labels from synced "
+             "lines only (human word order, line-level timing).",
+    ),
+    audio_domain_mode: str = typer.Option(
+        None,
+        "--audio-domain-mode",
+        help="Post-pass over the manifests when several --filename values "
+             "are given. 'balanced': each song wholly uses the first "
+             "filename or the rest (first existing), 50/50 by window count "
+             "(e.g. --filename vocals.wav --filename audio.wav --filename "
+             "audio.mp3). 'fallback': every "
+             "song uses the first existing of the 2nd..Nth filenames. Unset "
+             "= a random available file per song.",
+    ),
+    manifests_from: Path = typer.Option(
+        None,
+        "--manifests-from",
+        help="Copy train/val/val-subset manifests from an existing "
+             "experiment instead of generating them (manifests are "
+             "model-agnostic). Manifest-construction flags are then ignored.",
+    ),
+    max_train_windows: int = typer.Option(
+        None,
+        "--max-train-windows",
+        min=1,
+        help="Train on a seeded random subset of this many windows. "
+             "Unset = the architecture default (Qwen3-Omni: 20000; others: "
+             "every window). Use --all-train-windows to train on every window.",
+    ),
+    all_train_windows: bool = typer.Option(
+        False,
+        "--all-train-windows",
+        help="Train on every manifest window even where the architecture "
+             "default is a subset.",
+    ),
+    train_window_seed: int = typer.Option(
+        0, "--train-window-seed", help="Seed for --max-train-windows sampling.",
+    ),
+    grad_accum: int = typer.Option(
+        None, "--grad-accum", min=1,
+        help="Gradient accumulation steps (default: arch-dependent).",
+    ),
+    save_steps: int = typer.Option(
+        None, "--save-steps", min=1,
+        help="Qwen only: optimizer steps between resumable step checkpoints "
+             "(default 500).",
+    ),
+    lora_rank: int = typer.Option(
+        None, "--lora-rank", min=1, help="Qwen3-Omni only: LoRA rank (default 16).",
+    ),
+    lora_targets: str = typer.Option(
+        None, "--lora-targets",
+        help="Qwen3-Omni only: 'attn' (q/k/v/o, default) or 'wide' "
+             "(+ MoE expert FFN gate/up/down).",
+    ),
+    exp_name: str = typer.Option(
+        None, "--exp-name",
+        help="Experiment directory name (default: <arch>_<filenames>_<UTC "
+             "timestamp>). Set it when launching setups in parallel.",
+    ),
 ):
     """
     Setup a finetuning experiment with epoch-level checkpointing.
@@ -653,11 +856,16 @@ def finetune_setup(
     Creates job directory with manifests and chunk files for SLURM processing.
     Architecture is auto-detected from model name.
 
-    Pass multiple --filename flags to train on a random mix of audio types.
+    Pass multiple --filename flags to train on a random mix of audio types
+    (or a controlled mix with --audio-domain-mode).
     """
+    import random
+    import shutil as _shutil
+
     # Lazy import: data.py pulls in transformers (WhisperTokenizer),
     # which is heavy. Only setup needs it.
     from lyricscribe.finetune import data as finetune_data
+    from lyricscribe.finetune import domains as finetune_domains
 
     overrides = {
         k: v
@@ -672,9 +880,50 @@ def finetune_setup(
             "eval_subset_size": eval_subset_size,
             "whisper_timestamp_prob": whisper_timestamp_prob,
             "dedup_max_run": dedup_max_run if dedup_max_run else None,
+            "max_unlabeled_vocal_frac": max_unlabeled_vocal_frac,
+            "ref_selfwer_file": str(ref_selfwer_file) if ref_selfwer_file else None,
+            "max_ref_self_wer": max_ref_self_wer,
+            "use_alignment": not no_mfa_alignment,
+            "windows_per_song": windows_per_song,
+            "line_overlap_threshold": line_overlap_threshold,
+            "audio_domain_mode": audio_domain_mode,
+            "manifests_from": str(manifests_from) if manifests_from else None,
+            "max_train_windows": max_train_windows,
+            "train_window_seed": train_window_seed,
+            "grad_accum": grad_accum,
+            "save_steps": save_steps,
+            "lora_rank": lora_rank,
+            "lora_targets": lora_targets,
+            "exp_name": exp_name,
         }.items()
         if v is not None
     }
+    if audio_domain_mode and audio_domain_mode not in finetune_domains.AUDIO_DOMAIN_MODES:
+        logger.error(f"--audio-domain-mode must be one of {finetune_domains.AUDIO_DOMAIN_MODES}")
+        return
+    if lora_targets and lora_targets not in ("attn", "wide"):
+        logger.error("--lora-targets must be 'attn' or 'wide'")
+        return
+    if all_train_windows and max_train_windows:
+        logger.error("--all-train-windows and --max-train-windows are exclusive")
+        return
+
+    skip_song_ids: set[str] | None = None
+    if max_ref_self_wer is not None:
+        if ref_selfwer_file is None:
+            logger.error("--max-ref-self-wer requires --ref-selfwer-file")
+            return
+        skip_song_ids = set()
+        with open(ref_selfwer_file) as sf_:
+            for line in sf_:
+                r = json.loads(line)
+                sw = r.get("self_wer")
+                if sw is not None and sw > max_ref_self_wer:
+                    skip_song_ids.add(r["song_id"])
+        logger.info(
+            f"Ref-quality filter: skipping {len(skip_song_ids)} songs with "
+            f"self-WER > {max_ref_self_wer}"
+        )
 
     try:
         config = create_finetune_config(
@@ -696,60 +945,101 @@ def finetune_setup(
     logger.info(f"Filenames: {', '.join(config['filenames'])}")
     logger.info(f"Epochs: {config['max_epochs']} (per job: {config['epochs_per_job']})")
 
-    train_dataset = finetune_data.LyricsDataset(
-        dataset_dir=train_dir,
-        filenames=config['filenames'],
-    )
-
-    if len(train_dataset) == 0:
-        logger.error("No valid songs found in training directory!")
-        return
+    if all_train_windows:
+        config["max_train_windows"] = None
 
     job_dir = Path(config['output_dir']) / config['exp_name']
+    if (job_dir / "config.json").exists():
+        logger.error(f"{job_dir} already holds an experiment; refusing to overwrite")
+        return
     job_dir.mkdir(parents=True, exist_ok=True)
     train_manifest = job_dir / "train_manifest.jsonl"
-
-    n_train = finetune_data.create_manifest(
-        train_dataset,
-        train_manifest,
-        architecture=config['architecture'],
-        model_name=config['base_model'],
-        windows_per_song_multiplier=windows_per_song,
-        line_overlap_threshold=line_overlap_threshold,
-        dedup_max_run=config.get("dedup_max_run", 0),
-    )
-    logger.info(f"Training: {n_train} chunks (synced-line segments)")
-
     val_manifest = None
-    if val_dir:
-        val_dataset = finetune_data.LyricsDataset(
-            dataset_dir=val_dir,
+
+    if manifests_from:
+        for name in ("train_manifest.jsonl", "val_manifest.jsonl", "val_subset_manifest.jsonl"):
+            if (manifests_from / name).exists():
+                _shutil.copy2(manifests_from / name, job_dir / name)
+        if not train_manifest.exists():
+            logger.error(f"No train_manifest.jsonl in {manifests_from}")
+            return
+        if (job_dir / "val_subset_manifest.jsonl").exists():
+            val_manifest = job_dir / "val_manifest.jsonl"
+        logger.info(f"Copied manifests from {manifests_from}")
+    else:
+        train_dataset = finetune_data.LyricsDataset(
+            dataset_dir=train_dir,
             filenames=config['filenames'],
         )
-        val_manifest = job_dir / "val_manifest.jsonl"
-        # Validation manifest stays at windows_per_song=1: eval is just a
-        # sanity check, we don't need the same over-sampling as training.
-        n_val = finetune_data.create_manifest(
-            val_dataset,
-            val_manifest,
+
+        if len(train_dataset) == 0:
+            logger.error("No valid songs found in training directory!")
+            _shutil.rmtree(job_dir, ignore_errors=True)
+            return
+
+        n_train = finetune_data.create_manifest(
+            train_dataset,
+            train_manifest,
             architecture=config['architecture'],
             model_name=config['base_model'],
-            windows_per_song_multiplier=1,
+            windows_per_song_multiplier=windows_per_song,
             line_overlap_threshold=line_overlap_threshold,
             dedup_max_run=config.get("dedup_max_run", 0),
+            max_unlabeled_vocal_frac=config.get("max_unlabeled_vocal_frac"),
+            skip_song_ids=skip_song_ids,
+            use_alignment=not no_mfa_alignment,
         )
-        logger.info(f"Validation: {n_val} chunks")
+        logger.info(f"Training: {n_train} chunks (synced-line segments)")
 
-        # Write a fixed-size shuffled subset that both Whisper and NeMo
-        # evaluate against each epoch. Without this each trainer picks
-        # its own window (Subset vs. limit_val_batches) so cross-arch
-        # WER comparisons are over different audio — see #2.
-        subset_size = config.get("eval_subset_size", 200)
-        val_subset_manifest = job_dir / "val_subset_manifest.jsonl"
-        n_subset = finetune_data.write_subset_manifest(
-            val_manifest, val_subset_manifest, size=subset_size, seed=42,
+        val_manifest = None
+        if val_dir:
+            val_dataset = finetune_data.LyricsDataset(
+                dataset_dir=val_dir,
+                filenames=config['filenames'],
+            )
+            val_manifest = job_dir / "val_manifest.jsonl"
+            # Validation manifest stays at windows_per_song=1: eval is just a
+            # sanity check, we don't need the same over-sampling as training.
+            n_val = finetune_data.create_manifest(
+                val_dataset,
+                val_manifest,
+                architecture=config['architecture'],
+                model_name=config['base_model'],
+                windows_per_song_multiplier=1,
+                line_overlap_threshold=line_overlap_threshold,
+                dedup_max_run=config.get("dedup_max_run", 0),
+                max_unlabeled_vocal_frac=config.get("max_unlabeled_vocal_frac"),
+                skip_song_ids=skip_song_ids,
+                use_alignment=not no_mfa_alignment,
+            )
+            logger.info(f"Validation: {n_val} chunks")
+
+            # Write a fixed-size shuffled subset that both Whisper and NeMo
+            # evaluate against each epoch. Without this each trainer picks
+            # its own window (Subset vs. limit_val_batches) so cross-arch
+            # WER comparisons are over different audio — see #2.
+            subset_size = config.get("eval_subset_size", 200)
+            val_subset_manifest = job_dir / "val_subset_manifest.jsonl"
+            n_subset = finetune_data.write_subset_manifest(
+                val_manifest, val_subset_manifest, size=subset_size, seed=42,
+            )
+            logger.info(f"Validation subset (used during training): {n_subset} chunks")
+
+    if audio_domain_mode:
+        config["audio_domain_windows"] = finetune_domains.apply_audio_domains(
+            job_dir, config["filenames"], audio_domain_mode,
         )
-        logger.info(f"Validation subset (used during training): {n_subset} chunks")
+
+    if config.get("max_train_windows"):
+        with open(train_manifest) as f:
+            rows = [line for line in f if line.strip()]
+        k = config["max_train_windows"]
+        if k < len(rows):
+            rows = random.Random(config["train_window_seed"]).sample(rows, k)
+            _shutil.copy2(train_manifest, job_dir / "train_manifest_full.jsonl")
+            with open(train_manifest, "w") as f:
+                f.writelines(rows)
+        logger.info(f"Training windows: {len(rows)} (max_train_windows={k})")
 
     finetune_jobs.setup_finetune_job(config, train_manifest, val_manifest)
 
@@ -765,7 +1055,7 @@ def finetune_run(
     """
     Process one chunk (block of epochs) of a finetuning job.
     
-    This is typically called by the SLURM script, not run directly.
+    This is typically called from a SLURM job, not run directly.
     """
     # Lazy import: trainer pulls in NeMo + Lightning + transformers,
     # which takes a long time. Avoid that overhead for non-run commands.
@@ -789,10 +1079,8 @@ def finetune_run(
     logger.info(f"Processing chunk {chunk_id}: epochs {chunk_data['start_epoch']} to {chunk_data['end_epoch']}")
 
     train_manifest = job_dir / "train_manifest.jsonl"
-    # Prefer the fixed-size subset manifest for during-training eval
-    # so Whisper and NeMo evaluate on identical samples. Fall back to
-    # the full val manifest for older experiments that predate the
-    # subset file.
+    # Prefer the fixed-size subset manifest so every architecture evaluates
+    # on identical samples; fall back to the full val manifest without one.
     val_subset = job_dir / "val_subset_manifest.jsonl"
     val_full = job_dir / "val_manifest.jsonl"
     if val_subset.exists():
@@ -849,7 +1137,7 @@ def finetune_reset(
     
     finetune_jobs.reset_job(job_dir)
     logger.info(f"Job reset: {job_dir}")
-    logger.info(f"Run training again with: sbatch scripts/slurm_finetune.sh {job_dir} 1")
+    logger.info(f"Run training again with: lyricscribe finetune run --job-dir {job_dir} --chunk-id 1")
 
 
 @finetune_app.command("retry")
@@ -858,7 +1146,7 @@ def finetune_retry(
     chunk_id: int = typer.Option(None, "--chunk-id", help="Specific chunk to retry (default: all failed chunks)"),
 ):
     """
-    Reset failed chunks back to pending so the orchestrator resubmits them.
+    Reset failed chunks back to pending so they can be re-run.
 
     Without ``--chunk-id``, resets every failed chunk in the experiment.
     With ``--chunk-id``, resets only that specific chunk.
@@ -882,13 +1170,13 @@ def finetune_retry(
             return
 
         finetune_jobs.update_chunk_status(job_dir, chunk_id, "pending")
-        logger.info(f"Chunk {chunk_id} reset to pending — orchestrator will resubmit it")
+        logger.info(f"Chunk {chunk_id} reset to pending")
     else:
         n = finetune_jobs.reset_failed_chunks(job_dir)
         if n == 0:
             logger.info(f"No failed chunks in {job_dir.name}")
         else:
-            logger.info(f"Reset {n} failed chunks in {job_dir.name} — orchestrator will resubmit them")
+            logger.info(f"Reset {n} failed chunks in {job_dir.name} to pending")
 
 
 @finetune_app.command("retry-all")
@@ -1120,6 +1408,49 @@ def finetune_export(
 
     logger.info(f"Model exported: {checkpoint} -> {output_path}")
     logger.info(f"Use with: lyricscribe transcribe setup --model {output_path}")
+
+
+@finetune_app.command("eval-loss")
+def finetune_eval_loss(
+    base_model: str = typer.Option(
+        ..., "--base-model",
+        help="Base hub id/path (e.g. Qwen/Qwen3-ASR-1.7B-hf, Qwen/Qwen3-Omni-30B-A3B-Instruct)",
+    ),
+    checkpoint: list[Path] = typer.Option(
+        ..., "--checkpoint",
+        help="Checkpoint dir to compare (repeatable): a full model for "
+             "Qwen3-ASR, a LoRA adapter for Qwen3-Omni",
+    ),
+    manifest: Path = typer.Option(
+        ..., "--manifest", help="Manifest to sample held-out windows from"
+    ),
+    rows: int = typer.Option(32, "--rows", min=1, help="Windows to evaluate"),
+    seed: int = typer.Option(1234, "--seed", help="Window sampling seed"),
+    batch_size: int = typer.Option(2, "--batch-size", min=1),
+    output: Path = typer.Option(None, "--output", help="Write results JSON here"),
+):
+    """
+    Held-out mean per-token CE of a base Qwen model vs finetuned checkpoints.
+
+    Measured in eval mode on the same seeded windows for every model. The
+    Trainer's logged loss is accumulation-scaled and from train mode, so it is
+    not comparable.
+    """
+    from lyricscribe.finetune.config import detect_architecture
+    from lyricscribe.finetune.qwen import eval_loss
+
+    architecture = detect_architecture(base_model)
+    results = eval_loss(
+        architecture, base_model, [str(c) for c in checkpoint], manifest,
+        rows=rows, seed=seed, batch_size=batch_size,
+    )
+    base = results["base"]
+    for name, ce in results.items():
+        rel = "" if name == "base" else f"  ({100 * (ce - base) / base:+.1f}% vs base)"
+        logger.info(f"{name}: CE {ce:.4f}{rel}")
+    if output:
+        output.write_text(json.dumps({"rows": rows, "seed": seed, "manifest": str(manifest),
+                                      "ce": results}, indent=2) + "\n")
 
 
 if __name__ == "__main__":

@@ -7,56 +7,70 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
-from demucs.api import Separator
+from unblend import ModelRepository, Separator
 
 from lyricscribe.jobs import update_status
 
 logger = logging.getLogger(__name__)
 
+# ``shifts`` > 0 draws random time offsets, so the seed is pinned.
+DEFAULT_SHIFTS = 1
+DEFAULT_SPLIT_OVERLAP = 0.25
+DEFAULT_SEED = 0
 
-def _load_model(model_name: str, stem: str | None) -> Separator:
+
+def _load_model(
+    model_name: str, stem: str | None, dtype: str = "auto"
+) -> Separator:
     """
-    Load a Demucs model with optional single-stem isolation.
+    Load an Unblend model with optional single-stem isolation.
 
-    :param model_name: Name of the Demucs model to load.
+    Any registered Unblend model works, including custom ones added via
+    ``unblend models import``.
+
+    :param model_name: Unblend model name (see ``unblend models list``).
     :param stem: Stem to isolate, or ``None`` for all stems.
+    :param dtype: Compute precision: ``"auto"`` (FP16 on CUDA), ``"float32"``,
+        ``"float16"`` or ``"bfloat16"``.
     :return: A loaded :class:`Separator` instance.
     """
     logger.info(f"CUDA available: {torch.cuda.is_available()}")
-    if stem:
-        separator = Separator(model=model_name, only_load=stem)
-    else:
-        separator = Separator(model=model_name)
+    torch_dtype = "auto" if dtype == "auto" else getattr(torch, dtype)
+    separator = Separator(model=model_name, only_load=stem, dtype=torch_dtype)
     logger.info(
-        f"Loaded model {model_name} on {separator.device}, "
+        f"Loaded model {model_name} on {separator.device} ({separator.dtype}), "
         f"isolating {stem or 'all stems'}"
     )
     return separator
+
+
+def _model_sources(model_name: str) -> list[str]:
+    """
+    Stem names a registered Unblend model produces, without loading weights.
+
+    :param model_name: Unblend model name.
+    :return: Stem names in model order.
+    """
+    return list(ModelRepository().list_models()[model_name]["sources"])
 
 
 def _get_expected_output_paths(
     model_name: str,
     stem: str | None,
     output_path: str,
-    model: Separator | None = None,
 ) -> list[Path]:
     """
     Return the output file paths expected for one separation entry.
 
-    :param model_name: Name of the Demucs model used for filenames.
+    :param model_name: Name of the model used for filenames.
     :param stem: Stem to isolate, or ``None`` for all stems.
     :param output_path: Stored manifest output path.
-    :param model: Loaded separator, required when ``stem`` is ``None``.
     :return: Expected output file paths.
     """
     output = Path(output_path)
     if stem:
         return [output]
-
-    if model is None:
-        model = _load_model(model_name, None)
-
-    return [output / f"{model_name}_{stem_name}.wav" for stem_name in model.model.sources]
+    return [output / f"{model_name}_{s}.wav" for s in _model_sources(model_name)]
 
 
 def _process_file(
@@ -69,6 +83,7 @@ def _process_file(
     name: str,
     input_path: str,
     output_path: str,
+    separate_kwargs: dict,
 ) -> str:
     """
     Separate a single audio file and update its status in the chunk manifest.
@@ -78,19 +93,20 @@ def _process_file(
     :param job_dir: Path to the job directory.
     :param chunk_id: 1-based chunk identifier.
     :param chunk_data: In-memory chunk data (mutated in place).
-    :param model: Loaded Demucs :class:`Separator` instance.
+    :param model: Loaded Unblend :class:`Separator` instance.
     :param model_name: Name of the model, used for output filenames.
     :param stem: Stem to isolate, or ``None`` for all stems.
     :param name: Identifier for this entry.
     :param input_path: Path to the input audio file.
     :param output_path: Path for the output file or directory.
+    :param separate_kwargs: ``shifts`` / ``split_overlap`` / ``seed`` for
+        :meth:`Separator.separate`.
     :return: One of ``'success'``, ``'failed'``, or ``'skipped'``.
     """
     expected_outputs = _get_expected_output_paths(
         model_name=model_name,
         stem=stem,
         output_path=output_path,
-        model=model,
     )
     if expected_outputs and all(path.exists() for path in expected_outputs):
         update_status(job_dir, chunk_id, chunk_data, name, "success", 0.0, None)
@@ -99,8 +115,7 @@ def _process_file(
     start_time = time.time()
 
     try:
-        separated = model.separate(input_path)
-
+        separated = model.separate(input_path, **separate_kwargs)
         if stem:
             separated.export_stem(stem, output_path)
         else:
@@ -129,6 +144,11 @@ def setup_job(
     model: str,
     num_chunks: int,
     stem: str | None,
+    output_filename: str | None = None,
+    shifts: int = DEFAULT_SHIFTS,
+    split_overlap: float = DEFAULT_SPLIT_OVERLAP,
+    seed: int = DEFAULT_SEED,
+    dtype: str = "auto",
 ) -> None:
     """
     Initialize a separation job by scanning directories and writing
@@ -137,10 +157,23 @@ def setup_job(
     :param directories: Root directories containing subdirectories to process.
     :param job_dir: Directory to create for job files.
     :param filename: Audio filename to target within each subdirectory.
-    :param model: Name of the Demucs model to use.
+    :param model: Unblend model name.
     :param num_chunks: Number of chunks to split the work into.
     :param stem: Stem to isolate, or ``None`` for all stems.
+    :param output_filename: Output filename for a single-stem job (default
+        ``{model}_{stem}.wav``).
+    :param shifts: Random time-shift passes to average (0 = deterministic).
+    :param split_overlap: Overlap between consecutive model segments.
+    :param seed: Seed for the shift offsets.
+    :param dtype: Compute precision (see :func:`_load_model`).
     """
+    if output_filename and not stem:
+        raise ValueError("--output-filename requires --stem")
+    if model not in ModelRepository().list_models():
+        raise ValueError(
+            f"Unknown Unblend model {model!r}; see `unblend models list` "
+            "(custom checkpoints are added with `unblend models import`)"
+        )
 
     subdirs = []
     for directory in directories:
@@ -164,6 +197,10 @@ def setup_job(
         "filename": filename,
         "model": model,
         "stem": stem,
+        "shifts": shifts,
+        "split_overlap": split_overlap,
+        "seed": seed,
+        "dtype": dtype,
         "num_chunks": num_chunks,
         "total_files": total,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -179,7 +216,7 @@ def setup_job(
             name = subdir.name
             input_file = subdir / filename
             if stem:
-                output_path = subdir / f"{model}_{stem}.wav"
+                output_path = subdir / (output_filename or f"{model}_{stem}.wav")
             else:
                 output_path = subdir
 
@@ -217,7 +254,12 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
         config = json.load(f)
     model_name = config["model"]
     stem = config.get("stem")
-    model = _load_model(model_name, stem)
+    model = _load_model(model_name, stem, config.get("dtype", "auto"))
+    separate_kwargs = {
+        "shifts": config.get("shifts", DEFAULT_SHIFTS),
+        "split_overlap": config.get("split_overlap", DEFAULT_SPLIT_OVERLAP),
+        "seed": config.get("seed", DEFAULT_SEED),
+    }
 
     with open(job_dir / f"chunk_{chunk_id}.json") as f:
         chunk_data = json.load(f)
@@ -241,6 +283,7 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
             entry["name"],
             entry["input_path"],
             entry["output_path"],
+            separate_kwargs,
         )
         if result == "success":
             success_count += 1
@@ -268,7 +311,6 @@ def reset_job(job_dir: Path) -> None:
 
     model_name = config["model"]
     stem = config.get("stem")
-    model = None if stem else _load_model(model_name, None)
 
     deleted_outputs = 0
     reset_count = 0
@@ -282,7 +324,6 @@ def reset_job(job_dir: Path) -> None:
                 model_name=model_name,
                 stem=stem,
                 output_path=entry["output_path"],
-                model=model,
             ):
                 if path.exists():
                     path.unlink()
