@@ -1,6 +1,9 @@
+import fcntl
 import json
 import logging
+import os
 import random
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -18,38 +21,113 @@ from lyricscribe.transcribe.whisper import WhisperTranscriber
 logger = logging.getLogger(__name__)
 
 
-def _create_transcriber(model_name: str, batch_size: int) -> Transcriber:
+BACKENDS = (
+    "whisper",
+    "nemo",
+    "qwen3_asr",
+    "qwen3_omni",
+    "voxtral",
+    "musicflamingo",
+    "gemini",
+)
+
+# Substrings of hub ids / paths, checked in order.
+_NAME_HINTS = (
+    ("whisper", "whisper"),
+    ("qwen3-asr", "qwen3_asr"),
+    ("qwen3_asr", "qwen3_asr"),
+    ("qwen3-omni", "qwen3_omni"),
+    ("qwen3_omni", "qwen3_omni"),
+    ("voxtral", "voxtral"),
+    ("music-flamingo", "musicflamingo"),
+    ("musicflamingo", "musicflamingo"),
+    ("gemini", "gemini"),
+)
+# ``model_type`` / architecture strings in a local checkpoint's config.json.
+_CONFIG_HINTS = (
+    ("whisper", "whisper"),
+    ("qwen3_asr", "qwen3_asr"),
+    ("qwen3omni", "qwen3_omni"),
+    ("qwen3_omni", "qwen3_omni"),
+    ("voxtral", "voxtral"),
+    ("musicflamingo", "musicflamingo"),
+)
+
+
+def detect_backend(model_name: str) -> str:
     """
-    Create the appropriate transcriber based on model name.
+    Pick the transcription backend for a model id or checkpoint path.
 
-    Whisper models use HuggingFace Transformers, all others use NeMo.
+    Hub ids are matched by name; local checkpoint dirs (finetune outputs
+    rarely carry the family in their path) by their ``config.json``
+    ``model_type`` / ``architectures``. Anything else is treated as NeMo.
 
-    :param model_name: HuggingFace model identifier or path to local
-        checkpoint directory.
+    :param model_name: Hub id, local dir, or ``.nemo`` file.
+    :return: One of :data:`BACKENDS`.
+    """
+    lowered = model_name.lower()
+    for hint, backend in _NAME_HINTS:
+        if hint in lowered:
+            return backend
+    cfg_path = Path(model_name) / "config.json"
+    if cfg_path.exists():
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+        names = [str(cfg.get("model_type", ""))] + [
+            str(a) for a in cfg.get("architectures") or []
+        ]
+        joined = " ".join(names).lower()
+        for hint, backend in _CONFIG_HINTS:
+            if hint in joined:
+                return backend
+    return "nemo"
+
+
+def _create_transcriber(model_name: str, batch_size: int, config: dict | None = None) -> Transcriber:
+    """
+    Create the transcriber for a job.
+
+    :param model_name: Hub id or local checkpoint path.
     :param batch_size: Batch size for inference.
+    :param config: Job config; supplies ``backend`` (overrides detection)
+        and backend options (``max_new_tokens``, ``adapter``,
+        ``auto_language``).
     :return: An unloaded :class:`Transcriber` instance.
     """
-    if "whisper" in model_name.lower():
+    config = config or {}
+    backend = config.get("backend") or detect_backend(model_name)
+    max_new_tokens = int(config.get("max_new_tokens") or 1024)
+    if backend == "whisper":
         return WhisperTranscriber(model_name, batch_size)
+    if backend == "nemo":
+        return NemoTranscriber(model_name, batch_size)
+    if backend == "qwen3_asr":
+        from lyricscribe.transcribe.qwen_asr import Qwen3ASRTranscriber
 
-    # Local checkpoint dirs (e.g. finetune outputs) won't have "whisper" in
-    # their path. Fall back to reading the HF ``config.json`` and routing
-    # based on the architecture string so finetuned Whisper checkpoints
-    # don't get mis-dispatched to the NeMo loader.
-    ckpt_path = Path(model_name)
-    if ckpt_path.is_dir():
-        cfg_path = ckpt_path / "config.json"
-        if cfg_path.exists():
-            try:
-                with open(cfg_path) as f:
-                    cfg = json.load(f)
-                arch = (cfg.get("architectures") or [""])[0].lower()
-                if "whisper" in arch:
-                    return WhisperTranscriber(model_name, batch_size)
-            except Exception:
-                pass
+        return Qwen3ASRTranscriber(
+            model_name,
+            batch_size,
+            max_new_tokens=max_new_tokens,
+            auto_language=bool(config.get("auto_language", False)),
+        )
+    if backend in ("qwen3_omni", "voxtral", "musicflamingo"):
+        from lyricscribe.transcribe.audio_llm import AudioLLMTranscriber
 
-    return NemoTranscriber(model_name, batch_size)
+        return AudioLLMTranscriber(
+            model_name,
+            backend,
+            batch_size,
+            max_new_tokens=max_new_tokens,
+            adapter=config.get("adapter"),
+        )
+    if backend == "gemini":
+        from lyricscribe.transcribe.gemini import GeminiTranscriber
+
+        return GeminiTranscriber(model_name, batch_size)
+    raise ValueError(f"Unknown backend {backend!r}; expected one of {BACKENDS}")
 
 
 def _append_result(
@@ -60,11 +138,13 @@ def _append_result(
     model_name: str,
     duration_seconds: float,
     error: str | None,
+    transcription_raw: str | None = None,
 ) -> None:
     """
     Append a single transcription result as a JSON line to the output file.
 
-    Uses append mode for atomic writes on networked filesystems.
+    Writes under an exclusive lock: concurrent chunks share the file and
+    ``O_APPEND`` alone is not atomic on NFS.
 
     :param output_path: Path to the JSONL output file.
     :param song_id: Identifier for the song.
@@ -73,6 +153,8 @@ def _append_result(
     :param model_name: Model identifier used for transcription.
     :param duration_seconds: Time taken for transcription.
     :param error: Error message if failed, or ``None``.
+    :param transcription_raw: Pre-repair text when a post-hoc repair
+        (de-looping) changed it.
     """
     result = {
         "song_id": song_id,
@@ -82,8 +164,56 @@ def _append_result(
         "duration_seconds": round(duration_seconds, 2),
         "error": error,
     }
+    if transcription_raw is not None:
+        result["transcription_raw"] = transcription_raw
     with open(output_path, "a") as f:
-        f.write(json.dumps(result) + "\n")
+        fcntl.lockf(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(result) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.lockf(f, fcntl.LOCK_UN)
+
+
+def parse_song_dirname(name: str) -> tuple[str, str]:
+    """
+    Split a ``A_-_B`` song directory name into its two cleaned halves.
+
+    The halves are returned without assigning roles: MUSDB-ALT dirs are
+    ``Artist_-_Title`` but Jam-ALT mixes both orders (``Avercage_-_Embers``
+    vs ``10._Disparan_-_criatura``), so neither side can be assumed to be
+    the artist. Leading track numbers (``10.``) are stripped.
+
+    :param name: Song directory name.
+    :return: ``(left, right)``; ``right`` is empty when there is no separator.
+    """
+    left, _, right = name.partition("_-_")
+
+    def clean(s: str) -> str:
+        s = re.sub(r"^\d+\.?\s*", "", s.replace("_", " "))
+        return re.sub(r"\s+", " ", s).strip()
+
+    return clean(left), clean(right)
+
+
+def metadata_prompt(name: str, backend: str = "whisper") -> str:
+    """
+    Role-free per-song prompt built from a song directory name.
+
+    Whisper gets a decoder-prefix prompt; Qwen3-ASR gets a ``context``
+    (system message) prompt.
+
+    :param name: Song directory name.
+    :param backend: Transcription backend (see :func:`detect_backend`).
+    :return: Prompt text, e.g. ``Lyrics of "Avercage - Embers".``
+    """
+    left, right = parse_song_dirname(name)
+    if backend == "qwen3_asr":
+        if not right:
+            return f"Song metadata: {left}. Transcribe the sung lyrics."
+        return f"Song metadata: {left} - {right}. Transcribe the sung lyrics."
+    return f'Lyrics of "{left} - {right}".' if right else f'Lyrics of "{left}".'
 
 
 def setup_job(
@@ -100,6 +230,17 @@ def setup_job(
     vad_method: str = "silero",
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
+    num_beams: int = 5,
+    condition_on_prev: bool = True,
+    temperature_fallback: bool = False,
+    compression_ratio_threshold: float | None = None,
+    logprob_threshold: float | None = None,
+    prompt_from_dirname: bool = False,
+    backend: str | None = None,
+    max_new_tokens: int | None = None,
+    adapter: str | None = None,
+    auto_language: bool = False,
+    deloop_max_run: int | None = None,
 ) -> None:
     """
     Initialize a transcription job by scanning directories and writing
@@ -108,7 +249,7 @@ def setup_job(
     :param directories: Root directories containing subdirectories to process.
     :param job_dir: Directory to create for job files.
     :param filename: Audio filename to target within each subdirectory.
-    :param model: HuggingFace model identifier.
+    :param model: Hub id or local checkpoint path.
     :param num_chunks: Number of chunks to split the work into.
     :param batch_size: Batch size for inference.
     :param vad: Whether to enable VAD-based segmentation.
@@ -121,7 +262,28 @@ def setup_job(
         ``1.0`` disables (vanilla decode).
     :param no_repeat_ngram_size: Whisper decode-time anti-loop knob.
         ``0`` disables.
+    :param num_beams: Whisper beam width (5 = the HF pipeline default).
+    :param condition_on_prev: Whisper long-form ``condition_on_prev_tokens``.
+    :param temperature_fallback: Whisper temperature fallback.
+    :param compression_ratio_threshold: Fallback trigger.
+    :param logprob_threshold: Fallback trigger.
+    :param prompt_from_dirname: Derive a per-song prompt from the song
+        directory name (see :func:`metadata_prompt`): a decoder prompt for
+        Whisper, the ``context`` for Qwen3-ASR.
+    :param backend: Force a backend instead of :func:`detect_backend`.
+    :param max_new_tokens: Per-chunk generation cap for the LLM-decoder
+        backends (default 1024).
+    :param adapter: LoRA adapter dir merged into Qwen3-Omni.
+    :param auto_language: Qwen3-ASR: ignore the provided language and let
+        the model identify it.
+    :param deloop_max_run: If set, collapse any short cycle repeated more
+        than this many times in each transcription (post-hoc repair; pairs
+        with ``no_repeat_ngram_size=0``). The raw text is kept as
+        ``transcription_raw``.
     """
+    if backend is not None and backend not in BACKENDS:
+        raise ValueError(f"Unknown backend {backend!r}; expected one of {BACKENDS}")
+    resolved_backend = backend or detect_backend(model)
     subdirs = []
     for directory in directories:
         subdirs.extend(d for d in directory.iterdir() if d.is_dir())
@@ -156,6 +318,17 @@ def setup_job(
         "vad_filename": vad_filename,
         "repetition_penalty": repetition_penalty,
         "no_repeat_ngram_size": no_repeat_ngram_size,
+        "num_beams": num_beams,
+        "condition_on_prev": condition_on_prev,
+        "temperature_fallback": temperature_fallback,
+        "compression_ratio_threshold": compression_ratio_threshold,
+        "logprob_threshold": logprob_threshold,
+        "prompt_from_dirname": prompt_from_dirname,
+        "backend": resolved_backend,
+        "max_new_tokens": max_new_tokens,
+        "adapter": adapter,
+        "auto_language": auto_language,
+        "deloop_max_run": deloop_max_run,
         "num_chunks": num_chunks,
         "total_files": total,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -190,12 +363,17 @@ def setup_job(
                 if vad_file.exists():
                     vad_path = str(vad_file)
 
+            prompt = (
+                metadata_prompt(name, resolved_backend) if prompt_from_dirname else None
+            )
+
             files.append(
                 {
                     "name": name,
                     "input_path": str(input_file),
                     "vad_path": vad_path,
                     "language": language,
+                    "prompt": prompt,
                     "status": "pending",
                     "duration_seconds": None,
                     "error_message": None,
@@ -222,6 +400,12 @@ def _transcribe_with_oom_retry(
     vad_method: str = "silero",
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
+    num_beams: int = 5,
+    condition_on_prev: bool = True,
+    temperature_fallback: bool = False,
+    compression_ratio_threshold: float | None = None,
+    logprob_threshold: float | None = None,
+    initial_prompt: str | None = None,
 ) -> str:
     """
     Attempt transcription with automatic OOM recovery.
@@ -252,6 +436,12 @@ def _transcribe_with_oom_retry(
                 vad_method=vad_method,
                 repetition_penalty=repetition_penalty,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                num_beams=num_beams,
+                condition_on_prev=condition_on_prev,
+                temperature_fallback=temperature_fallback,
+                compression_ratio_threshold=compression_ratio_threshold,
+                logprob_threshold=logprob_threshold,
+                initial_prompt=initial_prompt,
             )
         except torch.cuda.OutOfMemoryError:
             if transcriber.batch_size <= 1:
@@ -285,6 +475,11 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     vad_filename = config.get("vad_filename")
     repetition_penalty = float(config.get("repetition_penalty", 1.0) or 1.0)
     no_repeat_ngram_size = int(config.get("no_repeat_ngram_size", 0) or 0)
+    num_beams = int(config.get("num_beams") or 5)
+    condition_on_prev = bool(config.get("condition_on_prev", True))
+    temperature_fallback = bool(config.get("temperature_fallback", False))
+    compression_ratio_threshold = config.get("compression_ratio_threshold")
+    logprob_threshold = config.get("logprob_threshold")
 
     if use_vad and vad_method == "rms" and not vad_filename:
         raise ValueError(
@@ -293,7 +488,8 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
             "by accompaniment."
         )
 
-    transcriber = _create_transcriber(model_name, batch_size)
+    deloop_max_run = config.get("deloop_max_run")
+    transcriber = _create_transcriber(model_name, batch_size, config)
     transcriber.load()
 
     logger.info(f"Using batch_size={transcriber.batch_size}")
@@ -347,15 +543,31 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
                 vad_model,
                 repetition_penalty=repetition_penalty,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                num_beams=num_beams,
+                condition_on_prev=condition_on_prev,
+                temperature_fallback=temperature_fallback,
+                compression_ratio_threshold=compression_ratio_threshold,
+                logprob_threshold=logprob_threshold,
                 language=entry.get("language"),
                 vad_source=entry.get("vad_path"),
                 vad_method=vad_method,
+                initial_prompt=entry.get("prompt"),
             )
+
+            raw = None
+            if deloop_max_run:
+                from lyricscribe.ensemble.deloop import deloop
+
+                words = text.split()
+                fixed = deloop(words, max_run=int(deloop_max_run))
+                if fixed != words:
+                    raw = text
+                text = " ".join(fixed)
 
             duration = time.time() - start_time
 
             _append_result(
-                output_path, name, input_path, text, model_name, duration, None
+                output_path, name, input_path, text, model_name, duration, None, raw
             )
             update_status(
                 job_dir, chunk_id, chunk_data, name, "success", duration, None

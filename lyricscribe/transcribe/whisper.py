@@ -46,6 +46,8 @@ class WhisperTranscriber(Transcriber):
         """
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Loading Whisper model: {self.model_name} on {device}")
+        # cuDNN SDPA drifts from the flash kernels and rebuilds per sequence shape.
+        torch.backends.cuda.enable_cudnn_sdp(False)
 
         kwargs = {
             "task": "automatic-speech-recognition",
@@ -78,6 +80,12 @@ class WhisperTranscriber(Transcriber):
         vad_method: str = "silero",
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
+        num_beams: int = 5,
+        condition_on_prev: bool = True,
+        temperature_fallback: bool = False,
+        compression_ratio_threshold: float | None = None,
+        logprob_threshold: float | None = None,
+        initial_prompt: str | None = None,
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
@@ -85,6 +93,10 @@ class WhisperTranscriber(Transcriber):
         generate_kwargs = {"task": "transcribe"}
         if language:
             generate_kwargs["language"] = language
+        if initial_prompt:
+            generate_kwargs["prompt_ids"] = self.pipe.tokenizer.get_prompt_ids(
+                initial_prompt, return_tensors="pt"
+            ).to(self.pipe.model.device)
         # Decoder anti-stutter knobs. Both ``1.0`` / ``0`` disable the
         # corresponding constraint; defaults reproduce a vanilla Whisper
         # decode unless the caller opts in via job config.
@@ -92,18 +104,22 @@ class WhisperTranscriber(Transcriber):
             generate_kwargs["repetition_penalty"] = repetition_penalty
         if no_repeat_ngram_size and no_repeat_ngram_size > 0:
             generate_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+        # The HF ASR pipeline defaults to 5 beams, so num_beams is always explicit.
+        generate_kwargs["num_beams"] = num_beams
+        if not condition_on_prev:
+            generate_kwargs["condition_on_prev_tokens"] = False
+        if temperature_fallback:
+            generate_kwargs["temperature"] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+            generate_kwargs["compression_ratio_threshold"] = (
+                compression_ratio_threshold if compression_ratio_threshold is not None else 2.4
+            )
+            generate_kwargs["logprob_threshold"] = (
+                logprob_threshold if logprob_threshold is not None else -1.0
+            )
 
         kwargs = {
-            # RMS-VAD pre-splits audio into <=30s segments
-            # (``merge_segments(max_length_s=30)``). Setting
-            # ``chunk_length_s`` routes those segments through the
-            # pipeline's chunking collator so bs>1 batches cleanly; without
-            # it the pipeline crashes on variable-length inputs at bs>1.
-            # Each segment is already <=30s so the internal chunker
-            # produces a single padded window per segment — no behavioral
-            # change vs. the explicit chunked path.
-            # Silero VAD is intentionally left at bs=1 to avoid changing
-            # its behavior vs. prior runs (it has no segment-length cap).
+            # bs>1 needs ``chunk_length_s``. It leaves RMS-VAD's <=30s segments whole
+            # but would re-chunk uncapped Silero segments, so Silero stays at bs=1.
             "batch_size": self.batch_size if (use_chunked or (use_vad and vad_method == "rms")) else 1,
             "generate_kwargs": generate_kwargs,
         }

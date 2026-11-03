@@ -21,6 +21,91 @@ from lyricscribe.transcribe.rms_vad import (
 logger = logging.getLogger(__name__)
 
 
+def _banned_ngram_next_tokens(ids: list[int], n: int) -> list[int]:
+    """
+    Tokens that would complete an already-generated n-gram if emitted next.
+
+    Standard HF ``no_repeat_ngram_size`` semantics: collect every n-gram in
+    *ids* and ban each token that previously followed the (n-1)-gram equal to
+    the current suffix.
+
+    :param ids: Generated token ids so far (including the prompt).
+    :param n: N-gram size to block.
+    :return: Token ids to ban at the next step.
+    """
+    if n < 1 or len(ids) < n:
+        return []
+    seen: dict[tuple[int, ...], set[int]] = {}
+    for j in range(len(ids) - n + 1):
+        seen.setdefault(tuple(ids[j : j + n - 1]), set()).add(ids[j + n - 1])
+    return sorted(seen.get(tuple(ids[len(ids) - n + 1 :]), ()))
+
+
+def _install_aed_logit_controls(generator) -> None:
+    """
+    Graft HF-style ``repetition_penalty`` / ``no_repeat_ngram_size`` onto a
+    NeMo ``GreedySequenceGenerator`` by wrapping ``_one_step_forward`` and
+    editing the last-position logits before the decode loop's argmax.
+
+    NeMo's AED (Canary) decoder exposes no repetition control of its own.
+    The decode loop passes ``decoder_mems_list=None`` exactly once per
+    utterance batch (the prompt step) and then only the newest token, so
+    mirroring those calls reconstructs the loop's full ``tgt`` prefix.
+
+    Idempotent: the wrapper reads ``generator._ls_repetition_penalty`` /
+    ``generator._ls_no_repeat_ngram_size`` on every call, so re-installs just
+    refresh those attributes. With both knobs at defaults it is a no-op.
+    """
+    if getattr(generator, "_ls_logit_controls", False):
+        return
+    generator._ls_logit_controls = True
+    original = generator._one_step_forward
+    state: dict = {"ids": None}
+
+    def wrapped(
+        decoder_input_ids=None,
+        encoder_hidden_states=None,
+        encoder_input_mask=None,
+        decoder_mems_list=None,
+        pos=0,
+        return_scores: bool = True,
+    ):
+        if decoder_mems_list is None:
+            state["ids"] = decoder_input_ids.detach().clone()
+        else:
+            state["ids"] = torch.cat(
+                (state["ids"], decoder_input_ids[:, -1:]), dim=-1
+            )
+
+        result = original(
+            decoder_input_ids,
+            encoder_hidden_states,
+            encoder_input_mask,
+            decoder_mems_list,
+            pos,
+            return_scores=return_scores,
+        )
+        penalty = getattr(generator, "_ls_repetition_penalty", 1.0) or 1.0
+        ngram = int(getattr(generator, "_ls_no_repeat_ngram_size", 0) or 0)
+        if penalty == 1.0 and ngram == 0:
+            return result
+
+        last = result[0][:, -1, :]
+        for row, ids_row in enumerate(state["ids"]):
+            if penalty != 1.0:
+                prev = torch.unique(ids_row)
+                scores = last[row, prev]
+                last[row, prev] = torch.where(
+                    scores < 0, scores * penalty, scores / penalty
+                )
+            if ngram > 0:
+                banned = _banned_ngram_next_tokens(ids_row.tolist(), ngram)
+                if banned:
+                    last[row, banned] = float("-inf")
+        return result
+
+    generator._one_step_forward = wrapped
+
 
 class NemoTranscriber(Transcriber):
     """
@@ -53,13 +138,18 @@ class NemoTranscriber(Transcriber):
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Loading NeMo model: {self.model_name}")
         # ``from_pretrained`` only accepts HF-hub repo IDs; local
-        # ``.nemo`` checkpoints (e.g. our finetune outputs) must be
+        # ``.nemo`` checkpoints (e.g. finetune outputs) must be
         # loaded via ``restore_from``.
         from pathlib import Path
         if Path(self.model_name).is_file():
-            self.model = nemo_asr.models.ASRModel.restore_from(
-                restore_path=self.model_name
+            # ``ASRModel.restore_from`` can't build multitask models; use their class.
+            cfg = nemo_asr.models.ASRModel.restore_from(
+                restore_path=self.model_name, return_config=True
             )
+            model_cls = nemo_asr.models.ASRModel
+            if "EncDecMultiTask" in str(cfg.get("target", "")):
+                model_cls = EncDecMultiTaskModel
+            self.model = model_cls.restore_from(restore_path=self.model_name)
         else:
             self.model = nemo_asr.models.ASRModel.from_pretrained(
                 model_name=self.model_name
@@ -90,13 +180,52 @@ class NemoTranscriber(Transcriber):
         vad_method: str = "silero",
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
+        num_beams: int = 5,
+        condition_on_prev: bool = True,
+        temperature_fallback: bool = False,
+        compression_ratio_threshold: float | None = None,
+        logprob_threshold: float | None = None,
+        initial_prompt: str | None = None,
     ) -> str:
-        # NeMo's RNNT/Canary decoders don't expose HF-style
-        # ``repetition_penalty`` / ``no_repeat_ngram_size``; ignored here.
-        del repetition_penalty, no_repeat_ngram_size
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
         """
+        del num_beams, condition_on_prev, temperature_fallback
+        del compression_ratio_threshold, logprob_threshold, initial_prompt
+        # Repetition knobs apply only to multitask (AED) models; RNNT/TDT ignores them.
+        if self.is_multitask:
+            wants_controls = repetition_penalty != 1.0 or bool(no_repeat_ngram_size)
+            inner = getattr(self.model.decoding, "decoding", None)
+            if wants_controls and not hasattr(inner, "greedy_search"):
+                # Controls need the greedy generator; same output as beam_size=1.
+                from nemo.collections.asr.parts.submodules.multitask_decoding import (
+                    MultiTaskDecodingConfig,
+                )
+                from omegaconf import OmegaConf
+
+                self.model.change_decoding_strategy(
+                    OmegaConf.structured(MultiTaskDecodingConfig(strategy="greedy"))
+                )
+                inner = getattr(self.model.decoding, "decoding", None)
+                logger.info(
+                    "Switched multitask decoding beam(1) -> greedy for logit controls"
+                )
+            generator = getattr(inner, "greedy_search", None)
+            if generator is not None:
+                _install_aed_logit_controls(generator)
+                generator._ls_repetition_penalty = repetition_penalty
+                generator._ls_no_repeat_ngram_size = no_repeat_ngram_size
+                if wants_controls:
+                    logger.info(
+                        "AED logit controls active: repetition_penalty="
+                        f"{repetition_penalty}, "
+                        f"no_repeat_ngram_size={no_repeat_ngram_size}"
+                    )
+            elif wants_controls:
+                logger.warning(
+                    "Repetition controls requested but no greedy generator "
+                    "found on the multitask decoder; knobs NOT applied."
+                )
         wav, sr = torchaudio.load(audio_path)
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0, keepdim=True)

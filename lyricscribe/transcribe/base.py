@@ -44,9 +44,18 @@ class Transcriber(ABC):
         vad_method: str = "silero",
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
+        num_beams: int = 5,
+        condition_on_prev: bool = True,
+        temperature_fallback: bool = False,
+        compression_ratio_threshold: float | None = None,
+        logprob_threshold: float | None = None,
+        initial_prompt: str | None = None,
     ) -> str:
         """
         Transcribe a single audio file, optionally with VAD and/or chunking.
+
+        Every backend accepts all decoding knobs and ignores the ones it
+        doesn't support.
 
         :param audio_path: Absolute path to the audio file.
         :param use_vad: Whether to use VAD to segment the audio.
@@ -57,10 +66,21 @@ class Transcriber(ABC):
             (timestamps from this file, transcription from audio_path).
         :param vad_method: VAD algorithm — ``"silero"`` (default) or
             ``"rms"`` (RMS-amplitude on a separated vocal track).
-        :param repetition_penalty: Decoder ``repetition_penalty`` for
-            Whisper. ``1.0`` disables it. Whisper-only.
-        :param no_repeat_ngram_size: Decoder ``no_repeat_ngram_size`` for
-            Whisper. ``0`` disables it. Whisper-only.
+        :param repetition_penalty: Decoder ``repetition_penalty`` (Whisper,
+            NeMo multitask). ``1.0`` disables it.
+        :param no_repeat_ngram_size: Decoder ``no_repeat_ngram_size``
+            (Whisper, NeMo multitask, audio-LLMs, Qwen3-ASR). ``0`` disables it.
+        :param num_beams: Beam width. Whisper-only.
+        :param condition_on_prev: Condition each long-form window on the
+            previous window's text. Whisper-only.
+        :param temperature_fallback: Re-decode degenerate windows at rising
+            temperature. Whisper-only.
+        :param compression_ratio_threshold: Fallback trigger (default 2.4).
+            Whisper-only.
+        :param logprob_threshold: Fallback trigger (default -1.0).
+            Whisper-only.
+        :param initial_prompt: Per-song text prompt: Whisper's decoder
+            prompt, or Qwen3-ASR's ``context``.
         :return: Transcribed text.
         """
         ...
