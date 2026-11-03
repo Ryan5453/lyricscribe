@@ -139,7 +139,7 @@ def update_chunk_status(
                 and job_status.get("status") in ("complete", "complete_with_failures")
             ):
                 # A chunk was reopened after a previous completion state
-                # (manual retry/orchestrator recovery). Clear stale top-level
+                # (manual retry). Clear stale top-level
                 # completion so monitors show the experiment as active again.
                 job_status["status"] = "pending"
 
@@ -217,8 +217,8 @@ def show_job_stats(job_dir: Path) -> None:
 
 def reset_failed_chunks(job_dir: Path) -> int:
     """
-    Reset all failed chunks in a job back to ``pending`` so the
-    orchestrator will resubmit them.
+    Reset all failed chunks in a job back to ``pending`` so they can be
+    re-run.
 
     Unlike :func:`reset_job`, this preserves successful chunks and
     existing checkpoints.

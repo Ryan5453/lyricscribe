@@ -37,6 +37,121 @@ def _window_has_vocals(
     return False
 
 
+def _unlabeled_vocal_fraction(
+    synced: list[dict],
+    segments_raw: list[list],
+    window_start_ms: float,
+    window_end_ms: float,
+) -> float:
+    """
+    Fraction of sung time inside the window that has no label text.
+
+    Sung time comes from the synced-line spans (every non-empty line,
+    clipped to the window); labeled time from ``segments_raw`` spans.
+    Windows with no sung time return 0.0 (purely instrumental windows
+    are complete by definition).
+    """
+    vocal: list[list[float]] = []
+    for line in synced:
+        if not line.get("text", "").strip():
+            continue
+        start = line.get("start", 0)
+        dur = line.get("duration", 0)
+        if dur <= 0:
+            continue
+        a = max(start, window_start_ms)
+        b = min(start + dur, window_end_ms)
+        if b > a:
+            vocal.append([a, b])
+    if not vocal:
+        return 0.0
+
+    vocal.sort()
+    merged = [vocal[0]]
+    for a, b in vocal[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+
+    labeled = [
+        (max(s[0], window_start_ms), min(s[1], window_end_ms))
+        for s in segments_raw
+    ]
+    total = 0.0
+    unlabeled = 0.0
+    for a, b in merged:
+        total += b - a
+        covered = sum(
+            max(0.0, min(b, lb) - max(a, la)) for la, lb in labeled
+        )
+        unlabeled += max(0.0, (b - a) - covered)
+    return unlabeled / total if total > 0 else 0.0
+
+
+def _segments_for_window(
+    synced: list[dict],
+    aligned_words: list[dict] | None,
+    window_start_ms: float,
+    window_end_ms: float,
+    line_overlap_threshold: float,
+) -> tuple[list[list], bool]:
+    """
+    Build ``(start_ms, end_ms, [words])`` label segments for one window.
+
+    Uses word-level MFA times when available (a word is kept only if it
+    falls fully inside the window), otherwise the synced-line overlap
+    heuristic. Returns ``(segments, mfa_gap)`` where ``mfa_gap`` is True
+    when the window has vocals per the synced lines but no aligned words
+    — an alignment failure, not silence.
+    """
+    segments_raw: list[list] = []
+    if aligned_words is not None:
+        kept = [
+            w for w in aligned_words
+            if w["start"] >= window_start_ms
+            and w["start"] + w["duration"] <= window_end_ms
+        ]
+        # Split into segments at pauses >1s.
+        for w in kept:
+            w_start = w["start"]
+            w_end = w["start"] + w["duration"]
+            if segments_raw and w_start - segments_raw[-1][1] <= 1000:
+                segments_raw[-1][1] = max(segments_raw[-1][1], w_end)
+                segments_raw[-1][2].append(w["word"])
+            else:
+                segments_raw.append([w_start, w_end, [w["word"]]])
+
+        if not segments_raw and _window_has_vocals(
+            synced, window_start_ms, window_end_ms
+        ):
+            return [], True
+    else:
+        for line in synced:
+            if not line.get("text", "").strip():
+                continue
+            line_start = line.get("start", 0)
+            line_dur = line.get("duration", 0)
+            if line_dur <= 0:
+                if window_start_ms <= line_start < window_end_ms:
+                    segments_raw.append(
+                        [line_start, line_start,
+                         line["text"].strip().split()]
+                    )
+                continue
+            line_end = line_start + line_dur
+            overlap_start = max(line_start, window_start_ms)
+            overlap_end = min(line_end, window_end_ms)
+            overlap = max(0, overlap_end - overlap_start)
+            if overlap / line_dur >= line_overlap_threshold:
+                segments_raw.append(
+                    [max(line_start, window_start_ms),
+                     min(line_end, window_end_ms),
+                     line["text"].strip().split()]
+                )
+    return segments_raw, False
+
+
 class LyricsDataset:
     """
     Dataset that iterates over song directories, yielding audio paths
@@ -129,6 +244,10 @@ def create_manifest(
     windows_per_song_multiplier: int = 1,
     line_overlap_threshold: float = 0.7,
     dedup_max_run: int = 0,
+    max_unlabeled_vocal_frac: float | None = None,
+    max_offset_attempts: int = 8,
+    skip_song_ids: set[str] | None = None,
+    use_alignment: bool = True,
 ) -> int:
     """
     Create a manifest JSONL by sampling random fixed-length audio windows
@@ -181,8 +300,28 @@ def create_manifest(
         Default 0.7 means we keep a line only if at least 70% of its
         duration is inside the window.
     :param dedup_max_run: If > 0, cap runs of consecutive identical
-        words in the label at this length. Off by default — capping
-        measurably hurt WER.
+        words in the label at this length. MFA alignments of backing
+        vocals can produce runs far longer than real lyrics repeat. Off by
+        default; 8 is a reasonable value.
+    :param max_unlabeled_vocal_frac: If set, reject windows where more
+        than this fraction of sung time (per synced-line spans) has no
+        label text — the boundary word/line drops that otherwise teach
+        the model to delete audible vocals. Rejected offsets are
+        re-drawn up to ``max_offset_attempts`` times so data volume is
+        preserved rather than filtered away. ``None`` disables; 0.2 is a
+        reasonable value.
+    :param max_offset_attempts: Random offsets tried per window before
+        giving up when ``max_unlabeled_vocal_frac`` is set.
+    :param skip_song_ids: Song IDs (directory names) to exclude entirely,
+        e.g. songs whose unsynced/synced references disagree heavily
+        (untrustworthy labels). The datasets themselves are never modified;
+        callers derive this set from an external artifact (see the
+        ``--ref-selfwer-file`` CLI option).
+    :param use_alignment: When False, ignore MFA word alignments and build
+        labels from synced lines only (the no-alignment fallback path).
+        Line text preserves the human word order, which MFA can jumble on
+        fast or repetitive passages, at the cost of coarser (line-level)
+        timing.
 
     When a song's ``lyrics.json`` carries an ``alignment`` field (from
     ``lyricscribe dataset align``), word-level MFA times are used
@@ -215,12 +354,18 @@ def create_manifest(
     skipped_too_short = 0
     skipped_too_long = 0
     skipped_mfa_gap = 0
+    skipped_incomplete = 0
+    skipped_ref_quality = 0
     total = len(dataset)
 
     with open(output_path, "w") as f:
         for idx, song in enumerate(dataset.songs):
             if (idx + 1) % 500 == 0:
                 logger.info(f"  Processing manifest: {idx + 1}/{total}")
+
+            if skip_song_ids and song["id"] in skip_song_ids:
+                skipped_ref_quality += 1
+                continue
 
             lyrics_path = song["dir"] / "lyrics.json"
             try:
@@ -234,9 +379,10 @@ def create_manifest(
 
                 # Opt-in word-level filtering when MFA alignment is present.
                 aligned_words = None
-                alignment = lyrics_data.get("alignment")
-                if alignment:
-                    aligned_words = alignment.get("words")
+                if use_alignment:
+                    alignment = lyrics_data.get("alignment")
+                    if alignment:
+                        aligned_words = alignment.get("words")
 
                 detected_language = lyrics_data["detected_language"]
                 audio_file = song["dir"] / _RNG.choice(song["available"])
@@ -258,76 +404,61 @@ def create_manifest(
                 # at offset 0 (no point in sampling the same position
                 # multiple times).
                 if song_duration <= window_seconds:
-                    offsets = [0.0]
+                    num_windows = 1
+                    max_offset = 0.0
                 else:
                     base_windows = math.ceil(song_duration / window_seconds)
                     num_windows = base_windows * windows_per_song_multiplier
                     max_offset = song_duration - window_seconds
-                    offsets = [
-                        _RNG.uniform(0.0, max_offset)
-                        for _ in range(num_windows)
-                    ]
 
-                for offset in offsets:
-                    window_start_ms = offset * 1000
-                    window_end_ms = window_start_ms + window_ms
-
-                    # (start_ms, end_ms, [words]) segments; joined words
-                    # form the text label.
+                for _ in range(num_windows):
+                    attempts = (
+                        max_offset_attempts
+                        if max_unlabeled_vocal_frac is not None
+                        and max_offset > 0
+                        else 1
+                    )
+                    offset = None
                     segments_raw: list[list] = []
-                    if aligned_words is not None:
-                        kept = [
-                            w for w in aligned_words
-                            if w["start"] >= window_start_ms
-                            and w["start"] + w["duration"] <= window_end_ms
-                        ]
-                        # Split into segments at pauses >1s.
-                        for w in kept:
-                            w_start = w["start"]
-                            w_end = w["start"] + w["duration"]
-                            if (
-                                segments_raw
-                                and w_start - segments_raw[-1][1] <= 1000
-                            ):
-                                segments_raw[-1][1] = max(
-                                    segments_raw[-1][1], w_end
-                                )
-                                segments_raw[-1][2].append(w["word"])
-                            else:
-                                segments_raw.append(
-                                    [w_start, w_end, [w["word"]]]
-                                )
-
-                        # Vocals present but no aligned words: alignment
-                        # gap, skip.
-                        if not segments_raw and _window_has_vocals(
-                            synced, window_start_ms, window_end_ms
-                        ):
-                            skipped_mfa_gap += 1
+                    fail_reason = None
+                    for _attempt in range(attempts):
+                        cand = (
+                            _RNG.uniform(0.0, max_offset)
+                            if max_offset > 0
+                            else 0.0
+                        )
+                        window_start_ms = cand * 1000
+                        window_end_ms = window_start_ms + window_ms
+                        segments_raw, mfa_gap = _segments_for_window(
+                            synced,
+                            aligned_words,
+                            window_start_ms,
+                            window_end_ms,
+                            line_overlap_threshold,
+                        )
+                        if mfa_gap:
+                            fail_reason = "mfa_gap"
                             continue
-                    else:
-                        for line in synced:
-                            if not line.get("text", "").strip():
-                                continue
-                            line_start = line.get("start", 0)
-                            line_dur = line.get("duration", 0)
-                            if line_dur <= 0:
-                                if window_start_ms <= line_start < window_end_ms:
-                                    segments_raw.append(
-                                        [line_start, line_start,
-                                         line["text"].strip().split()]
-                                    )
-                                continue
-                            line_end = line_start + line_dur
-                            overlap_start = max(line_start, window_start_ms)
-                            overlap_end = min(line_end, window_end_ms)
-                            overlap = max(0, overlap_end - overlap_start)
-                            if overlap / line_dur >= line_overlap_threshold:
-                                segments_raw.append(
-                                    [max(line_start, window_start_ms),
-                                     min(line_end, window_end_ms),
-                                     line["text"].strip().split()]
-                                )
+                        if (
+                            max_unlabeled_vocal_frac is not None
+                            and _unlabeled_vocal_fraction(
+                                synced,
+                                segments_raw,
+                                window_start_ms,
+                                window_end_ms,
+                            ) > max_unlabeled_vocal_frac
+                        ):
+                            fail_reason = "incomplete"
+                            continue
+                        offset = cand
+                        break
+
+                    if offset is None:
+                        if fail_reason == "mfa_gap":
+                            skipped_mfa_gap += 1
+                        else:
+                            skipped_incomplete += 1
+                        continue
 
                     if dedup_max_run > 0:
                         for seg in segments_raw:
@@ -383,11 +514,8 @@ def create_manifest(
                         entry["answer"] = text
                         entry["source_lang"] = detected_language
                         entry["target_lang"] = detected_language
-                        # pnc must reflect the target's actual style.
-                        has_style = any(c.isupper() for c in text) or any(
-                            c in text for c in ".,!?;:"
-                        )
-                        entry["pnc"] = "yes" if has_style else "no"
+                        # Must match inference, which always sends pnc="yes".
+                        entry["pnc"] = "yes"
 
                     f.write(json.dumps(entry) + "\n")
                     count += 1
@@ -398,10 +526,13 @@ def create_manifest(
 
     logger.info(
         f"Created manifest with {count} windows "
-        f"({skipped_no_sync} songs skipped for missing synced lyrics, "
+        f"({skipped_ref_quality} songs skipped for untrusted references, "
+        f"{skipped_no_sync} songs skipped for missing synced lyrics, "
         f"{skipped_too_short} songs skipped for being too short, "
         f"{skipped_too_long} windows dropped for exceeding {max_tokens} tokens, "
-        f"{skipped_mfa_gap} windows dropped for MFA alignment gaps over vocals)"
+        f"{skipped_mfa_gap} windows dropped for MFA alignment gaps over vocals, "
+        f"{skipped_incomplete} windows dropped for unlabeled vocals after "
+        f"{max_offset_attempts} offset attempts)"
     )
     return count
 

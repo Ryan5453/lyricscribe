@@ -825,7 +825,10 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
             start_s = max(float(start_s), prev_end)
             end_s = max(float(end_s), start_s)
             ids.append(self._timestamp_token(start_s))
-            ids.extend(tokenizer(seg_text, add_special_tokens=False).input_ids)
+            # Labels start with a space to match Whisper's native segment
+            # tokenization; without it words glue together once timestamps
+            # are stripped at decode time.
+            ids.extend(tokenizer(" " + seg_text, add_special_tokens=False).input_ids)
             ids.append(self._timestamp_token(end_s))
             prev_end = end_s
         ids.append(tokenizer.eos_token_id)
@@ -927,7 +930,9 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
                 language=entry["language"], task="transcribe",
                 predict_timestamps=False,
             )
-            labels = self.processor.tokenizer(entry["text"]).input_ids
+            # Same leading-space convention as timestamp mode.
+            text = " " + entry["text"] if entry["text"] else entry["text"]
+            labels = self.processor.tokenizer(text).input_ids
 
         return {"input_features": input_features, "labels": labels}
 
@@ -1087,8 +1092,9 @@ class WhisperTrainer:
 
         if self.model is None:
             logger.info(f"Loading Whisper model: {self.config['base_model']}")
+            # fp16 AMP needs fp32 master weights; some checkpoints are stored in fp16.
             self.model = WhisperForConditionalGeneration.from_pretrained(
-                self.config["base_model"]
+                self.config["base_model"], dtype=torch.float32
             )
             self.processor = WhisperProcessor.from_pretrained(self.config["base_model"])
 
@@ -1134,11 +1140,10 @@ class WhisperTrainer:
 
         job_dir = Path(self.config["output_dir"]) / self.config["exp_name"]
 
-        # Clamp so short smoke runs (e.g. max_epochs < warmup_epochs) still
-        # satisfy HF's warmup_ratio ∈ [0, 1] constraint — 1.0 means the whole
-        # run is warmup, which is the correct degenerate behaviour.
+        # ``warmup_steps`` reads values < 1 as a fraction of all steps and
+        # >= 1 as an absolute step count, so clamp below 1.
         warmup_ratio = min(
-            1.0,
+            0.999,
             self.config.get("warmup_epochs", 5) / max(self.config["max_epochs"], 1),
         )
 
@@ -1155,7 +1160,7 @@ class WhisperTrainer:
                 per_device_train_batch_size=self.config["batch_size"],
                 gradient_accumulation_steps=self.config.get("grad_accum", 1),
                 learning_rate=self.config["learning_rate"],
-                warmup_ratio=warmup_ratio,
+                warmup_steps=warmup_ratio,
                 num_train_epochs=self.config["max_epochs"],
                 fp16=torch.cuda.is_available(),
                 save_strategy="steps",
@@ -1279,7 +1284,7 @@ class WhisperTrainer:
                 per_device_train_batch_size=self.config["batch_size"],
                 gradient_accumulation_steps=self.config.get("grad_accum", 1),
                 learning_rate=self.config["learning_rate"],
-                warmup_ratio=0.0,
+                warmup_steps=0,
                 max_steps=n,
                 num_train_epochs=1,
                 fp16=torch.cuda.is_available(),
@@ -1327,11 +1332,8 @@ class WhisperTrainer:
             self.model.save_pretrained(checkpoint_path)
             self.processor.save_pretrained(checkpoint_path)
 
-            # Fix a transformers 4.57.x bug: save_pretrained() writes
-            # eos_token_id as a single-element list in generation_config.json,
-            # which crashes Whisper's SuppressTokensAtBeginLogitsProcessor
-            # at inference time (it uses eos_token_id as a slice index).
-            # Unwrap it back to an int.
+            # save_pretrained() can write eos_token_id as a one-element list;
+            # SuppressTokensAtBeginLogitsProcessor needs an int.
             gen_config_path = checkpoint_path / "generation_config.json"
             if gen_config_path.exists():
                 with open(gen_config_path) as f:
@@ -1350,7 +1352,9 @@ class WhisperTrainer:
         :param checkpoint_path: Path to the checkpoint directory.
         :return: The epoch number extracted from the directory name.
         """
-        self.model = WhisperForConditionalGeneration.from_pretrained(checkpoint_path)
+        self.model = WhisperForConditionalGeneration.from_pretrained(
+            checkpoint_path, dtype=torch.float32
+        )
         self.processor = WhisperProcessor.from_pretrained(checkpoint_path)
 
         try:
@@ -1368,7 +1372,8 @@ def create_trainer(config: dict):
     architecture.
 
     :param config: Job configuration dictionary with an ``"architecture"`` key.
-    :return: A ``NeMoTrainer`` or ``WhisperTrainer`` instance.
+    :return: A ``NeMoTrainer``, ``WhisperTrainer``, ``Qwen3ASRTrainer`` or
+        ``Qwen3OmniLoraTrainer`` instance.
     :raises ValueError: If the architecture is not recognized.
     """
     architecture = config.get("architecture", "parakeet")
@@ -1377,6 +1382,14 @@ def create_trainer(config: dict):
         return NeMoTrainer(config)
     elif architecture == "whisper":
         return WhisperTrainer(config)
+    elif architecture == "qwen3_asr":
+        from lyricscribe.finetune.qwen import Qwen3ASRTrainer
+
+        return Qwen3ASRTrainer(config)
+    elif architecture == "qwen3_omni":
+        from lyricscribe.finetune.qwen import Qwen3OmniLoraTrainer
+
+        return Qwen3OmniLoraTrainer(config)
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 
@@ -1399,7 +1412,7 @@ def run_training_job(
     the discovered value is persisted to ``config.json``, the trainer is
     recreated from the latest checkpoint, and the chunk is retried. This
     repeats until either training succeeds or the workload can no longer
-    be reduced.
+    be reduced. Qwen architectures re-raise the OOM instead.
 
     :param config: Job configuration dictionary.
     :param train_manifest: Path to the training manifest JSONL file.
@@ -1419,6 +1432,10 @@ def run_training_job(
             )
         except torch.cuda.OutOfMemoryError as e:
             architecture = str(config.get("architecture", "")).lower()
+            if architecture in ("qwen3_asr", "qwen3_omni"):
+                # Halving per rank desyncs DDP step counts and deadlocks NCCL.
+                logger.error(f"OOM at batch_size={config.get('batch_size')}: {e}")
+                raise
             if architecture == "canary":
                 current_duration = float(config.get("batch_duration") or 600.0)
                 if current_duration <= 1.0:
@@ -1464,6 +1481,9 @@ def _run_training_job_inner(
     the latest checkpoint if any, and trains the requested epochs. Any
     OOM raised here is caught and handled by ``run_training_job``.
     """
+    # cuDNN SDPA rebuilds its graph for every new sequence shape, i.e. every
+    # padded batch.
+    torch.backends.cuda.enable_cudnn_sdp(False)
     trainer = create_trainer(config)
 
     start_epoch = config.get("current_epoch", 0)

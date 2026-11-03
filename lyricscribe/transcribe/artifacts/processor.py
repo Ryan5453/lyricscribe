@@ -22,6 +22,8 @@ DEFAULT_MFA_DOCKER_REF = "docker://mmcauliffe/montreal-forced-aligner:latest"
 _MFA_MODEL_BY_LANGUAGE = {
     "en": "english_mfa",
     "es": "spanish_mfa",
+    "de": "german_mfa",
+    "fr": "french_mfa",
 }
 _WORK_MOUNT = "/mfa_work"
 _MFA_ROOT_MOUNT = "/mfa_root"
@@ -201,8 +203,8 @@ def align(
     :param filename: audio filename inside each song subdirectory (e.g.
         ``"vocals.wav"`` or ``"htdemucs_ft_vocals.wav"``).
     :param num_chunks: total number of shards this dataset is partitioned into.
-        When >1, only the subset matching ``chunk_id`` is processed. Used by
-        the SLURM array wrapper to parallelize large datasets across nodes.
+        When >1, only the subset matching ``chunk_id`` is processed, so a
+        job array can parallelize large datasets across nodes.
     :param chunk_id: 0-indexed shard id to process (requires ``num_chunks > 1``).
     :param skip_existing: if True, songs whose ``lyrics.json`` already has a
         non-null ``alignment`` field are skipped — makes resume-on-failure
