@@ -10,13 +10,26 @@ analyze_app = typer.Typer(help="Scoring, reference self-WER, significance testin
 
 
 def _write_json(path: Path | None, data) -> None:
+    """
+    Write *data* as indented JSON, creating parent dirs; no-op without a path.
+
+    :param path: Destination file, or ``None`` to skip.
+    :param data: JSON-serialisable object.
+    """
     if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
         logger.info(f"Wrote {path}")
 
 
-def _keep_set(selfwer_file: Path | None, max_self_wer: float):
+def _keep_set(selfwer_file: Path | None, max_self_wer: float) -> set[str] | None:
+    """
+    Load the reference-quality keep-set and report its size.
+
+    :param selfwer_file: Self-WER artifact, or ``None`` for no filter.
+    :param max_self_wer: Inclusive self-WER cutoff.
+    :return: Song IDs to keep, or ``None`` when no artifact is given.
+    """
     if selfwer_file is None:
         return None
     from lyricscribe.analysis.common import load_selfwer_keep
@@ -26,20 +39,40 @@ def _keep_set(selfwer_file: Path | None, max_self_wer: float):
     return keep
 
 
-def _print_result(name: str, res: dict) -> None:
-    from lyricscribe.analysis.scoring import format_stats
+def _format_stats(label: str, s: dict) -> str:
+    """
+    One-line human summary of a stats dict.
 
+    :param label: Row label.
+    :param s: Stats from :func:`~lyricscribe.analysis.common.corpus_stats`.
+    :return: The summary line.
+    """
+    sh = s["share"]
+    return (
+        f"{label}: n={s['n']} WER={s['wer']:.4f} "
+        f"I/D/S={sh['I']:.1f}/{sh['D']:.1f}/{sh['S']:.1f} "
+        f"(I={s['I']} D={s['D']} S={s['S']})"
+    )
+
+
+def _print_result(name: str, res: dict) -> None:
+    """
+    Print one job's scores, or why it was skipped.
+
+    :param name: Job label.
+    :param res: Result from :func:`~lyricscribe.analysis.scoring.score_many`.
+    """
     if "error" in res:
         typer.echo(f"SKIP {name}: {res['error']}")
         return
     typer.echo(name)
-    typer.echo("  " + format_stats("all", res["all"]))
+    typer.echo("  " + _format_stats("all", res["all"]))
     if "filtered" in res:
-        typer.echo("  " + format_stats("filtered", res["filtered"]))
+        typer.echo("  " + _format_stats("filtered", res["filtered"]))
     if "raw" in res:
-        typer.echo("  " + format_stats("raw (un-normalised)", res["raw"]))
+        typer.echo("  " + _format_stats("raw (un-normalised)", res["raw"]))
     for lang, s in res.get("by_language", {}).items():
-        typer.echo("    " + format_stats(lang, s))
+        typer.echo("    " + _format_stats(lang, s))
 
 
 _SELFWER_OPT = typer.Option(

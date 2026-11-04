@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import shutil
 import subprocess
 import time
@@ -9,8 +10,16 @@ from pathlib import Path
 import librosa
 import numpy as np
 import torch
+from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.data import Dataset
-from transformers import Trainer, TrainerCallback, TrainingArguments
+from transformers import (
+    AutoProcessor,
+    Qwen3ASRForConditionalGeneration,
+    Qwen3OmniMoeForConditionalGeneration,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +44,21 @@ OMNI_LORA_TARGETS = {
 
 
 def _is_main_process() -> bool:
+    """
+    Whether this process is local rank 0 (or not running under DDP).
+
+    :return: ``True`` on rank 0.
+    """
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
 
 
 def _language_code(row: dict) -> str:
+    """
+    Base language code of a manifest row, e.g. ``"en"`` from ``"en-US"``.
+
+    :param row: Manifest row; a missing ``language`` counts as English.
+    :return: Lowercase base code.
+    """
     return (row.get("language") or "en").split("-")[0].split("_")[0].lower()
 
 
@@ -50,14 +70,30 @@ class WindowDataset(Dataset):
     """
 
     def __init__(self, manifest: Path):
+        """
+        Read every row of the manifest.
+
+        :param manifest: Manifest JSONL path.
+        """
         with Path(manifest).open() as f:
             self.rows = [json.loads(line) for line in f if line.strip()]
         logger.info(f"Loaded {len(self.rows)} windows from {manifest}")
 
     def __len__(self) -> int:
+        """
+        Number of windows.
+
+        :return: Row count.
+        """
         return len(self.rows)
 
     def __getitem__(self, index: int) -> dict:
+        """
+        Decode one window's audio.
+
+        :param index: Row index.
+        :return: ``{"audio", "text", "language"}`` for the collators.
+        """
         row = self.rows[index]
         audio, _ = librosa.load(
             row["audio_filepath"], sr=SAMPLE_RATE, mono=True,
@@ -100,6 +136,9 @@ def _concat_prompt_target(prompt_ids, target_ids, pad_id):
     """
     Right-pad prompt+target sequences; the prompt is masked out of the loss.
 
+    :param prompt_ids: Per-item prompt token ids.
+    :param target_ids: Per-item target token ids (transcript + EOS).
+    :param pad_id: Padding token id.
     :return: ``(input_ids, attention_mask, labels)`` batch tensors.
     """
     seqs = [torch.cat([p, t]) for p, t in zip(prompt_ids, target_ids)]
@@ -125,11 +164,22 @@ class Qwen3ASRCollator:
     """
 
     def __init__(self, processor):
+        """
+        Keep the processor and resolve the pad id (EOS when the tokenizer has none).
+
+        :param processor: ``Qwen3ASRProcessor``.
+        """
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
 
     def __call__(self, features: list[dict]) -> dict:
+        """
+        Collate :class:`WindowDataset` items into a training batch.
+
+        :param features: Dataset items.
+        :return: Token ids, attention mask, labels and the padded audio features.
+        """
         prompts, targets, feats, masks = [], [], [], []
         for item in features:
             enc = self.processor.apply_transcription_request(
@@ -161,11 +211,22 @@ class Qwen3OmniCollator:
     """
 
     def __init__(self, processor):
+        """
+        Keep the processor and resolve the pad id (EOS when the tokenizer has none).
+
+        :param processor: ``Qwen3OmniMoeProcessor``.
+        """
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
 
     def _prompt(self, language: str) -> str:
+        """
+        Chat-templated instruction prompt with one audio slot.
+
+        :param language: Full language name, e.g. ``"English"``.
+        :return: Prompt text ending in the generation prefix.
+        """
         messages = [{"role": "user", "content": [
             {"type": "audio", "audio": ""},
             {"type": "text", "text": OMNI_PROMPT.format(language=language)},
@@ -174,6 +235,12 @@ class Qwen3OmniCollator:
             messages, add_generation_prompt=True, tokenize=False)
 
     def __call__(self, features: list[dict]) -> dict:
+        """
+        Collate :class:`WindowDataset` items into a training batch.
+
+        :param features: Dataset items.
+        :return: Token ids, attention mask, labels and the processor's audio tensors.
+        """
         prompts, targets, extras = [], [], []
         for item in features:
             enc = self.processor(
@@ -236,7 +303,9 @@ def mean_token_ce(model, collator, dataset, batch_size: int = 2) -> float:
 
 def _slurm_seconds_left() -> float | None:
     """
-    Remaining walltime of the current Slurm job, or ``None`` outside Slurm.
+    Remaining walltime of the current Slurm job.
+
+    :return: Seconds left, or ``None`` outside Slurm or when ``squeue`` can't tell.
     """
     job = os.environ.get("SLURM_JOB_ID")
     if not job:
@@ -267,12 +336,25 @@ class _StepBudgetCallback(TrainerCallback):
     """
 
     def __init__(self, probe_steps: int = 20):
+        """
+        Set up timing state; the trainer sets ``target_epoch`` before each call.
+
+        :param probe_steps: Steps to time before projecting.
+        """
         self.probe_steps = probe_steps
         self.target_epoch = None
         self._t0 = None
         self._step0 = None
 
     def on_train_begin(self, args, state, control, **kwargs):
+        """
+        Record the start time and step, and log the total step budget.
+
+        :param args: Training arguments.
+        :param state: Trainer state.
+        :param control: Trainer control flags.
+        :param kwargs: Unused callback extras.
+        """
         self._t0, self._step0 = time.time(), state.global_step
         per_epoch = state.max_steps / max(args.num_train_epochs, 1e-9)
         logger.info(
@@ -281,6 +363,15 @@ class _StepBudgetCallback(TrainerCallback):
         )
 
     def on_step_end(self, args, state, control, **kwargs):
+        """
+        After ``probe_steps`` steps, log the projected time to ``target_epoch``
+        on rank 0, warning if it exceeds the remaining Slurm walltime.
+
+        :param args: Training arguments.
+        :param state: Trainer state.
+        :param control: Trainer control flags.
+        :param kwargs: Unused callback extras.
+        """
         done = state.global_step - (self._step0 or 0)
         if done != self.probe_steps or not _is_main_process():
             return
@@ -305,9 +396,21 @@ class _StopAfterEpochCallback(TrainerCallback):
     """
 
     def __init__(self):
+        """
+        Start with no target epoch; the trainer sets it before each call.
+        """
         self.target_epoch = None
 
     def on_epoch_end(self, args, state, control, **kwargs):
+        """
+        Request a save and stop once ``target_epoch`` is reached.
+
+        :param args: Training arguments.
+        :param state: Trainer state.
+        :param control: Trainer control flags.
+        :param kwargs: Unused callback extras.
+        :return: The updated *control*.
+        """
         if self.target_epoch is not None and state.epoch is not None and \
                 state.epoch >= self.target_epoch - 1e-3:
             control.should_save = True
@@ -326,6 +429,11 @@ class _QwenTrainerBase:
     collator_cls = None
 
     def __init__(self, config: dict):
+        """
+        Store the config; the model loads in :meth:`setup`.
+
+        :param config: Job configuration dictionary.
+        """
         self.config = config
         self.model = None
         self.processor = None
@@ -334,20 +442,46 @@ class _QwenTrainerBase:
         self.val_manifest = None
         self.job_dir = Path(config["output_dir"]) / config["exp_name"]
 
-    # Subclasses: build self.model / self.processor from a path or hub id.
     def _load(self, path: str) -> None:
+        """
+        Load ``self.model`` and ``self.processor``.
+
+        :param path: Hub id or local checkpoint path.
+        :raises NotImplementedError: On the base class.
+        """
         raise NotImplementedError
 
     def _training_args(self) -> dict:
+        """
+        Extra ``TrainingArguments`` for a subclass.
+
+        :return: Keyword overrides (none by default).
+        """
         return {}
 
     def setup(self, train_manifest: Path, val_manifest: Path | None) -> None:
+        """
+        Record the manifests and load the base model if none is loaded yet.
+
+        :param train_manifest: Training manifest JSONL.
+        :param val_manifest: Validation manifest JSONL, or ``None``.
+        """
         self.train_manifest = train_manifest
         self.val_manifest = val_manifest
         if self.model is None:
             self._load(self.config["base_model"])
 
     def train_one_epoch(self, target_epoch: int) -> dict:
+        """
+        Train up to *target_epoch*, resuming from the latest complete step checkpoint.
+
+        The HF ``Trainer`` is built on the first call with the LR schedule
+        spanning ``max_epochs``; later calls reuse it.
+
+        :param target_epoch: Epoch to train up to (1-indexed).
+        :return: Eval metrics when a validation manifest is set, plus
+            ``train_loss_logged``, the last logged training loss.
+        """
         train_dataset = WindowDataset(self.train_manifest)
         eval_dataset = WindowDataset(self.val_manifest) if self.val_manifest else None
         if self.hf_trainer is None:
@@ -423,8 +557,11 @@ class Qwen3ASRTrainer(_QwenTrainerBase):
     collator_cls = Qwen3ASRCollator
 
     def _load(self, path: str) -> None:
-        from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
+        """
+        Load a transformers-native Qwen3-ASR checkpoint in bf16.
 
+        :param path: Hub id or local checkpoint path.
+        """
         logger.info(f"Loading Qwen3-ASR: {path}")
         self.processor = AutoProcessor.from_pretrained(path)
         self.model = Qwen3ASRForConditionalGeneration.from_pretrained(path, dtype=torch.bfloat16)
@@ -439,6 +576,13 @@ class Qwen3ASRTrainer(_QwenTrainerBase):
                     setattr(gc, field, None)
 
     def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
+        """
+        Save the full model and processor to ``epoch_<N>`` (rank 0 only).
+
+        :param epoch: Epoch number for the directory name.
+        :param checkpoint_dir: Parent directory for checkpoints.
+        :return: Path to the checkpoint directory.
+        """
         path = checkpoint_dir / f"epoch_{epoch}"
         if _is_main_process():
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -449,6 +593,12 @@ class Qwen3ASRTrainer(_QwenTrainerBase):
         return path
 
     def load_checkpoint(self, checkpoint_path: Path) -> int:
+        """
+        Load a full-model checkpoint directory.
+
+        :param checkpoint_path: ``epoch_<N>`` directory.
+        :return: The epoch number from the directory name (0 if unparseable).
+        """
         self._load(str(checkpoint_path))
         try:
             return int(checkpoint_path.name.split("_")[1])
@@ -468,8 +618,6 @@ def load_omni_thinker(base_model: str, device: str = "cuda:0"):
     :param device: Device map target.
     :return: ``(thinker, processor)``.
     """
-    from transformers import AutoProcessor, Qwen3OmniMoeForConditionalGeneration
-
     processor = AutoProcessor.from_pretrained(base_model)
     full = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         base_model, dtype=torch.bfloat16, device_map=device)
@@ -489,8 +637,13 @@ class Qwen3OmniLoraTrainer(_QwenTrainerBase):
     collator_cls = Qwen3OmniCollator
 
     def _load(self, path: str, adapter: str | None = None) -> None:
-        from peft import LoraConfig, PeftModel, get_peft_model
+        """
+        Load the Omni thinker and wrap it with a new or saved LoRA adapter.
 
+        :param path: Hub id or path of the full Omni checkpoint.
+        :param adapter: Saved adapter dir to resume; ``None`` creates a fresh
+            adapter from ``lora_rank`` / ``lora_targets``.
+        """
         thinker, self.processor = load_omni_thinker(path)
         if adapter is not None:
             self.model = PeftModel.from_pretrained(thinker, adapter, is_trainable=True)
@@ -507,6 +660,13 @@ class Qwen3OmniLoraTrainer(_QwenTrainerBase):
         self.model.print_trainable_parameters()
 
     def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
+        """
+        Save the LoRA adapter and processor to ``epoch_<N>`` (rank 0 only).
+
+        :param epoch: Epoch number for the directory name.
+        :param checkpoint_dir: Parent directory for checkpoints.
+        :return: Path to the checkpoint directory.
+        """
         path = checkpoint_dir / f"epoch_{epoch}"
         if _is_main_process():
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -515,6 +675,12 @@ class Qwen3OmniLoraTrainer(_QwenTrainerBase):
         return path
 
     def load_checkpoint(self, checkpoint_path: Path) -> int:
+        """
+        Reload the base thinker with a saved adapter.
+
+        :param checkpoint_path: ``epoch_<N>`` adapter directory.
+        :return: The epoch number from the directory name (0 if unparseable).
+        """
         self._load(self.config["base_model"], adapter=str(checkpoint_path))
         try:
             return int(checkpoint_path.name.split("_")[1])
@@ -545,16 +711,12 @@ def eval_loss(
     :param batch_size: Windows per forward pass.
     :return: ``{"base": ce, <checkpoint>: ce, ...}``.
     """
-    import random
-
     torch.backends.cuda.enable_cudnn_sdp(False)  # see _run_training_job_inner
     dataset = WindowDataset(manifest)
     if rows and rows < len(dataset.rows):
         dataset.rows = random.Random(seed).sample(dataset.rows, rows)
     results = {}
     if architecture == "qwen3_asr":
-        from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
-
         collator = Qwen3ASRCollator(AutoProcessor.from_pretrained(base_model))
         for name in [base_model, *checkpoints]:
             model = Qwen3ASRForConditionalGeneration.from_pretrained(name, dtype=torch.bfloat16).to("cuda:0")
@@ -563,8 +725,6 @@ def eval_loss(
             del model
             torch.cuda.empty_cache()
     elif architecture == "qwen3_omni":
-        from peft import PeftModel
-
         thinker, processor = load_omni_thinker(base_model)
         collator = Qwen3OmniCollator(processor)
         results["base"] = mean_token_ce(thinker, collator, dataset, batch_size)

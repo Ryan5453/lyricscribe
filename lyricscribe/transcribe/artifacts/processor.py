@@ -32,6 +32,12 @@ _MIN_SEGMENT_S = 0.2
 
 
 def _language_key(lyrics_data: dict) -> str:
+    """
+    Base language code of a song, e.g. ``"en"`` for ``"en-US"``.
+
+    :param lyrics_data: Parsed ``lyrics.json``.
+    :return: Lowercase base language code, ``"en"`` if none is set.
+    """
     lang = (lyrics_data.get("detected_language") or "en").lower()
     return lang.split("-")[0].split("_")[0]
 
@@ -39,6 +45,9 @@ def _language_key(lyrics_data: dict) -> str:
 def _clean_lyrics(text: str) -> str:
     """
     Strip punctuation and normalise whitespace for MFA.
+
+    :param text: Lyrics text.
+    :return: Lowercase text with only word characters, apostrophes and single spaces.
     """
     text = text.lower()
     text = re.sub(r"[^\w\s']", " ", text)
@@ -51,7 +60,7 @@ def _parse_mfa_json(json_path: Path) -> list[dict]:
 
     :param json_path: path to a ``.json`` file produced by MFA with
         ``output_format="json"``.
-    :returns: list of dicts each containing ``word``, ``start``, and ``end``.
+    :return: list of dicts each containing ``word``, ``start``, and ``end``.
     """
     with open(json_path) as f:
         data = json.load(f)
@@ -86,6 +95,9 @@ def _display_word_map(orig_text: str) -> tuple[list[str], list[str]]:
     Parallel (cleaned_word, display_word) sequences for one line:
     ``cleaned`` is what MFA saw, ``display`` the original token. Tokens
     the cleaner drops or splits keep their cleaned form.
+
+    :param orig_text: Original lyric line.
+    :return: ``(cleaned, display)`` word lists of equal length.
     """
     cleaned_seq: list[str] = []
     display_seq: list[str] = []
@@ -106,6 +118,10 @@ def _recase_segment_words(words: list[dict], orig_text: str) -> list[dict]:
     forms from the source line. Positional when counts match (also
     recovers ``<unk>``), sequence-matched otherwise; unmatched words
     keep the cleaned form.
+
+    :param words: MFA word entries with ``word``, ``start`` and ``end``.
+    :param orig_text: Original lyric line the words were aligned from.
+    :return: Copies of *words* with ``word`` replaced by its display form.
     """
     cleaned_seq, display_seq = _display_word_map(orig_text)
     out = [dict(w) for w in words]
@@ -141,6 +157,10 @@ def _iter_synced_segments(lyrics_data: dict) -> list[dict]:
 
     Expected input shape is ``lyrics_data["synced"]["data"]`` where each item
     has ``text``, ``start``, and ``duration`` in milliseconds.
+
+    :param lyrics_data: Parsed ``lyrics.json``.
+    :return: Segments with ``index``, ``text``, ``start_s`` and ``end_s``;
+        empty or too-short lines are skipped.
     """
     synced = lyrics_data.get("synced", {}).get("data", [])
     if not isinstance(synced, list):
@@ -323,6 +343,13 @@ def _run_mfa_pass(
     """
     Build an MFA corpus from *song_dirs*, run alignment with *mfa_model*,
     then write per-song alignments back into each song's ``lyrics.json``.
+
+    :param song_dirs: Song directories to align.
+    :param mfa_model: MFA dictionary and acoustic model name.
+    :param filename: Audio filename within each song directory.
+    :param mfa_host: Host MFA root directory, mounted into the container.
+    :param image_arg: Container image path or URI.
+    :param runtime: ``apptainer`` or ``singularity``.
     """
 
     with tempfile.TemporaryDirectory(prefix="lyricscribe_mfa_") as tmp:

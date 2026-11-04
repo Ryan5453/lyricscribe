@@ -19,6 +19,11 @@ def _window_has_vocals(
     """
     True if any non-empty synced line has most of its duration inside
     the window.
+
+    :param synced: Synced lyric lines (``start`` and ``duration`` in ms).
+    :param window_start_ms: Window start.
+    :param window_end_ms: Window end.
+    :return: Whether the window has vocals.
     """
     for line in synced:
         if not line.get("text", "").strip():
@@ -50,6 +55,12 @@ def _unlabeled_vocal_fraction(
     clipped to the window); labeled time from ``segments_raw`` spans.
     Windows with no sung time return 0.0 (purely instrumental windows
     are complete by definition).
+
+    :param synced: Synced lyric lines (``start`` and ``duration`` in ms).
+    :param segments_raw: Label segments ``(start_ms, end_ms, words)``.
+    :param window_start_ms: Window start.
+    :param window_end_ms: Window end.
+    :return: The unlabeled fraction.
     """
     vocal: list[list[float]] = []
     for line in synced:
@@ -104,6 +115,13 @@ def _segments_for_window(
     heuristic. Returns ``(segments, mfa_gap)`` where ``mfa_gap`` is True
     when the window has vocals per the synced lines but no aligned words
     — an alignment failure, not silence.
+
+    :param synced: Synced lyric lines (``start`` and ``duration`` in ms).
+    :param aligned_words: MFA word timings, or ``None`` for the synced-line heuristic.
+    :param window_start_ms: Window start.
+    :param window_end_ms: Window end.
+    :param line_overlap_threshold: Minimum fraction of a synced line inside the window for it to count.
+    :return: ``(segments, mfa_gap)``.
     """
     segments_raw: list[list] = []
     if aligned_words is not None:
@@ -158,10 +176,6 @@ class LyricsDataset:
 
     Each song directory must contain a ``lyrics.json`` file and at least one
     of the requested audio filenames.
-
-    :param dataset_dir: Root directory containing song subdirectories.
-    :param filenames: Audio filenames to look for in each song directory.
-        When multiple are provided, one is chosen at random per iteration.
     """
 
     def __init__(
@@ -169,6 +183,13 @@ class LyricsDataset:
         dataset_dir: Path,
         filenames: list[str],
     ):
+        """
+        Scan *dataset_dir* for songs with ``lyrics.json`` and at least one of *filenames*.
+
+        :param dataset_dir: Root directory containing song subdirectories.
+        :param filenames: Audio filenames to look for in each song directory.
+            When multiple are provided, one is chosen at random per iteration.
+        """
         self.dataset_dir = Path(dataset_dir)
         self.filenames = filenames
 
@@ -558,12 +579,10 @@ def write_subset_manifest(
     :param seed: Shuffle seed (default 42).
     :return: Number of entries written to the subset manifest.
     """
-    import random as _random
-
     with open(source) as f:
         lines = f.readlines()
 
-    rng = _random.Random(seed)
+    rng = random.Random(seed)
     rng.shuffle(lines)
     lines = lines[:size]
 

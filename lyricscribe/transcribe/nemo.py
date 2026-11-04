@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torchaudio
 from nemo.collections.asr.models import EncDecMultiTaskModel
+from nemo.collections.asr.parts.submodules.multitask_decoding import MultiTaskDecodingConfig
+from omegaconf import OmegaConf
 from silero_vad import get_speech_timestamps
 from torch.jit import ScriptModule
 
@@ -55,6 +57,8 @@ def _install_aed_logit_controls(generator) -> None:
     Idempotent: the wrapper reads ``generator._ls_repetition_penalty`` /
     ``generator._ls_no_repeat_ngram_size`` on every call, so re-installs just
     refresh those attributes. With both knobs at defaults it is a no-op.
+
+    :param generator: NeMo ``GreedySequenceGenerator``, patched in place.
     """
     if getattr(generator, "_ls_logit_controls", False):
         return
@@ -70,6 +74,17 @@ def _install_aed_logit_controls(generator) -> None:
         pos=0,
         return_scores: bool = True,
     ):
+        """
+        Run the original step, then apply the repetition controls to the last-position logits.
+
+        :param decoder_input_ids: Full prompt on the first step, otherwise the running prefix.
+        :param encoder_hidden_states: Encoder output.
+        :param encoder_input_mask: Encoder padding mask.
+        :param decoder_mems_list: Decoder cache; ``None`` on the prompt step.
+        :param pos: Decoding position.
+        :param return_scores: Passed through.
+        :return: The original step's result, with its logits edited in place.
+        """
         if decoder_mems_list is None:
             state["ids"] = decoder_input_ids.detach().clone()
         else:
@@ -137,7 +152,6 @@ class NemoTranscriber(Transcriber):
         """
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Loading NeMo model: {self.model_name}")
-        from pathlib import Path
         if Path(self.model_name).is_file():
             # ``ASRModel.restore_from`` can't build multitask models; use their class.
             cfg = nemo_asr.models.ASRModel.restore_from(
@@ -194,10 +208,6 @@ class NemoTranscriber(Transcriber):
             inner = getattr(self.model.decoding, "decoding", None)
             if wants_controls and not hasattr(inner, "greedy_search"):
                 # Controls need the greedy generator; same output as beam_size=1.
-                from nemo.collections.asr.parts.submodules.multitask_decoding import (
-                    MultiTaskDecodingConfig,
-                )
-                from omegaconf import OmegaConf
 
                 self.model.change_decoding_strategy(
                     OmegaConf.structured(MultiTaskDecodingConfig(strategy="greedy"))

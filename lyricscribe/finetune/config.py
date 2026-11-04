@@ -197,6 +197,12 @@ def get_latest_checkpoint(job_dir: Path, config: dict) -> Path | None:
         return None
     
     def epoch_from_path(p: Path) -> int:
+        """
+        Epoch number of an ``epoch_N`` checkpoint, or -1.
+
+        :param p: Checkpoint path.
+        :return: The epoch.
+        """
         try:
             return int(p.stem.split("_")[1])
         except (IndexError, ValueError):
@@ -230,6 +236,8 @@ def list_checkpoints(job_dir: Path, config: dict) -> list[tuple[int, Path]]:
     List all available checkpoints sorted by epoch.
 
     :return: List of (epoch, path) tuples
+    :param job_dir: Path to job directory
+    :param config: Job configuration
     """
     ckpt_dir = Path(config["output_dir"]) / config["exp_name"] / "checkpoints"
     if not ckpt_dir.exists():

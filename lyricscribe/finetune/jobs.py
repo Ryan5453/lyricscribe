@@ -159,6 +159,11 @@ def update_chunk_status(
 
 
 def show_job_stats(job_dir: Path) -> None:
+    """
+    Log a finetuning job's progress, chunk states, checkpoints and per-epoch metrics.
+
+    :param job_dir: Job directory.
+    """
     status = load_job_status(job_dir)
 
     logger.info(f"Experiment: {status['exp_name']}")
@@ -268,6 +273,12 @@ def gather_experiment_status(job_dir: Path) -> dict:
         ckpts = [p for p in ckpt_dir.iterdir() if p.name.startswith("epoch_")]
         if ckpts:
             def epoch_num(p: Path) -> int:
+                """
+                Epoch number of an ``epoch_N`` checkpoint, or -1.
+
+                :param p: Checkpoint path.
+                :return: The epoch.
+                """
                 try:
                     return int(p.stem.split("_")[1])
                 except (IndexError, ValueError):

@@ -3,6 +3,9 @@ import logging
 import shutil
 from pathlib import Path
 
+import torch
+from safetensors.torch import load_file, save_file
+
 logger = logging.getLogger(__name__)
 
 _SKIP_FILES = {
@@ -22,8 +25,6 @@ def load_state(path: Path) -> dict:
     :param path: Checkpoint dir.
     :return: ``{name: tensor}``.
     """
-    from safetensors.torch import load_file
-
     path = Path(path)
     index = path / "model.safetensors.index.json"
     state = {}
@@ -53,9 +54,6 @@ def merge_checkpoints(
     :param dtype: Saved dtype, as a ``torch`` dtype name.
     :return: ``{"weights", "tensors", "dropped_keys"}``.
     """
-    import torch
-    from safetensors.torch import save_file
-
     if len(members) < 2:
         raise ValueError("need at least two members")
     if weights is None:

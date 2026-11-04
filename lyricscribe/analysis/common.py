@@ -6,8 +6,6 @@ import jiwer
 
 from lyricscribe.evaluate import _language_for, _load_dataset, _normalized
 
-EXPECTED_SONGS = {"jam-alt": 79, "jam_alt": 79, "musdb_alt": 39}
-
 
 @dataclass
 class Job:
@@ -32,20 +30,20 @@ class Job:
 
     @property
     def dataset_dirs(self) -> list[Path]:
+        """
+        Dataset directories from the job config.
+
+        :return: The directories.
+        """
         return [Path(d) for d in self.config.get("directories", [])]
 
-    @property
-    def expected(self) -> int | None:
-        """
-        Song count this job should have, or ``None`` if unknown.
-        """
-        for d in self.dataset_dirs:
-            if d.name in EXPECTED_SONGS:
-                return EXPECTED_SONGS[d.name]
-        total = self.config.get("total_files")
-        return int(total) if total else None
-
     def normalized_hyp(self, song_id: str) -> str:
+        """
+        Normalised hypothesis for one song; empty if transcription failed.
+
+        :param song_id: Song ID.
+        :return: Normalised text.
+        """
         return _normalized(self.hyps.get(song_id) or "", self.langs[song_id])
 
 

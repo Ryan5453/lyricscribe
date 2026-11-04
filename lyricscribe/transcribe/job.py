@@ -13,9 +13,13 @@ import torch
 from silero_vad import load_silero_vad
 from torch.jit import ScriptModule
 
+from lyricscribe.ensemble.deloop import deloop
 from lyricscribe.jobs import update_status
+from lyricscribe.transcribe.audio_llm import AudioLLMTranscriber
 from lyricscribe.transcribe.base import Transcriber
+from lyricscribe.transcribe.gemini import GeminiTranscriber
 from lyricscribe.transcribe.nemo import NemoTranscriber
+from lyricscribe.transcribe.qwen_asr import Qwen3ASRTranscriber
 from lyricscribe.transcribe.whisper import WhisperTranscriber
 
 logger = logging.getLogger(__name__)
@@ -105,8 +109,6 @@ def _create_transcriber(model_name: str, batch_size: int, config: dict | None = 
     if backend == "nemo":
         return NemoTranscriber(model_name, batch_size)
     if backend == "qwen3_asr":
-        from lyricscribe.transcribe.qwen_asr import Qwen3ASRTranscriber
-
         return Qwen3ASRTranscriber(
             model_name,
             batch_size,
@@ -114,8 +116,6 @@ def _create_transcriber(model_name: str, batch_size: int, config: dict | None = 
             auto_language=bool(config.get("auto_language", False)),
         )
     if backend in ("qwen3_omni", "voxtral", "musicflamingo"):
-        from lyricscribe.transcribe.audio_llm import AudioLLMTranscriber
-
         return AudioLLMTranscriber(
             model_name,
             backend,
@@ -124,8 +124,6 @@ def _create_transcriber(model_name: str, batch_size: int, config: dict | None = 
             adapter=config.get("adapter"),
         )
     if backend == "gemini":
-        from lyricscribe.transcribe.gemini import GeminiTranscriber
-
         return GeminiTranscriber(model_name, batch_size)
     raise ValueError(f"Unknown backend {backend!r}; expected one of {BACKENDS}")
 
@@ -191,6 +189,12 @@ def parse_song_dirname(name: str) -> tuple[str, str]:
     left, _, right = name.partition("_-_")
 
     def clean(s: str) -> str:
+        """
+        Replace underscores, strip a leading track number and collapse whitespace.
+
+        :param s: One half of the directory name.
+        :return: The cleaned half.
+        """
         s = re.sub(r"^\d+\.?\s*", "", s.replace("_", " "))
         return re.sub(r"\s+", " ", s).strip()
 
@@ -565,8 +569,6 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
 
             raw = None
             if deloop_max_run:
-                from lyricscribe.ensemble.deloop import deloop
-
                 words = text.split()
                 fixed = deloop(words, max_run=int(deloop_max_run))
                 if fixed != words:

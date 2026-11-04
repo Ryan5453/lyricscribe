@@ -6,6 +6,11 @@ import sys
 import time
 from pathlib import Path
 
+import torch
+
+from lyricscribe.finetune.config import detect_architecture
+from lyricscribe.finetune.trainer import create_trainer
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +41,13 @@ def _build_probe_config(
     the per-rank sample count (``batch_size``), for Canary it is seconds
     of audio per batch (``batch_duration``) since Canary's setup sets
     ``batch_size = None`` and only duration batching controls memory.
+    :param architecture: Detected architecture.
+    :param model_name: Base model hub id or path.
+    :param batch_value: ``batch_size``, or ``batch_duration`` in seconds for Canary.
+    :param freeze_encoder: Freeze the encoder, as in production.
+    :param max_duration_s: Per-sample audio cap.
+    :param learning_rate: Optimizer learning rate.
+    :return: The trainer config.
     """
     config = {
         "architecture": architecture,
@@ -57,6 +69,11 @@ def _build_probe_config(
 
 
 def main() -> int:
+    """
+    Run the probe trial given on the command line and write its result on rank 0.
+
+    :return: Process exit code.
+    """
     parser = argparse.ArgumentParser(
         description="Run N training steps and report peak VRAM per rank."
     )
@@ -94,11 +111,6 @@ def main() -> int:
         level=logging.INFO,
         format=f"%(asctime)s [rank {os.environ.get('RANK', '0')}] %(levelname)s %(message)s",
     )
-
-    import torch
-
-    from lyricscribe.finetune.config import detect_architecture
-    from lyricscribe.finetune.trainer import create_trainer
 
     architecture = detect_architecture(args.model)
     rank = int(os.environ.get("RANK", "0"))

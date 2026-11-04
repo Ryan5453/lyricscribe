@@ -5,7 +5,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file
 from torch.jit import ScriptModule
+from transformers import (
+    AutoProcessor,
+    GenerationConfig,
+    Qwen3ASRConfig,
+    Qwen3ASRForConditionalGeneration,
+)
+from transformers.models.qwen3_asr.modeling_qwen3_asr import _get_feat_extract_output_lengths
 
 from lyricscribe.transcribe.base import Transcriber
 from lyricscribe.transcribe.chunking import SAMPLE_RATE, language_name, song_chunks
@@ -37,7 +46,6 @@ def _resolve_dir(model_name: str, allow_patterns: list[str] | None = None) -> Pa
     path = Path(model_name)
     if path.is_dir():
         return path
-    from huggingface_hub import snapshot_download
 
     return Path(snapshot_download(model_name, allow_patterns=allow_patterns))
 
@@ -71,14 +79,6 @@ def load_qwen3_asr(model_name: str, dtype: torch.dtype, device: str):
     :param device: Torch device.
     :return: ``(model, processor, generation_config)``.
     """
-    from safetensors.torch import load_file
-    from transformers import (
-        AutoProcessor,
-        GenerationConfig,
-        Qwen3ASRConfig,
-        Qwen3ASRForConditionalGeneration,
-    )
-
     src = _resolve_dir(model_name)
     cfg = json.loads((src / "config.json").read_text())
     if "thinker_config" not in cfg:
@@ -142,16 +142,20 @@ def _encode_audio_per_item(model) -> None:
 
     :param model: Native ``Qwen3ASRForConditionalGeneration``.
     """
-    from transformers.models.qwen3_asr.modeling_qwen3_asr import (
-        _get_feat_extract_output_lengths,
-    )
-
     inner = model.model
     original = inner.get_audio_features
     n_window = inner.audio_tower.n_window
     chunk = n_window * 2
 
     def per_item(input_features, input_features_mask, **kwargs):
+        """
+        Encode each item of the batch alone and concatenate the pooled outputs.
+
+        :param input_features: Padded log-mel features, one row per item.
+        :param input_features_mask: Valid-frame mask per item.
+        :param kwargs: Passed through to the original ``get_audio_features``.
+        :return: The last item's output with ``pooler_output`` holding every item's pooled tokens.
+        """
         pooled = []
         out = None
         for feat, mask in zip(input_features, input_features_mask):
@@ -177,6 +181,12 @@ def _encode_audio_per_item(model) -> None:
 
 
 def _float_range_normalize(audio: np.ndarray) -> np.ndarray:
+    """
+    Cast to float32 and peak-normalise into [-1, 1] (qwen-asr's input normalisation).
+
+    :param audio: Waveform.
+    :return: The normalised waveform; silent or empty input is returned as float32 unchanged.
+    """
     audio = audio.astype(np.float32)
     if audio.size == 0:
         return audio
@@ -200,6 +210,14 @@ def _split_audio_into_chunks(
 ) -> list[np.ndarray]:
     """
     Split at low-energy points near ``max_chunk_sec``; pad short chunks (qwen-asr).
+
+    :param wav: Mono waveform.
+    :param sr: Sample rate.
+    :param max_chunk_sec: Longest chunk.
+    :param search_expand_sec: How far either side of each cut point to search
+        for the quietest window.
+    :param min_window_ms: Width of the energy window.
+    :return: Chunks, each padded to at least ``_MIN_ASR_INPUT_SECONDS``.
     """
     wav = np.asarray(wav, dtype=np.float32)
     total_len = int(wav.shape[0])
@@ -239,9 +257,20 @@ def _split_audio_into_chunks(
 def _detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
     """
     Collapse >threshold character / short-pattern repeats (qwen-asr).
+
+    :param text: Decoded text.
+    :param threshold: Repeat count that triggers collapsing.
+    :return: The repaired text.
     """
 
     def fix_char_repeats(s, thresh):
+        """
+        Collapse runs of one character longer than *thresh* to a single character.
+
+        :param s: Text.
+        :param thresh: Longest run kept as is.
+        :return: The repaired text.
+        """
         res, i, n = [], 0, len(s)
         while i < n:
             count = 1
@@ -252,6 +281,14 @@ def _detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
         return "".join(res)
 
     def fix_pattern_repeats(s, thresh, max_len=20):
+        """
+        Collapse a pattern of up to *max_len* characters repeated *thresh* or more times.
+
+        :param s: Text.
+        :param thresh: Repeat count that triggers collapsing.
+        :param max_len: Longest pattern searched for.
+        :return: The repaired text.
+        """
         n = len(s)
         min_repeat_chars = thresh * 2
         if n < min_repeat_chars:
@@ -290,6 +327,11 @@ def _detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
 def _parse_asr_output(raw: str, forced_language: str | None) -> str:
     """
     Strip the ``language X<asr_text>`` header and repetitions (qwen-asr).
+
+    :param raw: Decoded model output.
+    :param forced_language: Language forced in the prompt; the output then has
+        no header to strip.
+    :return: Transcription text.
     """
     s = (raw or "").strip()
     if not s:
@@ -311,6 +353,10 @@ def _build_prompt(context: str, language: str | None) -> str:
 
     Forcing a language appends ``language X<asr_text>`` so the model emits
     transcription text only.
+
+    :param context: ``context`` system message (may be empty).
+    :param language: Language name to force, or ``None``.
+    :return: The rendered prompt.
     """
     prompt = (
         f"<|im_start|>system\n{context or ''}<|im_end|>\n"
@@ -354,6 +400,9 @@ class Qwen3ASRTranscriber(Transcriber):
         self.generation_config = None
 
     def load(self) -> None:
+        """
+        Load the model and processor onto the GPU (CPU without CUDA).
+        """
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
         logger.info(f"Loading Qwen3-ASR: {self.model_name} on {device}")
@@ -369,6 +418,15 @@ class Qwen3ASRTranscriber(Transcriber):
         self, wavs: list[np.ndarray], context: str, language: str | None,
         no_repeat_ngram_size: int,
     ) -> list[str]:
+        """
+        Decode chunks of one song in batches of ``batch_size``.
+
+        :param wavs: 16 kHz mono chunks.
+        :param context: Qwen ``context`` system message.
+        :param language: Language name to force, or ``None`` to let the model identify it.
+        :param no_repeat_ngram_size: Decoder ``no_repeat_ngram_size`` (0 = off).
+        :return: Parsed transcription text per chunk.
+        """
         prompt = _build_prompt(context, language)
         config = copy.deepcopy(self.generation_config)
         config.max_new_tokens = self.max_new_tokens

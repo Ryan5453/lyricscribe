@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 
 import numpy as np
+import soundfile as sf
 from torch.jit import ScriptModule
 
 from lyricscribe.transcribe.base import Transcriber
@@ -39,13 +40,24 @@ class GeminiTranscriber(Transcriber):
         self.key = None
 
     def load(self) -> None:
+        """
+        Read the API key from ``GEMINI_API_KEY``.
+
+        :raises RuntimeError: If the variable is unset or empty.
+        """
         self.key = os.environ.get("GEMINI_API_KEY", "").strip()
         if not self.key:
             raise RuntimeError("GEMINI_API_KEY is not set")
 
     def _call(self, chunk: np.ndarray, language: str) -> str:
-        import soundfile as sf
+        """
+        Transcribe one chunk with a single API request, retrying 429/5xx and network errors.
 
+        :param chunk: Mono waveform at ``SAMPLE_RATE``.
+        :param language: Language name for the prompt.
+        :return: The response text, or ``""`` if Gemini returned no candidates.
+        :raises RuntimeError: On a non-retryable HTTP error or once retries are exhausted.
+        """
         buffer = io.BytesIO()
         sf.write(buffer, chunk, SAMPLE_RATE, format="WAV", subtype="PCM_16")
         body = json.dumps({

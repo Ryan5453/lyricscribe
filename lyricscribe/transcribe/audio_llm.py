@@ -4,8 +4,17 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
+from peft import PeftModel
 from torch.jit import ScriptModule
+from transformers import (
+    AutoProcessor,
+    MusicFlamingoForConditionalGeneration,
+    Qwen3OmniMoeForConditionalGeneration,
+    Qwen3OmniMoeProcessor,
+    VoxtralForConditionalGeneration,
+)
 
 from lyricscribe.transcribe.base import Transcriber
 from lyricscribe.transcribe.chunking import SAMPLE_RATE, language_name, song_chunks
@@ -55,13 +64,16 @@ class AudioLLMTranscriber(Transcriber):
         self.processor = None
 
     def load(self) -> None:
+        """
+        Load the model and processor for this family onto the GPU (CPU without CUDA).
+
+        :raises ImportError: For Voxtral when ``mistral-common`` is not installed.
+        """
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         logger.info(f"Loading {self.family}: {self.model_name} on {device}")
         # cuDNN SDPA rebuilds its graph per sequence shape, which stalls decoding.
         torch.backends.cuda.enable_cudnn_sdp(False)
         if self.family == "voxtral":
-            from transformers import AutoProcessor, VoxtralForConditionalGeneration
-
             try:
                 import mistral_common  # noqa: F401
             except ImportError as e:
@@ -78,11 +90,6 @@ class AudioLLMTranscriber(Transcriber):
                 self.model_name, dtype=torch.bfloat16, device_map=device
             )
         elif self.family == "qwen3_omni":
-            from transformers import (
-                Qwen3OmniMoeForConditionalGeneration,
-                Qwen3OmniMoeProcessor,
-            )
-
             self.processor = Qwen3OmniMoeProcessor.from_pretrained(self.model_name)
             self.model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
                 self.model_name,
@@ -93,18 +100,11 @@ class AudioLLMTranscriber(Transcriber):
             # Without the talker, generate() returns the thinker's ids directly.
             self.model.disable_talker()
             if self.adapter:
-                from peft import PeftModel
-
                 # Merged, not wrapped, so the model's generate() path is untouched.
                 wrapped = PeftModel.from_pretrained(self.model.thinker, self.adapter)
                 self.model.thinker = wrapped.merge_and_unload()
                 logger.info(f"Merged LoRA adapter {self.adapter}")
         else:
-            from transformers import (
-                AutoProcessor,
-                MusicFlamingoForConditionalGeneration,
-            )
-
             self.processor = AutoProcessor.from_pretrained(self.model_name)
             # bf16 hits a dtype mismatch in a layer_norm on the fp32 audio path.
             self.model = MusicFlamingoForConditionalGeneration.from_pretrained(
@@ -114,6 +114,14 @@ class AudioLLMTranscriber(Transcriber):
 
     @torch.inference_mode()
     def _generate(self, wav_path: Path, prompt: str, no_repeat_ngram_size: int) -> str:
+        """
+        Transcribe one audio file with the family's chat format and greedy decoding.
+
+        :param wav_path: Audio file to transcribe.
+        :param prompt: Instruction text sent with the audio.
+        :param no_repeat_ngram_size: Decoder ``no_repeat_ngram_size`` (0 = off).
+        :return: The generated text.
+        """
         audio = {"type": "audio", "path": str(wav_path)}
         text = {"type": "text", "text": prompt}
         content = [text, audio] if self.family == "musicflamingo" else [audio, text]
@@ -184,8 +192,6 @@ class AudioLLMTranscriber(Transcriber):
         ``no_repeat_ngram_size`` is honoured; the other decoding knobs and
         ``initial_prompt`` are accepted and ignored.
         """
-        import soundfile as sf
-
         del vad_model, use_chunked, repetition_penalty, num_beams
         del condition_on_prev, temperature_fallback
         del compression_ratio_threshold, logprob_threshold, initial_prompt

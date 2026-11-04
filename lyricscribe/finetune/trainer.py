@@ -1,9 +1,11 @@
 import json
 import logging
+import gc
 import math
 import os
 import random
 import shutil
+import subprocess
 import tempfile
 import types
 from dataclasses import dataclass
@@ -45,7 +47,6 @@ def _configure_cuda_toolkit_for_numba() -> None:
     nvvm_unversioned = nvvm_lib64 / "libnvvm.so"
     if nvvm_unversioned.exists():
         try:
-            import subprocess
             soname = subprocess.check_output(
                 ["objdump", "-p", str(nvvm_unversioned)], text=True
             )
@@ -77,6 +78,18 @@ _configure_cuda_toolkit_for_numba()
 
 import jiwer
 import nemo.collections.asr as nemo_asr
+import numpy as np
+from lhotse import CutSet, MonoCut
+from lhotse.cut import Cut, MixedCut
+from lhotse.dataset.collation import collate_vectors
+from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
+    PromptedAudioToTextLhotseDataset,
+    PromptedAudioToTextMiniBatch,
+    _drop_in_memory_data,
+)
+from nemo.collections.common.data import apply_prompt_format_fn
+from nemo.collections.common.data import prompt_fn as _prompt_fn
+from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from omegaconf import OmegaConf
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
@@ -93,6 +106,7 @@ from transformers import (
 from transformers.models.whisper.modeling_whisper import shift_tokens_right
 
 from lyricscribe.finetune.config import get_latest_checkpoint
+from lyricscribe.finetune.qwen import Qwen3ASRTrainer, Qwen3OmniLoraTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +115,9 @@ def _is_main_process() -> bool:
     """
     Return True if this is rank 0 (or single-GPU). Used to guard
     file writes (checkpoints, metrics, config) in multi-GPU DDP.
+
+    :return: ``True`` on rank 0.
     """
-    import os
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
 
 
@@ -120,17 +135,9 @@ def _build_mono_averaging_canary_dataset_cls():
        MultiCut-tolerating prompt-function wrapper.
 
     Returns the class so importing NeMo stays lazy.
-    """
-    import numpy as np
-    from lhotse import CutSet
-    from lhotse.dataset.collation import collate_vectors
-    from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
-        PromptedAudioToTextLhotseDataset,
-        PromptedAudioToTextMiniBatch,
-        _drop_in_memory_data,
-    )
-    from nemo.collections.common.data import apply_prompt_format_fn
 
+    :return: The dataset class.
+    """
     class MonoAveragingPromptedDataset(PromptedAudioToTextLhotseDataset):
         """
         Load audio, average stereo channels, and format prompts as usual.
@@ -142,6 +149,12 @@ def _build_mono_averaging_canary_dataset_cls():
         """
 
         def __getitem__(self, cuts: CutSet) -> PromptedAudioToTextMiniBatch:
+            """
+            Load and channel-average each cut's audio and collate the prompts.
+
+            :param cuts: Cuts in the batch.
+            :return: The collated mini-batch.
+            """
             audios: list[torch.Tensor] = []
             audio_lens_list: list[int] = []
             for cut in cuts:
@@ -203,11 +216,13 @@ def _patch_prompt_format_for_multi_channel() -> None:
     registry level is the earliest hook point. Idempotent: attaches a
     ``_lyricscribe_patched`` marker on each wrapper.
     """
-    from lhotse import MonoCut
-    from lhotse.cut import Cut, MixedCut
-    from nemo.collections.common.data import prompt_fn as _prompt_fn
-
     def _to_mono_view(cut):
+        """
+        View a multi-channel cut as a MonoCut so prompt formatters accept it.
+
+        :param cut: Lhotse cut.
+        :return: The cut itself if mono or mixed, else a MonoCut of its first channel.
+        """
         if isinstance(cut, (MonoCut, MixedCut)):
             return cut
         if not hasattr(cut, "num_channels") or cut.num_channels <= 1:
@@ -236,7 +251,20 @@ def _patch_prompt_format_for_multi_channel() -> None:
             continue
 
         def _make_wrapper(fn):
+            """
+            Wrap one prompt-format function to accept multi-channel cuts.
+
+            :param fn: Registered prompt-format function.
+            :return: The marked wrapper.
+            """
             def wrapped(example, prompt):
+                """
+                Format *example* through its mono view.
+
+                :param example: Cut to format.
+                :param prompt: Prompt formatter.
+                :return: Whatever *fn* returns.
+                """
                 return fn(_to_mono_view(example), prompt)
 
             wrapped._lyricscribe_patched = True  # type: ignore[attr-defined]
@@ -251,14 +279,20 @@ def _install_mono_averaging_dataloader(model) -> None:
     Override ``model._setup_dataloader_from_config`` so the Lhotse dataloader
     uses the mono-averaging dataset above. Must be called before
     ``setup_training_data`` / ``setup_validation_data``.
-    """
-    from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 
+    :param model: Canary model to patch.
+    """
     _patch_prompt_format_for_multi_channel()
 
     dataset_cls = _build_mono_averaging_canary_dataset_cls()
 
     def _setup(self, config):
+        """
+        Build the Lhotse dataloader with the mono-averaging dataset.
+
+        :param config: Dataset config (``train_ds`` / ``validation_ds``).
+        :return: The dataloader.
+        """
         assert config.get("use_lhotse", False), (
             "Canary requires Lhotse dataloading (use_lhotse=True)."
         )
@@ -289,9 +323,23 @@ class _SkipNaNOrInfLossCallback(Callback):
     """
 
     def setup(self, trainer, pl_module, stage=None):
+        """
+        Wrap ``pl_module.training_step`` with the non-finite-loss guard.
+
+        :param trainer: Lightning trainer.
+        :param pl_module: Module being trained.
+        :param stage: Lightning stage name (unused).
+        """
         original_step = pl_module.training_step
 
         def safe_step(batch, batch_idx):
+            """
+            Run the original step, swapping a non-finite loss on any rank for a zero loss.
+
+            :param batch: Training batch.
+            :param batch_idx: Batch index.
+            :return: The original output, or a zero loss over all trainable parameters.
+            """
             skip_flag = torch.zeros(1, device=pl_module.device)
             out = original_step(batch, batch_idx)
 
@@ -338,9 +386,25 @@ class _SkipBadBatchCallback(Callback):
     """
 
     def setup(self, trainer, pl_module, stage=None):
+        """
+        Wrap ``pl_module.training_step`` with the bad-batch guard.
+
+        :param trainer: Lightning trainer.
+        :param pl_module: Module being trained.
+        :param stage: Lightning stage name (unused).
+        """
         original_step = pl_module.training_step
 
         def safe_training_step(batch, batch_idx):
+            """
+            Run the original step, swapping an RNNT invalid-input error on any rank
+            for a zero loss.
+
+            :param batch: Training batch.
+            :param batch_idx: Batch index.
+            :return: The original loss, or a zero loss over all trainable parameters.
+            :raises RuntimeError: For any other error from the original step.
+            """
             skip_flag = torch.zeros(1, device=pl_module.device)
             loss = None
             local_err: str | None = None
@@ -409,6 +473,11 @@ class NeMoTrainer:
     """
 
     def __init__(self, config: dict):
+        """
+        Store the config; the model loads in :meth:`setup`.
+
+        :param config: Job configuration dictionary.
+        """
         self.config = config
         self.current_epoch = config.get("current_epoch", 0)
         self.model = None
@@ -536,6 +605,8 @@ class NeMoTrainer:
         Estimate optimizer steps per epoch from the training manifest:
         total duration / ``batch_duration`` for Canary's duration-based
         Lhotse batching, sample count / ``batch_size`` otherwise.
+
+        :return: Steps per epoch (at least 1).
         """
         if self.config["architecture"] == "canary":
             total_duration = _sum_manifest_durations(self.train_manifest)
@@ -740,6 +811,14 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         processor: WhisperProcessor,
         timestamp_prob: float = 0.0,
     ):
+        """
+        Read the manifest and resolve the timestamp token range.
+
+        :param manifest_path: Path to the JSONL manifest file.
+        :param processor: ``WhisperProcessor`` for features and tokenization.
+        :param timestamp_prob: Probability of a timestamp-mode label for
+            entries that have ``segments``.
+        """
         self.processor = processor
         self.timestamp_prob = timestamp_prob
         self.entries = []
@@ -753,13 +832,21 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         self._max_timestamp_index = 1500
 
     def _timestamp_token(self, seconds: float) -> int:
+        """
+        Token id for the timestamp nearest *seconds*, clamped to 0–30 s.
+
+        :param seconds: Window-relative time.
+        :return: Timestamp token id.
+        """
         idx = round(seconds / self.TIME_PRECISION)
         return self._timestamp_begin + max(0, min(self._max_timestamp_index, idx))
 
     def _build_timestamp_labels(self, entry: dict) -> list[int] | None:
         """
         Build timestamp-mode label ids from the entry's ``segments``.
-        Returns ``None`` if the result exceeds the decoder cap.
+
+        :param entry: Manifest entry with ``segments``.
+        :return: Label ids, or ``None`` if they exceed the decoder cap.
         """
         tokenizer = self.processor.tokenizer
         ids = list(tokenizer.prefix_tokens)
@@ -941,9 +1028,21 @@ class _StopAndSaveAfterEpochCallback(TrainerCallback):
     """
 
     def __init__(self):
+        """
+        Start with no target epoch; :meth:`WhisperTrainer.train_one_epoch` sets it.
+        """
         self.target_epoch: int | None = None
 
     def on_epoch_end(self, args, state, control, **kwargs):
+        """
+        Request a save and stop once ``target_epoch`` is reached.
+
+        :param args: Training arguments.
+        :param state: Trainer state.
+        :param control: Trainer control flags.
+        :param kwargs: Unused callback extras.
+        :return: The updated *control*.
+        """
         if (
             self.target_epoch is not None
             and state.epoch is not None
@@ -965,6 +1064,11 @@ class WhisperTrainer:
     """
 
     def __init__(self, config: dict):
+        """
+        Store the config; the model loads in :meth:`setup`.
+
+        :param config: Job configuration dictionary.
+        """
         self.config = config
         self.current_epoch = config.get("current_epoch", 0)
         self.model = None
@@ -1267,12 +1371,8 @@ def create_trainer(config: dict):
     elif architecture == "whisper":
         return WhisperTrainer(config)
     elif architecture == "qwen3_asr":
-        from lyricscribe.finetune.qwen import Qwen3ASRTrainer
-
         return Qwen3ASRTrainer(config)
     elif architecture == "qwen3_omni":
-        from lyricscribe.finetune.qwen import Qwen3OmniLoraTrainer
-
         return Qwen3OmniLoraTrainer(config)
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
@@ -1344,7 +1444,6 @@ def run_training_job(
                 config["batch_size"] = new_bs
             with open(job_dir / "config.json", "w") as f:
                 json.dump(config, f, indent=2)
-            import gc
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -1360,6 +1459,14 @@ def _run_training_job_inner(
     Inner training implementation. Builds a fresh trainer, resumes from
     the latest checkpoint if any, and trains the requested epochs. Any
     OOM raised here is caught and handled by ``run_training_job``.
+
+    :param config: Job configuration dictionary.
+    :param train_manifest: Path to the training manifest JSONL file.
+    :param val_manifest: Path to the validation manifest JSONL file,
+        or ``None`` to skip validation.
+    :param chunk_end_epoch: Hard cap on the final epoch, or ``None``.
+    :param job_dir: Experiment directory.
+    :return: Status dict, as from :func:`run_training_job`.
     """
     # cuDNN SDPA rebuilds its graph for every padded batch shape.
     torch.backends.cuda.enable_cudnn_sdp(False)

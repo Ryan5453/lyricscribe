@@ -6,6 +6,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+import torch
+
+from lyricscribe.finetune import data as finetune_data
+from lyricscribe.finetune.config import detect_architecture
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,10 +21,22 @@ _BATCH_DURATION_CANDIDATES: tuple[int, ...] = (60, 120, 300, 600, 900, 1200, 144
 
 
 def _candidates_for(architecture: str) -> tuple[int, ...]:
+    """
+    Sweep stops for the batch knob of *architecture*.
+
+    :param architecture: Detected architecture.
+    :return: Candidate values in ascending order.
+    """
     return _BATCH_DURATION_CANDIDATES if architecture == "canary" else _BATCH_SIZE_CANDIDATES
 
 
 def _param_label(architecture: str) -> str:
+    """
+    Name of the batch knob being swept, for printing.
+
+    :param architecture: Detected architecture.
+    :return: The label.
+    """
     return "batch_duration (s)" if architecture == "canary" else "batch_size"
 
 
@@ -37,10 +54,13 @@ def _build_shared_manifest(
 
     Matches :func:`lyricscribe.finetune.data.create_manifest` exactly
     so the audio + text distribution the probe sees matches production.
-    """
-    from lyricscribe.finetune import data as finetune_data
-    from lyricscribe.finetune.config import detect_architecture
 
+    :param dataset_dir: Dataset with one dir per song.
+    :param filename: Audio filename in each song dir.
+    :param model_name: Base model hub id or path.
+    :param work_dir: Where to write the manifest.
+    :return: Manifest path.
+    """
     architecture = detect_architecture(model_name)
     manifest_path = work_dir / "probe_manifest.jsonl"
     dataset = finetune_data.LyricsDataset(dataset_dir, [filename])
@@ -72,7 +92,17 @@ def _run_trial(
     subprocess. Exit code != 0 is treated as an OOM (the whole DDP
     group dies as a unit, so either all ranks succeeded or none did).
 
-    :returns: Result dict including ``status`` ∈ {success, oom, timeout,
+    :param manifest: Shared probe manifest.
+    :param model_name: Base model hub id or path.
+    :param bs: Batch value to try (``batch_duration`` seconds for Canary).
+    :param freeze_encoder: Freeze the encoder.
+    :param max_duration_s: Per-sample audio cap.
+    :param num_gpus: DDP world size.
+    :param timeout_s: Wall-clock limit for the trial.
+    :param work_dir: Where the trial writes its result file.
+    :param phase: Sweep phase label, for printing and file names.
+    :param n_steps: Training steps to run.
+    :return: Result dict including ``status`` ∈ {success, oom, timeout,
         crash} plus the fields the probe writes to its output file.
     """
     print(f"\n{'=' * 72}")
@@ -147,8 +177,6 @@ def _detect_num_gpus() -> int:
     if cvd:
         return len([x for x in cvd.split(",") if x.strip()])
     try:
-        import torch
-
         return max(torch.cuda.device_count(), 1)
     except Exception:
         return 1
@@ -192,8 +220,6 @@ def tune_batch_size(
     :param n_steps: Training steps per trial (after PL's warmup).
     :return: Per-trial result dicts, one per attempted batch size.
     """
-    from lyricscribe.finetune.config import detect_architecture
-
     architecture = detect_architecture(model_name)
     candidates = [b for b in _candidates_for(architecture) if start <= b <= max_bs]
     if not candidates:
@@ -291,6 +317,12 @@ def _find_throughput_sweet_spot(
         return None
 
     def tput(r: dict) -> float:
+        """
+        Samples per second of a trial.
+
+        :param r: Trial result.
+        :return: Throughput, or 0 without a step time.
+        """
         step_ms = r.get("mean_step_ms", 0)
         return r["bs"] / (step_ms / 1000) if step_ms else 0
 
@@ -305,6 +337,12 @@ def _find_throughput_sweet_spot(
 
 
 def _print_summary(results: list[dict], safety_margin_pct: float) -> None:
+    """
+    Print the trial table and the recommended batch size.
+
+    :param results: Every trial result.
+    :param safety_margin_pct: VRAM margin applied to the largest fitting size when there is no throughput plateau.
+    """
     print(f"\n{'=' * 72}")
     print("  SUMMARY")
     print(f"{'=' * 72}")

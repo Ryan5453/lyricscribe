@@ -1,3 +1,4 @@
+import librosa
 import numpy as np
 
 from lyricscribe.transcribe.rms_vad import (
@@ -52,8 +53,6 @@ def load_mono(path: str) -> np.ndarray:
     :param path: Audio file path.
     :return: 1-D waveform.
     """
-    import librosa
-
     audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True)
     return audio
 

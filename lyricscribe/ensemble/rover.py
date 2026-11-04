@@ -5,6 +5,7 @@ import multiprocessing
 import random
 from pathlib import Path
 
+import jiwer
 import numpy as np
 
 from lyricscribe.evaluate import _language_for, _normalized
@@ -95,6 +96,12 @@ def merge_into_cn(
     memo: dict[str, np.ndarray] = {}
 
     def equals(token: str) -> np.ndarray:
+        """
+        Memoised mask of the token positions equal to *token*.
+
+        :param token: Candidate token.
+        :return: Boolean array over the tokens.
+        """
         cached = memo.get(token)
         if cached is None:
             cached = token_arr == token
@@ -182,6 +189,12 @@ def select_vote(cn: Network, systems: list[str], null_weight: float = 1.0) -> li
 
 
 def _oracle_choices(cn: Network) -> list[list[str | None]]:
+    """
+    Candidate tokens per slot, plus ``None`` where some member has NULL.
+
+    :param cn: Confusion network.
+    :return: Sorted candidates per slot.
+    """
     choices = []
     for slot in cn:
         candidates = {v for v in slot.values() if v is not None}
@@ -246,6 +259,13 @@ _STATE: dict = {}
 
 
 def _song_task(song: str) -> tuple[str, list[list[str]], list[int | None]]:
+    """
+    Vote one song under every ordering in the shared pool state.
+
+    :param song: Song ID.
+    :return: ``(song, votes, oracle distances)`` with one entry per ordering; distances are
+        ``None`` when the oracle is off.
+    """
     orders = _STATE["orders"]
     hyps = _STATE["hyps"]
     ref = _STATE["refs"][song]
@@ -348,8 +368,6 @@ def score(refs: dict[str, list[str]], hyps: dict[str, list[str]]) -> dict:
     :param hyps: Song -> hypothesis tokens.
     :return: ``{"wer", "I", "D", "S", "ref_words", "n_songs"}``.
     """
-    import jiwer
-
     songs = [s for s in sorted(hyps) if refs.get(s)]
     m = jiwer.process_words([" ".join(refs[s]) for s in songs], [" ".join(hyps[s]) for s in songs])
     n = m.substitutions + m.deletions + m.hits

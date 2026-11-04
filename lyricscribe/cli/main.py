@@ -1,14 +1,18 @@
 import csv
 import json
 import logging
+import random
 import shutil
 from pathlib import Path
 
 import typer
 
+from lyricscribe import jobs
+from lyricscribe.finetune import domains as finetune_domains
 from lyricscribe.finetune import jobs as finetune_jobs
 from lyricscribe.finetune.config import (
     create_finetune_config,
+    detect_architecture,
     get_checkpoint_for_epoch,
     get_latest_checkpoint,
     list_checkpoints,
@@ -49,6 +53,12 @@ def _collect_result_files(
 
     When ``job_name`` is provided, discovers ``results*.jsonl`` files from
     ``jobs_dir/*/<job_name>/`` and returns them in sorted order.
+
+    :param explicit_results: Result files given directly.
+    :param jobs_dir: Root holding one dir per model run.
+    :param job_name: Job dir name to look for under each run.
+    :return: Resolved result files, deduplicated, in input order.
+    :raises ValueError: If *job_name* is given without *jobs_dir* or matches nothing.
     """
     result_files: list[Path] = list(explicit_results or [])
 
@@ -76,6 +86,9 @@ def _collect_result_files(
 
 @cli.callback()
 def _setup_logging():
+    """
+    Configure logging for every command.
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
@@ -172,8 +185,6 @@ def separate_inspect(
     """
     Inspect separation job details and processing statistics.
     """
-    from lyricscribe import jobs
-
     with open(job_dir / "config.json") as f:
         config = json.load(f)
 
@@ -408,8 +419,6 @@ def transcribe_inspect(
     """
     Inspect transcription job details and processing statistics.
     """
-    from lyricscribe import jobs
-
     with open(job_dir / "config.json") as f:
         config = json.load(f)
     logger.info(f"VAD: {'enabled' if config.get('vad') else 'disabled'}")
@@ -854,11 +863,7 @@ def finetune_setup(
     Pass multiple --filename flags to train on a random mix of audio types
     (or a controlled mix with --audio-domain-mode).
     """
-    import random
-    import shutil as _shutil
-
     from lyricscribe.finetune import data as finetune_data
-    from lyricscribe.finetune import domains as finetune_domains
 
     overrides = {
         k: v
@@ -952,7 +957,7 @@ def finetune_setup(
     if manifests_from:
         for name in ("train_manifest.jsonl", "val_manifest.jsonl", "val_subset_manifest.jsonl"):
             if (manifests_from / name).exists():
-                _shutil.copy2(manifests_from / name, job_dir / name)
+                shutil.copy2(manifests_from / name, job_dir / name)
         if not train_manifest.exists():
             logger.error(f"No train_manifest.jsonl in {manifests_from}")
             return
@@ -967,7 +972,7 @@ def finetune_setup(
 
         if len(train_dataset) == 0:
             logger.error("No valid songs found in training directory!")
-            _shutil.rmtree(job_dir, ignore_errors=True)
+            shutil.rmtree(job_dir, ignore_errors=True)
             return
 
         n_train = finetune_data.create_manifest(
@@ -1023,7 +1028,7 @@ def finetune_setup(
         k = config["max_train_windows"]
         if k < len(rows):
             rows = random.Random(config["train_window_seed"]).sample(rows, k)
-            _shutil.copy2(train_manifest, job_dir / "train_manifest_full.jsonl")
+            shutil.copy2(train_manifest, job_dir / "train_manifest_full.jsonl")
             with open(train_manifest, "w") as f:
                 f.writelines(rows)
         logger.info(f"Training windows: {len(rows)} (max_train_windows={k})")
@@ -1420,7 +1425,6 @@ def finetune_eval_loss(
     Trainer's logged loss is accumulation-scaled and from train mode, so it is
     not comparable.
     """
-    from lyricscribe.finetune.config import detect_architecture
     from lyricscribe.finetune.qwen import eval_loss
 
     architecture = detect_architecture(base_model)

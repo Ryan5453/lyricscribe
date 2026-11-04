@@ -4,6 +4,9 @@ from pathlib import Path
 
 import typer
 
+from lyricscribe.ensemble.deloop import deloop_job
+from lyricscribe.ensemble.spec import load_spec
+
 logger = logging.getLogger(__name__)
 
 ensemble_app = typer.Typer(help="System combination (ROVER) over transcription job dirs")
@@ -20,8 +23,16 @@ _DATASET_DIR_HELP = "Ad-hoc dataset: name=dataset_dir. Repeatable."
 
 
 def _build_spec(spec_path, systems, dataset_dirs, datasets):
-    from lyricscribe.ensemble.spec import load_spec
+    """
+    Load the spec file and add the ad-hoc ``--dataset-dir`` and ``--system`` entries.
 
+    :param spec_path: Spec file, or ``None`` for a purely ad-hoc spec.
+    :param systems: ``--system`` values.
+    :param dataset_dirs: ``--dataset-dir`` values.
+    :param datasets: Datasets being combined; a ``--system`` without a dataset needs exactly one.
+    :return: The combined spec.
+    :raises typer.BadParameter: On a malformed ``--system`` or ``--dataset-dir``.
+    """
     spec = load_spec(spec_path)
     for arg in dataset_dirs or []:
         name, sep, path = arg.partition("=")
@@ -47,6 +58,12 @@ def _build_spec(spec_path, systems, dataset_dirs, datasets):
 def _load(spec, dataset, members):
     """
     Reference tokens, languages and normalised hypotheses for *members*.
+
+    :param spec: Ensemble spec.
+    :param dataset: Dataset name.
+    :param members: System names.
+    :return: ``(dataset spec, reference tokens per song, hypotheses per member)``.
+    :raises typer.BadParameter: On an unknown dataset or a member with no job dir for it.
     """
     from lyricscribe.ensemble import rover
 
@@ -62,6 +79,14 @@ def _load(spec, dataset, members):
 
 
 def _members(spec, subset):
+    """
+    Resolve a subset name or comma-separated member list against the spec.
+
+    :param spec: Ensemble spec.
+    :param subset: Subset name, or comma-separated system names.
+    :return: Member names in alignment order.
+    :raises typer.BadParameter: On an unknown subset or system.
+    """
     try:
         return spec.members(subset)
     except KeyError as e:
@@ -69,10 +94,22 @@ def _members(spec, subset):
 
 
 def _pct(x: float) -> str:
+    """
+    Format a fraction as a percentage.
+
+    :param x: Fraction.
+    :return: e.g. ``"17.530%"``.
+    """
     return f"{100 * x:.3f}%"
 
 
 def _ids(s: dict) -> str:
+    """
+    Format the insertion, deletion and substitution shares of all errors.
+
+    :param s: Stats with ``I``, ``D`` and ``S`` counts.
+    :return: ``I/D/S`` percentages, or ``-`` with no errors.
+    """
     e = s["I"] + s["D"] + s["S"]
     if not e:
         return "-"
@@ -199,7 +236,5 @@ def deloop_cmd(
     Example: lyricscribe ensemble deloop jobs/qwen3omni/jam_alt
     --out jobs/qwen3omni_deloop/jam_alt --max-run 5
     """
-    from lyricscribe.ensemble.deloop import deloop_job
-
     changed, removed = deloop_job(src, out, max_run, max_cycle)
     print(f"de-looped {changed} songs, removed {removed} tokens -> {out}")

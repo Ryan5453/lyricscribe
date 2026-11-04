@@ -13,6 +13,15 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 
 
 def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False):
+    """
+    Build a YAML mapping, rejecting duplicate keys.
+
+    :param loader: Active loader.
+    :param node: Mapping node.
+    :param deep: Construct nested objects eagerly.
+    :return: The mapping.
+    :raises ValueError: On a duplicate key.
+    """
     seen: set = set()
     for key_node, _ in node.value:
         key = loader.construct_object(key_node, deep=deep)
@@ -132,6 +141,12 @@ def load_spec(path: Path | None) -> EnsembleSpec:
     root = Path(raw.get("root") or Path(path).parent)
 
     def resolve(p: str) -> Path:
+        """
+        Resolve a spec path against the spec root unless it is absolute.
+
+        :param p: Path from the spec.
+        :return: The resolved path.
+        """
         q = Path(p)
         return q if q.is_absolute() else root / q
 

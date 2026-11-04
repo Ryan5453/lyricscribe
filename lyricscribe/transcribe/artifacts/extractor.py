@@ -37,7 +37,7 @@ def _compute_mag_spectrogram(audio: np.ndarray) -> np.ndarray:
     window to reduce spectral leakage, then transformed into frequency using FFT.
 
     :param audio: 1D array of audio samples at 16kHz in float32.
-    :returns: 2D array containing the magnitude of each frequency bin for each frame.
+    :return: 2D array containing the magnitude of each frequency bin for each frame.
     """
 
     # 25 ms windows, standard for ASR

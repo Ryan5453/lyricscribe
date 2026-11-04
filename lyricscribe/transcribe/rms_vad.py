@@ -35,7 +35,7 @@ def get_speech_timestamps_rms(
     :param vad_options: Threshold + duration options.
     :param window_size_samples: Hop length of the RMS feature.
     :param sampling_rate: Sample rate of ``audio``.
-    :returns: List of ``{"start": int, "end": int}`` dicts with sample
+    :return: List of ``{"start": int, "end": int}`` dicts with sample
         indices.
     """
     onset = vad_options.onset
@@ -174,7 +174,7 @@ def merge_segments(
         :func:`get_speech_timestamps_rms`.
     :param max_length_s: Maximum chunk length (seconds).
     :param sampling_rate: Sample rate of the original audio.
-    :returns: Merged ``{"start", "end"}`` dicts with sample indices.
+    :return: Merged ``{"start", "end"}`` dicts with sample indices.
     """
     if not segments:
         return []

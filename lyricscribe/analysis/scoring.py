@@ -37,9 +37,9 @@ def scorable_songs(job: Job, require_complete: bool = True) -> list[str]:
                 f"{job.path}: {job.corrupt_lines} unparseable result line(s) — "
                 "parallel chunks probably raced on one results.jsonl"
             )
-        want = job.expected
+        want = len(job.refs)
         have = sum(1 for h in job.hyps.values() if h is not None)
-        if want is not None and have != want:
+        if have != want:
             raise IncompleteJobError(f"{job.path}: {have}/{want} songs transcribed")
     return ok
 
@@ -88,6 +88,13 @@ def score_job(
 
 
 def _stats(job: Job, songs: list[str]) -> dict:
+    """
+    Corpus stats over *songs* of *job*.
+
+    :param job: Loaded job.
+    :param songs: Songs to include.
+    :return: Stats from :func:`corpus_stats`.
+    """
     return corpus_stats(
         [job.refs[s] for s in songs], [job.normalized_hyp(s) for s in songs]
     )
@@ -147,15 +154,3 @@ def discover_job_dirs(root: Path, pattern: str) -> list[Path]:
         if d.is_dir() and (d / "config.json").exists() and any(d.glob("results*.jsonl")):
             found.add(d)
     return sorted(found)
-
-
-def format_stats(label: str, s: dict) -> str:
-    """
-    One-line human summary of a stats dict.
-    """
-    sh = s["share"]
-    return (
-        f"{label}: n={s['n']} WER={s['wer']:.4f} "
-        f"I/D/S={sh['I']:.1f}/{sh['D']:.1f}/{sh['S']:.1f} "
-        f"(I={s['I']} D={s['D']} S={s['S']})"
-    )

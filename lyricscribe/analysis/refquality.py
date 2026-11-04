@@ -65,6 +65,13 @@ def build_selfwer_artifact(dataset_dir: Path, output_path: Path) -> int:
 
 
 def _normalized_or_empty(text, language: str) -> str:
+    """
+    Normalise *text*, treating missing or non-string text as empty.
+
+    :param text: Raw transcript, possibly ``None``.
+    :param language: Language code.
+    :return: Normalised text.
+    """
     if not isinstance(text, str) or not text:
         return ""
     return _normalized(text, language)

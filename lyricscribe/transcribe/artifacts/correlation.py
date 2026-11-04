@@ -14,6 +14,13 @@ _TOKENIZER = LyricsTokenizer()
 
 
 def _normalized_words(text: str, language: str = "en") -> list[str]:
+    """
+    Tokenise and normalise text into lowercase words with the alt-eval tokenizer.
+
+    :param text: Lyrics text.
+    :param language: Language code.
+    :return: Normalised words.
+    """
     tokens = _TOKENIZER(text, language=language)
     return [t.text.lower() for t in tokens_as_words(tokens) if WORD in t.tags]
 
@@ -41,7 +48,7 @@ def _load_alignments(dataset_dir: Path) -> dict[str, list[dict]]:
     window-indexing expects).
 
     :param dataset_dir: Root dataset directory (one subdirectory per song).
-    :returns: Dictionary mapping song_id to a list of word dicts, each
+    :return: Dictionary mapping song_id to a list of word dicts, each
         with ``word``, ``start``, and ``end`` keys (start/end in seconds).
     """
     alignments = {}
@@ -73,7 +80,7 @@ def _load_artifact_features(features_dir: Path) -> dict[str, dict]:
     Load precomputed artifact features for each song.
 
     :param features_dir: absolute path to the directory containing one .json features file per song, as produced by the artifacts extract command.
-    :returns: Dictionary mapping song_id to its full features dict, containing per-frame arrays for artifact_rms, vocal_rms, artifact_to_signal_ratio, spectral_centroid, and spectral_flatness.
+    :return: Dictionary mapping song_id to its full features dict, containing per-frame arrays for artifact_rms, vocal_rms, artifact_to_signal_ratio, spectral_centroid, and spectral_flatness.
     """
     features = {}
     for path in (sorted(features_dir.glob("*.json"))):
@@ -89,7 +96,7 @@ def _load_results(result_files: list[Path]) -> dict[tuple[str, str], str]:
 
     :param result_files: absolute paths to .jsonl files where each line is a
         JSON object containing song_id, model_name, transcription, and error fields.
-    :returns: Dictionary mapping (song_id, model_name) tuples to transcription strings. Entries with errors or missing transcriptions are skipped.
+    :return: Dictionary mapping (song_id, model_name) tuples to transcription strings. Entries with errors or missing transcriptions are skipped.
     """
     results = {}
     for result_file in result_files:
@@ -114,7 +121,7 @@ def _load_ground_truth(musdb_dir: Path) -> tuple[dict[str, str], dict[str, str]]
     Load ground truth lyrics and language for each MUSDB song from its lyrics.json file.
 
     :param musdb_dir: root directory of the MUSDB dataset, containing one subdirectory per song, each with a lyrics.json file.
-    :returns: Tuple of (ground_truth, languages) dicts keyed by song_id.
+    :return: Tuple of (ground_truth, languages) dicts keyed by song_id.
     """
     ground_truth = {}
     languages = {}
@@ -147,7 +154,7 @@ def _get_artifact_features_for_window(features: dict, start_s: float, end_s: flo
     :param features: features dict for a single song as returned by _load_artifact_features.
     :param start_s: start of the time window in seconds.
     :param end_s: end of the time window in seconds.
-    :returns: dictionary containing the mean value of each artifact feature (artifact_rms, vocal_rms, artifact_to_signal_ratio, spectral_centroid, spectral_flatness) over the given window.
+    :return: dictionary containing the mean value of each artifact feature (artifact_rms, vocal_rms, artifact_to_signal_ratio, spectral_centroid, spectral_flatness) over the given window.
     """
     hop = features["hop_length"]
     sample_rate = features["sample_rate"]
@@ -182,7 +189,7 @@ def _get_word_error(
     :param reference: Ground truth lyrics string.
     :param hypothesis: Model transcription string.
     :param language: ISO 639-1 language code for the reference.
-    :returns: tuple of (word_errors, insertion_counts) where word_errors maps
+    :return: tuple of (word_errors, insertion_counts) where word_errors maps
         reference word index to error type, and insertion_counts maps each
         reference word index to the number of hypothesis words inserted
         adjacent to it.
@@ -233,7 +240,7 @@ def build_dataset(
         ``alignment`` field of each song's ``lyrics.json``; ground-truth
         lyrics from the same file's ``synced`` field.
     :param csv_output: optional path to also write the dataset as CSV.
-    :returns: list of row dicts.
+    :return: list of row dicts.
     """
     alignments = _load_alignments(musdb_dir)
     features = _load_artifact_features(features_dir)
@@ -322,7 +329,7 @@ def analyse(
 
     :param rows: word-level dataset as returned by :func:`build_dataset`.
     :param csv_output: optional path to write quartile summary CSV.
-    :returns: list of quartile summary dicts.
+    :return: list of quartile summary dicts.
     """
     rows = [r for r in rows if r["artifact_to_signal_ratio"] != float("inf")]
     if not rows:
@@ -341,6 +348,12 @@ def analyse(
     q25, q50, q75 = np.percentile(asr_values, [25, 50, 75])
 
     def get_quartile(val):
+        """
+        Bucket an artifact-to-signal ratio into its quartile.
+
+        :param val: Artifact-to-signal ratio.
+        :return: ``"Q1"`` (cleanest) to ``"Q4"`` (noisiest).
+        """
         if val <= q25: return "Q1"
         if val <= q50: return "Q2"
         if val <= q75: return "Q3"

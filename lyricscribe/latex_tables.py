@@ -28,6 +28,12 @@ DATASET_DISPLAY = {
 
 
 def _dataset_tex(ds: str) -> str:
+    """
+    LaTeX-escaped display name of a dataset.
+
+    :param ds: Dataset key from :data:`DATASET_DISPLAY`.
+    :return: The escaped display name.
+    """
     return DATASET_DISPLAY[ds].replace("_", "\\_")
 
 
@@ -35,6 +41,9 @@ def _config_label(job_dir: str) -> str:
     """
     Strip the dataset prefix from the job-dir basename to get a compact
     pipeline config label (e.g. 'stems_vad_chunked', 'mix_cross_vad').
+
+    :param job_dir: Job directory path.
+    :return: The LaTeX-escaped label.
     """
     basename = job_dir.split("/")[-1]
     for prefix in ("musdb_alt_", "jam_alt_", "final_test_"):
@@ -45,6 +54,12 @@ def _config_label(job_dir: str) -> str:
 
 
 def _derive_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add the label, input, VAD-kind and I/D/S rate and share columns the tables use.
+
+    :param df: Evaluation summary DataFrame.
+    :return: A copy with the derived columns.
+    """
     df = df.copy()
     df["model_label"] = df["model"].map(MODEL_LABELS)
     df["input"] = df["filename"].map(INPUT_FROM_FILENAME)
@@ -66,6 +81,12 @@ def _derive_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _row_full(r) -> str:
+    """
+    Format one row of the full results table.
+
+    :param r: Row from :func:`_derive_columns` output.
+    :return: The LaTeX table row.
+    """
     return (
         f"{r.model_label} & {r.config_label} & {int(r.n_songs)} & "
         f"{r.wer * 100:.1f} & "
@@ -74,6 +95,12 @@ def _row_full(r) -> str:
 
 
 def _row_headline(r) -> str:
+    """
+    Format one row of the headline results table.
+
+    :param r: Row from :func:`_derive_columns` output.
+    :return: The LaTeX table row.
+    """
     return (
         f"{r.model_label} & {r.config_label} & {r.wer * 100:.1f} & "
         f"{int(r.insertions):,} & {int(r.deletions):,} & {int(r.substitutions):,} \\\\"
@@ -86,6 +113,9 @@ def write_full_results_tex(df: pd.DataFrame, out_path: Path) -> None:
     This is intended to be compiled directly (``pdflatex full_results.tex``)
     as a reference appendix; it is NOT meant to be ``\\input{}``-ed into
     the main paper, since it can run hundreds of rows long.
+
+    :param df: Evaluation summary DataFrame.
+    :param out_path: Destination ``.tex`` file.
     """
     df = _derive_columns(df)
     lines = [
@@ -124,6 +154,13 @@ def write_full_results_tex(df: pd.DataFrame, out_path: Path) -> None:
 
 
 def write_headline_results_tex(df: pd.DataFrame, out_path: Path) -> None:
+    """
+    Write the headline table (each model's best config per dataset) as a
+    ``tabular`` to ``\\input{}`` into the paper.
+
+    :param df: Evaluation summary DataFrame.
+    :param out_path: Destination ``.tex`` file.
+    """
     df = _derive_columns(df)
     lines = [
         "% Auto-generated — do not edit by hand.",

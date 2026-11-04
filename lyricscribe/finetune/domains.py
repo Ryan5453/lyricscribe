@@ -26,6 +26,12 @@ def _domain_path(song_dir: Path, names: list[str]) -> Path:
 
 
 def _load_rows(path: Path) -> list[dict]:
+    """
+    Read a JSONL manifest; empty if it doesn't exist.
+
+    :param path: Manifest path.
+    :return: The rows.
+    """
     if not path.exists():
         return []
     with path.open() as f:
@@ -33,6 +39,12 @@ def _load_rows(path: Path) -> list[dict]:
 
 
 def _song_hash(song: str) -> str:
+    """
+    Stable hash of a song ID, for deterministic domain assignment.
+
+    :param song: Song ID.
+    :return: Hex SHA-256 digest.
+    """
     return hashlib.sha256(song.encode()).hexdigest()
 
 
