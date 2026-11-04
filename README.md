@@ -4,8 +4,8 @@
 
 ## Installation
 
-
 Assuming you have [uv](https://docs.astral.sh/uv/) installed, run:
+
 ```bash
 git clone https://github.com/Ryan5453/lyricscribe
 cd lyricscribe
@@ -17,19 +17,30 @@ Note: The project is configured for CUDA 12.9 (`cu129`). If you need a different
 
 ## CLI Usage
 
-The LyricScribe CLI contains eight subcommands: `lyricscribe dataset` for downloading public ALT datasets and running word-level forced alignment on them, `lyricscribe separate` for mass vocal separation using [Unblend](https://pypi.org/project/unblend/), `lyricscribe transcribe` for batch ASR transcription, `lyricscribe evaluate` for transcription quality evaluation and plotting, `lyricscribe artifacts` for artifact feature extraction and correlation analysis, `lyricscribe finetune` for ASR model finetuning with epoch-level SLURM checkpointing, `lyricscribe ensemble` for ROVER system combination across transcription jobs, and `lyricscribe analyze` for scoring, reference self-WER, significance testing and checkpoint averaging.
+| Command | Purpose |
+|---------|---------|
+| `lyricscribe dataset` | Download public ALT datasets and add word-level forced alignments |
+| `lyricscribe separate` | Batch vocal separation with [Unblend](https://pypi.org/project/unblend/) |
+| `lyricscribe transcribe` | Batch transcription with Whisper, NeMo, Qwen3-ASR, audio-LLM and Gemini backends |
+| `lyricscribe evaluate` | WER evaluation, LaTeX tables and plots across transcription jobs |
+| `lyricscribe artifacts` | Separation-artifact features and a word-level error dataset |
+| `lyricscribe finetune` | Finetuning with epoch-level checkpointing for SLURM |
+| `lyricscribe ensemble` | ROVER system combination and repetition repair |
+| `lyricscribe analyze` | Scoring, reference self-WER, significance testing and checkpoint averaging |
+
+`separate`, `transcribe` and `finetune` share a job model: `setup` writes a job directory split into chunks, `run --chunk-id N` processes one chunk (typically one SLURM array task), and finished work is skipped on rerun. Every command takes `--help`.
 
 <details>
 <summary><h3>lyricscribe dataset</h3></summary>
 
-The `dataset` commands download public ALT benchmark datasets and convert them into a standardized per-song directory layout with a `lyrics.json` file matching the project's Pydantic schema.
+The `dataset` commands download public ALT benchmark datasets and convert them into a per-song directory layout with a `lyrics.json` file matching the project's Pydantic schema.
 
 #### `lyricscribe dataset jam-alt`
 
 Downloads the [Jam-ALT](https://huggingface.co/datasets/jamendolyrics/jam-alt) dataset (79 songs in 4 languages) from HuggingFace. Each song gets a directory containing `audio.mp3` and `lyrics.json`.
 
 ```bash
-uv run lyricscribe dataset jam-alt --output-dir ./dataset/jam_alt
+lyricscribe dataset jam-alt --output-dir ./dataset/jam_alt
 ```
 
 Options:
@@ -48,10 +59,10 @@ jam_alt/
 
 #### `lyricscribe dataset musdb-alt`
 
-Downloads the [MUSDB-ALT](https://huggingface.co/datasets/jazasyed/musdb-alt) dataset (39 English songs). Lyrics are downloaded from HuggingFace, and audio is automatically downloaded from [MUSDB18-HQ](https://zenodo.org/records/3338373) on Zenodo (~30 GB, one-time download cached in `/tmp/lyricscribe/musdb18hq/`). Each song gets a directory containing `mixture.wav`, `vocals.wav`, and `lyrics.json`.
+Downloads the [MUSDB-ALT](https://huggingface.co/datasets/jazasyed/musdb-alt) dataset (39 English songs). Lyrics come from HuggingFace and audio from [MUSDB18-HQ](https://zenodo.org/records/3338373) on Zenodo (~30 GB, one-time download cached in `/tmp/lyricscribe/musdb18hq/`). Each song gets a directory containing `mixture.wav`, `vocals.wav` and `lyrics.json`.
 
 ```bash
-uv run lyricscribe dataset musdb-alt --output-dir ./dataset/musdb_alt
+lyricscribe dataset musdb-alt --output-dir ./dataset/musdb_alt
 ```
 
 Options:
@@ -71,9 +82,9 @@ musdb_alt/
 
 #### `lyricscribe dataset align`
 
-Runs Montreal Forced Aligner via Singularity/Apptainer to produce word-level alignments and writes them back into each song's `lyrics.json` under the `alignment` field. Works on any dataset that follows the standard per-song layout (each subdirectory contains an audio file and a `lyrics.json`).
+Runs Montreal Forced Aligner via Singularity/Apptainer and writes word-level alignments into each song's `lyrics.json` under `alignment`. Works on any dataset in the per-song layout. Each song is aligned with the MFA model for its detected language.
 
-**Setup** — pull the MFA image and download models once:
+Pull the MFA image and download models once:
 
 ```bash
 singularity pull mfa.sif docker://mmcauliffe/montreal-forced-aligner:latest
@@ -84,22 +95,12 @@ singularity exec --env MFA_ROOT_DIR=/mfa_root -B /path/to/mfa_cache:/mfa_root mf
     mfa model download dictionary english_mfa
 ```
 
-**Usage:**
+Then align, passing whichever audio file each song should be aligned against (e.g. a separated stem):
 
 ```bash
-uv run lyricscribe dataset align \
+lyricscribe dataset align \
     --dataset-dir ./dataset/musdb_alt \
     --filename vocals.wav \
-    --container ./mfa.sif \
-    --mfa-root /path/to/mfa_cache
-```
-
-For datasets separated with `lyricscribe separate` (e.g. an `htdemucs_ft_vocals.wav` stem per song), pass the stem filename:
-
-```bash
-uv run lyricscribe dataset align \
-    --dataset-dir ./dataset/final_train \
-    --filename htdemucs_ft_vocals.wav \
     --container ./mfa.sif \
     --mfa-root /path/to/mfa_cache
 ```
@@ -108,11 +109,11 @@ Options:
 
 - `--dataset-dir`: Root dataset directory containing song subdirectories (required)
 - `--filename`: Audio filename inside each song subdirectory (default: `vocals.wav`)
-- `--container` / `-c`: Path to `.sif` file (or set env `LYRICSCRIBE_MFA_CONTAINER`)
-- `--mfa-root`: Host directory for cached MFA pretrained models (recommended)
-- `--num-chunks`: Total shards for parallel execution (default `1`)
-- `--chunk-id`: 0-indexed shard to process (used with `--num-chunks`, usually supplied by `$SLURM_ARRAY_TASK_ID`)
-- `--skip-existing` / `--no-skip-existing`: Skip songs whose `lyrics.json` already has a non-null `alignment` (default on; makes reruns cheap)
+- `--container` / `-c`: Path to the MFA `.sif` image (or set `LYRICSCRIBE_MFA_CONTAINER`)
+- `--mfa-root`: Host directory for cached MFA pretrained models
+- `--num-chunks`: Total shards for parallel execution (default: 1)
+- `--chunk-id`: 0-indexed shard to process, usually `$SLURM_ARRAY_TASK_ID` (default: 0)
+- `--skip-existing` / `--no-skip-existing`: Skip songs that already have an alignment (default: on)
 
 After alignment, each song's `lyrics.json` has an `alignment` field like:
 
@@ -130,14 +131,14 @@ After alignment, each song's `lyrics.json` has an `alignment` field like:
 }
 ```
 
-Times are in milliseconds (matching the `synced` field's convention).
+Times are in milliseconds, matching the `synced` field's convention.
 
 </details>
 
 <details>
 <summary><h3>lyricscribe separate</h3></summary>
 
-The `separate` commands expect the dataset directory to contain **subdirectories**, each containing an audio file to be separated. The subdirectory names are used as identifiers for tracking progress. For example:
+The `separate` commands run [Unblend](https://pypi.org/project/unblend/) over a dataset of song subdirectories, each containing the audio file to separate. Subdirectory names identify songs for progress tracking:
 
 ```text
 dataset/
@@ -150,23 +151,18 @@ dataset/
 
 #### `lyricscribe separate setup`
 
-To be able to mass separate audio files, you need to set up a separation job.
-This creates a job directory with a config file and per-chunk JSON manifests to coordinate work across multiple workers.
-It divides your dataset into chunks, tracks the status of each file, and stores the job configuration so workers can process independently.
-This makes it possible to resume interrupted jobs since already-processed files are automatically skipped.
-
-To set up a separation job:
+Creates a job directory with the config and per-chunk manifests.
 
 ```bash
-# Save all stems (default)
-uv run lyricscribe separate setup /path/to/dataset \
+# Save all stems
+lyricscribe separate setup /path/to/dataset \
     --job-dir ./jobs/htdemucs_ft \
     --filename mix.wav \
     --model htdemucs_ft \
     --chunks 5
 
-# Or isolate just one stem
-uv run lyricscribe separate setup /path/to/dataset \
+# Isolate one stem
+lyricscribe separate setup /path/to/dataset \
     --job-dir ./jobs/htdemucs_ft \
     --filename mix.wav \
     --model htdemucs_ft \
@@ -176,39 +172,37 @@ uv run lyricscribe separate setup /path/to/dataset \
 
 Options:
 
+- `DIRECTORIES`: One or more dataset directories (positional, required)
 - `--job-dir`: Directory to create for job files (required)
-- `--filename`: Audio filename to process within each subdirectory, e.g. `mix.wav` (required)
-- `--model`: Unblend model to use (default: htdemucs). Run `unblend models list` to see the options; custom checkpoints are added with `unblend models import`.
-- `--stem`: Which stem to isolate - vocals, drums, bass, or other. If not specified, all stems are saved.
-- `--output-filename`: Output filename for a single isolated stem (default `{model}_{stem}.wav`)
+- `--filename`: Audio filename to separate within each subdirectory (required)
+- `--model`: Unblend model (default: `htdemucs`). `unblend models list` shows the options; custom checkpoints are added with `unblend models import`.
+- `--stem`: Stem to isolate (`vocals`, `drums`, `bass`, `other`). All stems are saved if omitted.
+- `--output-filename`: Output filename for a single isolated stem (default: `{model}_{stem}.wav`)
 - `--shifts`: Random time-shift passes to average; 0 is deterministic (default: 1)
 - `--split-overlap`: Overlap between consecutive model segments, in [0, 1) (default: 0.25)
 - `--seed`: Seed for the shift offsets (default: 0)
-- `--dtype`: Compute precision: auto (FP16 on CUDA), float32, float16 or bfloat16 (default: auto)
-- `--chunks`: Number of chunks to split dataset into (default: 5)
+- `--dtype`: `auto` (FP16 on CUDA), `float32`, `float16` or `bfloat16` (default: `auto`)
+- `--chunks`: Number of chunks (default: 5)
 
 #### `lyricscribe separate run`
 
-This command can only be ran after you have run the `lyricscribe separate setup` command which creates the job directory.
-You need to run this command however many times you specified with the `--chunks` argument in the setup command.
+Processes one chunk. Stems are written next to the source audio as `{model}_{stem}.wav`.
 
 ```bash
-uv run lyricscribe separate run --job-dir ./jobs/htdemucs_ft --chunk-id 1
+lyricscribe separate run --job-dir ./jobs/htdemucs_ft --chunk-id 1
 ```
 
 Options:
 
 - `--job-dir`: Path to job directory (required)
-- `--chunk-id`: Which chunk to process, 1-indexed (required)
-
-Output files will be saved in the same directory as the mixed audio with the template {model}_{stem}.wav.
+- `--chunk-id`: Chunk to process, 1-indexed (required)
 
 #### `lyricscribe separate inspect`
 
-This command allows you to inspect the job details and show processing statistics from the job directory.
+Shows the job config and processing statistics.
 
 ```bash
-uv run lyricscribe separate inspect --job-dir ./jobs/htdemucs_ft
+lyricscribe separate inspect --job-dir ./jobs/htdemucs_ft
 ```
 
 Options:
@@ -217,10 +211,10 @@ Options:
 
 #### `lyricscribe separate reset`
 
-This command resets a separation job so it can be re-run from scratch. It deletes the tracked separation outputs for the job and resets all chunk entries back to `pending`.
+Deletes the job's separation outputs and resets every chunk to `pending`.
 
 ```bash
-uv run lyricscribe separate reset --job-dir ./jobs/htdemucs_ft
+lyricscribe separate reset --job-dir ./jobs/htdemucs_ft
 ```
 
 Options:
@@ -232,21 +226,34 @@ Options:
 <details>
 <summary><h3>lyricscribe transcribe</h3></summary>
 
-The `transcribe` commands run ASR inference on audio files using Whisper, Parakeet, Canary, or other compatible models. Like the separation commands, transcription uses a chunk-based job system for parallel SLURM processing with automatic resuming.
+The `transcribe` commands run batch ASR over a dataset of song subdirectories. The backend is detected from the model id (or a local checkpoint's `config.json`) and can be forced with `--backend`:
+
+| Backend | Example models |
+|---------|----------------|
+| `whisper` | `openai/whisper-large-v3`, Whisper finetunes |
+| `nemo` | `nvidia/parakeet-tdt-0.6b-v3`, `nvidia/canary-1b-v2` |
+| `qwen3_asr` | `Qwen/Qwen3-ASR-1.7B` and finetunes |
+| `qwen3_omni` | `Qwen/Qwen3-Omni-30B-A3B-Instruct`, optionally with a LoRA `--adapter` |
+| `voxtral` | `mistralai/Voxtral-Mini-3B-2507` (needs `mistral-common` installed separately) |
+| `musicflamingo` | NVIDIA Music Flamingo |
+| `gemini` | Gemini models via the Google API; reads `GEMINI_API_KEY` |
+
+The LLM-decoder backends (Qwen3-ASR, the audio-LLMs and Gemini) take the whole song, or RMS-VAD chunks of it with `--vad --vad-method rms`; they don't support Silero VAD.
 
 #### `lyricscribe transcribe setup`
 
-Set up a transcription job by scanning dataset directories for audio files and splitting them into chunks.
+Scans the dataset and writes the job config and chunk manifests.
 
 ```bash
-# Basic setup
-uv run lyricscribe transcribe setup /path/to/dataset \
+# Whisper on separated vocals
+lyricscribe transcribe setup /path/to/dataset \
     --job-dir ./jobs/whisper_vocals \
     --filename vocals.wav \
-    --model openai/whisper-large-v3
+    --model openai/whisper-large-v3 \
+    --lyrics-file lyrics.json
 
-# With VAD segmentation and multiple chunks
-uv run lyricscribe transcribe setup /path/to/dataset \
+# Parakeet on the mix, segmented with Silero VAD, in 5 chunks
+lyricscribe transcribe setup /path/to/dataset \
     --job-dir ./jobs/parakeet_mixture \
     --filename mixture.wav \
     --model nvidia/parakeet-tdt-0.6b-v3 \
@@ -254,29 +261,52 @@ uv run lyricscribe transcribe setup /path/to/dataset \
     --vad
 ```
 
-Options:
+Job options:
 
+- `DIRECTORIES`: One or more dataset directories (positional, required)
 - `--job-dir`: Directory to create for job files (required)
 - `--filename`: Audio filename to transcribe within each subdirectory (required)
-- `--model`: HuggingFace model ID (required). Whisper models use HuggingFace Transformers, all others use NeMo.
-- `--chunks`: Number of chunks to split dataset into (default: 1)
-- `--batch-size`: Batch size for inference (default: 1)
-- `--vad`: Enable Silero VAD-based segmentation (flag)
+- `--model`: HuggingFace model id or local checkpoint path (required)
+- `--backend`: Force a backend instead of detecting it (see the table above)
+- `--chunks`: Number of chunks (default: 1)
+- `--batch-size`: Inference batch size (default: 1)
+- `--lyrics-file`: JSON file in each song directory to read `detected_language` from (e.g. `lyrics.json`)
+
+Segmentation:
+
+- `--vad`: Segment the audio with VAD before transcribing
+- `--vad-method`: `silero` (speech-trained) or `rms` (amplitude on separated vocals) (default: `silero`)
+- `--vad-source`: Audio file to run VAD on, e.g. a separated vocal stem, while transcribing `--filename`. Required with `--vad-method rms`.
+- `--chunked`: Fixed-length chunked inference instead of full context
+
+Decoding:
+
+- `--repetition-penalty`: Whisper decoder repetition penalty; 1.0 disables (default: 1.0)
+- `--no-repeat-ngram-size`: Block repeated n-grams; 0 disables. Applies to Whisper, Canary, Qwen3-ASR and the audio-LLMs. (default: 0)
+- `--mit`: Shortcut for `--repetition-penalty 1.7 --no-repeat-ngram-size 5`
+- `--num-beams`: Whisper beam width; 1 is greedy (default: 5)
+- `--condition-on-prev` / `--no-condition-on-prev`: Whisper long-form conditioning on previous windows (default: on)
+- `--temperature-fallback`: Whisper temperature fallback, triggered by `--compression-ratio-threshold` (default 2.4) and `--logprob-threshold` (default -1.0)
+- `--prompt-from-dirname`: Use the song directory name as Whisper's decoder prompt or Qwen3-ASR's context
+- `--max-new-tokens`: Per-chunk generation cap for the LLM-decoder backends (default: 1024)
+- `--adapter`: LoRA adapter directory merged into Qwen3-Omni
+- `--auto-language`: Let Qwen3-ASR identify the language instead of forcing the `--lyrics-file` one
+- `--deloop-max-run`: Collapse any short cycle repeated more than this many times; the raw text is kept as `transcription_raw`
 
 #### `lyricscribe transcribe run`
 
-Process one chunk of a transcription job. Results are appended to a JSONL file in the job directory.
+Processes one chunk and appends results to `results_{chunk_id}.jsonl` in the job directory.
 
 ```bash
-uv run lyricscribe transcribe run --job-dir ./jobs/whisper_vocals --chunk-id 1
+lyricscribe transcribe run --job-dir ./jobs/whisper_vocals --chunk-id 1
 ```
 
 Options:
 
 - `--job-dir`: Path to job directory (required)
-- `--chunk-id`: Which chunk to process, 1-indexed (required)
+- `--chunk-id`: Chunk to process, 1-indexed (required)
 
-Output files (`results_{chunk_id}.jsonl`) are saved in the job directory. Each line contains:
+Each result line looks like:
 
 ```json
 {"song_id": "...", "audio_file": "...", "transcription": "...", "model_name": "...", "duration_seconds": 0.0, "error": null}
@@ -284,10 +314,10 @@ Output files (`results_{chunk_id}.jsonl`) are saved in the job directory. Each l
 
 #### `lyricscribe transcribe inspect`
 
-Inspect transcription job details and show processing statistics.
+Shows the job config and processing statistics.
 
 ```bash
-uv run lyricscribe transcribe inspect --job-dir ./jobs/whisper_vocals
+lyricscribe transcribe inspect --job-dir ./jobs/whisper_vocals
 ```
 
 Options:
@@ -296,10 +326,10 @@ Options:
 
 #### `lyricscribe transcribe reset`
 
-Reset a transcription job so it can be re-run from scratch. Deletes any `results*.jsonl` files in the job directory and flips every chunk entry's status back to `pending` (clearing its duration, error, and processed-at fields).
+Deletes the job's `results*.jsonl` files and resets every chunk to `pending`.
 
 ```bash
-uv run lyricscribe transcribe reset --job-dir ./jobs/whisper_vocals
+lyricscribe transcribe reset --job-dir ./jobs/whisper_vocals
 ```
 
 Options:
@@ -311,65 +341,61 @@ Options:
 <details>
 <summary><h3>lyricscribe evaluate</h3></summary>
 
-The `evaluate` commands compute Word Error Rate (WER) and other metrics to check transcription quality against ground truth lyrics.
-
 #### `lyricscribe evaluate run`
 
-Recursively evaluates all complete transcription subdirectories inside a base jobs directory and, in one pass, writes everything into `--output-dir`: an aggregated CSV sorted by WER, paper-ready LaTeX tables under `tables/`, and analysis PDF plots covering baseline WER comparisons, error type breakdowns, and pipeline error-profile shifts.
+Evaluates every complete transcription job under a jobs directory and writes, in one pass: a CSV sorted by WER, LaTeX tables under `tables/`, and PDF plots of baseline WER, error-type breakdowns and pipeline error-profile shifts.
 
 ```bash
-# Core evaluation outputs (CSV + LaTeX tables + plots, all in ./results)
-uv run lyricscribe evaluate run \
+# CSV, LaTeX tables and plots
+lyricscribe evaluate run \
     --jobs-dir ./jobs \
     --output-dir ./results
 
-# Include the artifact quartile chart (builds word-level data in memory).
-# Alignments are read from each song's lyrics.json — run
-# `lyricscribe dataset align` on the MUSDB directory first.
-uv run lyricscribe evaluate run \
+# Also the artifact quartile chart. Run `lyricscribe dataset align` on the MUSDB directory first.
+lyricscribe evaluate run \
     --jobs-dir ./jobs \
     --output-dir ./results \
     --features-dir ./features \
     --results-file ./jobs/whisper_vocals/results.jsonl \
     --results-file ./jobs/parakeet_vocals/results.jsonl \
-    --results-file ./jobs/canary_vocals/results.jsonl \
     --musdb-dir ./dataset/musdb_alt
 ```
 
 Options:
 
-- `--jobs-dir`: Path to base jobs directory containing model subdirectories (required)
-- `--output-dir`: Directory for all outputs — `evaluation_summary.csv`, `tables/*.tex`, and the PDF plots (required)
-- `--features-dir`: Directory of artifact feature JSON files (enables artifact chart)
-- `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (enables artifact chart)
-- `--results-job-name`: Job subdirectory name to auto-discover `results*.jsonl` across all model directories under `--jobs-dir` (enables artifact chart)
-- `--musdb-dir`: Root MUSDB directory (alignments + ground truth both from each song's `lyrics.json`, enables artifact chart)
+- `--jobs-dir`: Base jobs directory containing model subdirectories (required)
+- `--output-dir`: Directory for the CSV, `tables/*.tex` and PDF plots (required)
+- `--features-dir`: Artifact feature JSON files (enables the artifact chart)
+- `--results-file`: A `results.jsonl` to include in the artifact chart; repeatable
+- `--results-job-name`: Job subdirectory name to auto-discover `results*.jsonl` across every model directory under `--jobs-dir`
+- `--musdb-dir`: Root MUSDB directory, for alignments and references (enables the artifact chart)
 
 Output files:
 
 | File | Description |
 |------|-------------|
-| `baseline_wer.pdf` | Grouped bar chart of WER by dataset configuration & model |
-| `error_type_rates.pdf` | Grouped bar chart of normalised insertion/deletion/substitution rates per model |
-| `error_distribution.pdf` | Stacked bar chart of error type distribution by model and dataset |
-| `wer_heatmap.pdf` | Heatmap of WER across all models × pipeline configurations |
-| `error_type_breakdown.pdf` | Stacked percentage bar chart of error type breakdown per model |
-| `pipeline_shift.pdf` | Per-model scatter of pipeline error-profile shift vs clean-stems baseline |
-| `artifact_quartile_error.pdf` | Line chart of error rate across artifact noise quartiles (requires artifact options) |
+| `evaluation_summary.csv` | Every job's WER and error counts, sorted by WER |
+| `baseline_wer.pdf` | Grouped bar chart of WER by dataset configuration and model |
+| `error_type_rates.pdf` | Normalised insertion/deletion/substitution rates per model |
+| `error_distribution.pdf` | Stacked error-type distribution by model and dataset |
+| `wer_heatmap.pdf` | WER across all models × pipeline configurations |
+| `error_type_breakdown.pdf` | Stacked percentage error-type breakdown per model |
+| `pipeline_shift.pdf` | Per-model error-profile shift vs the clean-stems baseline |
+| `artifact_quartile_error.pdf` | Error rate across artifact noise quartiles (requires the artifact options) |
 
 </details>
 
 <details>
 <summary><h3>lyricscribe artifacts</h3></summary>
 
-The `artifacts` commands handle artifact feature extraction, Montreal Forced Alignment (MFA) processing, and correlation analysis between audio artifacts and transcription errors. These are used to investigate how separation artifacts (residual instruments bleeding into the vocal stem) affect ASR accuracy.
+The `artifacts` commands measure how separation artifacts (residual instruments bleeding into the vocal stem) relate to transcription errors. Both need MUSDB-ALT, whose clean vocal stems serve as the reference.
 
 #### `lyricscribe artifacts extract`
 
-Extracts per-frame artifact features from MUSDB songs by comparing separated vocals against the ground-truth vocal stems. Computes artifact RMS, vocal RMS, artifact-to-signal ratio, spectral centroid, and spectral flatness.
+Compares separated vocals against the clean vocal stems and writes per-frame features per song: artifact RMS, vocal RMS, artifact-to-signal ratio, spectral centroid and spectral flatness.
 
 ```bash
-uv run lyricscribe artifacts extract \
+lyricscribe artifacts extract \
     --musdb-dir ./dataset/musdb_alt \
     --output-dir ./features
 ```
@@ -377,76 +403,106 @@ uv run lyricscribe artifacts extract \
 Options:
 
 - `--musdb-dir`: Root MUSDB directory (required)
-- `--output-dir`: Directory to write per-song feature JSON files (required)
+- `--output-dir`: Directory for the per-song feature JSON files (required)
 
 #### `lyricscribe artifacts build`
 
-Builds a word-level CSV dataset that combines MFA alignments, artifact features, ground-truth lyrics, and model transcription errors. Each row represents one word for one model, with the artifact features averaged over that word's time window, the error type (correct, deletion, substitution) from jiwer alignment, and the count of hypothesis words inserted adjacent to this reference word. This CSV is useful for notebook exploration; plotting is handled by `evaluate run`.
-
-Run `lyricscribe dataset align` on the MUSDB directory first so alignments are present in each song's `lyrics.json`.
+Builds a word-level CSV: one row per reference word per model, with that word's averaged artifact features, its error type (correct, deletion, substitution) and the number of hypothesis words inserted next to it. Run `lyricscribe dataset align` on the MUSDB directory first.
 
 ```bash
-uv run lyricscribe artifacts build \
+lyricscribe artifacts build \
     --features-dir ./features \
     --results-file ./jobs/whisper_vocals/results.jsonl \
     --results-file ./jobs/parakeet_vocals/results.jsonl \
-    --results-file ./jobs/canary_vocals/results.jsonl \
     --musdb-dir ./dataset/musdb_alt \
     --output ./word_dataset.csv
 ```
 
 Options:
 
-- `--features-dir`: Directory of artifact feature JSON files (required)
-- `--results-file`: Path to results.jsonl with model transcriptions; repeat to include multiple models (required)
-- `--musdb-dir`: Root MUSDB directory (alignments + ground truth both from each song's `lyrics.json`) (required)
-- `--output`: Path to write the word-level CSV (required)
+- `--features-dir`: Artifact feature JSON files (required)
+- `--results-file`: A `results.jsonl` to include; repeatable (required)
+- `--results-jobs-dir` / `--results-job-name`: Also auto-discover `results*.jsonl` under a jobs root
+- `--musdb-dir`: Root MUSDB directory, for alignments and references (required)
+- `--output`: Path for the word-level CSV (required)
 
 </details>
 
 <details>
 <summary><h3>lyricscribe finetune</h3></summary>
 
-The `finetune` commands finetune ASR models (Whisper, Canary, or Parakeet) using epoch-level checkpointing for SLURM cluster training. Training is split into chunks (blocks of epochs) with checkpoints saved after every epoch. Each song directory must contain a `lyrics.json` file and at least one of the audio files specified via `--filename`.
+The `finetune` commands train Whisper, Parakeet, Canary, Qwen3-ASR (full finetune) or Qwen3-Omni (LoRA) on 30-second windows sampled from songs. Training is split into chunks of epochs for SLURM, with a checkpoint after every epoch and mid-epoch step checkpoints to resume from after a timeout. Each song directory needs a `lyrics.json` and at least one of the `--filename` audio files.
 
-**Audio files must be PCM WAV.** Lossy formats like MP3 report a header duration that can differ from the decoded sample count by up to ~1s, which causes Lhotse to reject cuts near the end of a song. Pre-decode to WAV before running setup (16 kHz mono matches what the models consume internally, but any PCM WAV works).
+**Audio files must be PCM WAV.** Lossy formats like MP3 report a header duration that can differ from the decoded sample count by up to ~1s, which makes Lhotse reject cuts near the end of a song.
 
 #### `lyricscribe finetune setup`
 
-Set up a finetuning experiment by scanning dataset directories and creating manifests and chunk files.
+Builds the train/validation manifests and the chunk files for an experiment.
 
 ```bash
-# Train on separated vocals
-lyricscribe finetune setup /path/to/final_train \
+# Whisper on separated vocals
+lyricscribe finetune setup /path/to/train \
     --output-dir ./experiments \
-    --val-dir /path/to/final_validation \
-    --model nvidia/parakeet-tdt-0.6b-v3 \
+    --val-dir /path/to/validation \
+    --model openai/whisper-large-v3 \
     --filename htdemucs_ft_vocals.wav
 
-# Train on both (randomly picks one per sample each epoch)
-lyricscribe finetune setup /path/to/final_train \
+# Qwen3-ASR on vocals and the mix, each song wholly in one domain
+lyricscribe finetune setup /path/to/train \
     --output-dir ./experiments \
-    --val-dir /path/to/final_validation \
-    --model nvidia/canary-1b-v2 \
-    --filename htdemucs_ft_vocals.wav \
-    --filename audio.wav
+    --val-dir /path/to/validation \
+    --model Qwen/Qwen3-ASR-1.7B \
+    --filename vocals.wav \
+    --filename audio.wav \
+    --audio-domain-mode balanced
 ```
 
-Options:
+Defaults depend on the architecture:
 
-- `--output-dir`: Directory to save experiment outputs (required)
-- `--model`: Model identifier on HuggingFace/NeMo hub (required)
-- `--filename`: Audio filename to train on, repeat for multi-file training (required)
-- `--val-dir`: Directory with validation songs (strongly recommended)
-- `--batch-size`: Training batch size (default: 8)
-- `--max-epochs`: Maximum training epochs (default: 50)
-- `--epochs-per-job`: Epochs per SLURM job chunk (default: 5)
-- `--learning-rate`: Peak learning rate (default: 1e-5)
-- `--no-augment`: Disable SpecAugment (enabled by default)
+| Architecture | Batch size | Max epochs | Epochs per job | Learning rate |
+|--------------|-----------|------------|----------------|---------------|
+| Whisper | 24 | 10 | 5 | 1e-5 |
+| Parakeet | 16 | 10 | 3 | 5e-5 |
+| Canary | 1440 s of audio (`--batch-duration`) | 10 | 3 | 1e-5 |
+| Qwen3-ASR | 4 (× 4 grad accum) | 3 | 3 | 3e-5 |
+| Qwen3-Omni | 1 (× 16 grad accum) | 1 | 1 | 1e-4 |
+
+Core options:
+
+- `TRAIN_DIR`: Directory of training songs (positional, required)
+- `--output-dir`: Directory for experiment outputs (required)
+- `--model`: Base model id; the architecture is detected from it (required)
+- `--filename`: Audio filename to train on; repeat for multi-file training (required)
+- `--val-dir`: Directory of validation songs (recommended)
+- `--exp-name`: Experiment directory name (default: `<arch>_<filenames>_<UTC timestamp>`)
+- `--batch-size`, `--max-epochs`, `--epochs-per-job`, `--learning-rate`, `--grad-accum`: Override the defaults above
+- `--warmup-epochs`: Linear warmup before cosine decay, may be fractional (default: 5; Qwen uses a short fraction)
+- `--no-augment`: Disable SpecAugment
+- `--eval-subset-size`: Fixed number of validation windows evaluated each epoch (default: 200)
+
+Training windows and labels:
+
+- `--windows-per-song`: Random 30s windows sampled per ~30s of song (default: 1)
+- `--line-overlap-threshold`: Fraction of a synced line that must fall inside a window for its text to count (default: 0.7)
+- `--max-unlabeled-vocal-frac`: Reject windows where more than this fraction of sung time has no label text; offsets are re-drawn
+- `--ref-selfwer-file` / `--max-ref-self-wer`: Skip songs whose two reference transcripts disagree (artifact from `lyricscribe analyze selfwer`; 0.3 is a good cutoff)
+- `--no-mfa-alignment`: Build labels from synced lines only, ignoring MFA word timings
+- `--dedup-max-run`: Cap runs of identical consecutive label words; 0 disables (default: 0)
+- `--whisper-timestamp-prob`: Whisper only: fraction of samples trained with timestamp labels; 0 breaks >30s decoding (default: 0.5)
+- `--audio-domain-mode`: With several `--filename` values, `balanced` puts each song wholly in the first file's domain or the rest, 50/50 by window count; `fallback` uses the rest. Default: a random file per song.
+- `--manifests-from`: Copy the manifests from an existing experiment instead of building them
+- `--max-train-windows` / `--all-train-windows` / `--train-window-seed`: Train on a seeded random subset of windows (Qwen3-Omni defaults to 20000)
+
+Architecture-specific:
+
+- `--batch-duration`: Canary: seconds of audio per Lhotse batch (default: 1440; lower for <24 GB GPUs)
+- `--freeze-encoder`: Canary: train only the decoder and head
+- `--save-steps`: Qwen: optimizer steps between step checkpoints (default: 500)
+- `--lora-rank` / `--lora-targets`: Qwen3-Omni: LoRA rank (default: 16) and targets, `attn` (default) or `wide` (adds the MoE expert FFNs)
 
 #### `lyricscribe finetune run`
 
-Process one chunk of a finetuning job. Typically called by the SLURM script, not run directly.
+Trains one chunk of epochs, resuming from the latest checkpoint. Usually launched from a SLURM script.
 
 ```bash
 lyricscribe finetune run --job-dir ./experiments/my_experiment --chunk-id 1
@@ -454,12 +510,12 @@ lyricscribe finetune run --job-dir ./experiments/my_experiment --chunk-id 1
 
 Options:
 
-- `--job-dir`: Path to job directory (required)
+- `--job-dir`: Path to the experiment directory (required)
 - `--chunk-id`: Chunk to process, 1-indexed (required)
 
 #### `lyricscribe finetune inspect`
 
-Inspect job progress, chunk statuses, checkpoints, and training metrics.
+Shows progress, chunk statuses, checkpoints and per-epoch metrics.
 
 ```bash
 lyricscribe finetune inspect --job-dir ./experiments/my_experiment
@@ -467,48 +523,11 @@ lyricscribe finetune inspect --job-dir ./experiments/my_experiment
 
 Options:
 
-- `--job-dir`: Path to job directory (required)
-
-#### `lyricscribe finetune reset`
-
-Reset a job to start from scratch. Deletes all checkpoints and metrics.
-
-```bash
-lyricscribe finetune reset --job-dir ./experiments/my_experiment
-```
-
-Options:
-
-- `--job-dir`: Path to job directory (required)
-
-#### `lyricscribe finetune retry`
-
-Reset a single failed chunk back to pending so the orchestrator can resubmit it.
-
-```bash
-lyricscribe finetune retry --job-dir ./experiments/my_experiment --chunk-id 3
-```
-
-Options:
-
-- `--job-dir`: Path to job directory (required)
-- `--chunk-id`: Chunk to retry (required)
-
-#### `lyricscribe finetune retry-all`
-
-Reset every failed chunk across every experiment in an experiments directory. Successful chunks and existing checkpoints are left alone. Use this after deploying a fix that should unblock previously-failed runs.
-
-```bash
-lyricscribe finetune retry-all --experiments-dir ./experiments
-```
-
-Options:
-
-- `--experiments-dir`: Directory containing experiment subdirectories (required)
+- `--job-dir`: Path to the experiment directory (required)
 
 #### `lyricscribe finetune status`
 
-Print a one-line summary for every experiment in a directory: current epoch, chunk success/failure/running/pending counts, last checkpoint, and last observed loss.
+Prints one line per experiment: current epoch, chunk counts by status, last checkpoint and last loss.
 
 ```bash
 lyricscribe finetune status --experiments-dir ./experiments
@@ -518,20 +537,260 @@ Options:
 
 - `--experiments-dir`: Directory containing experiment subdirectories (required)
 
-#### `lyricscribe finetune export-model`
+#### `lyricscribe finetune retry`
 
-Export a checkpoint for use in transcription. Defaults to the latest checkpoint.
+Resets failed chunks back to `pending` so they can be resubmitted.
 
 ```bash
-lyricscribe finetune export-model \
-    --job-dir ./experiments/my_experiment \
-    --output ./models/my_finetuned_model.nemo \
-    --epoch 25
+lyricscribe finetune retry --job-dir ./experiments/my_experiment --chunk-id 3
 ```
 
 Options:
 
-- `--job-dir`: Path to job directory (required)
-- `--output`: Path to save exported model (required)
+- `--job-dir`: Path to the experiment directory (required)
+- `--chunk-id`: Chunk to retry (default: every failed chunk)
+
+#### `lyricscribe finetune retry-all`
+
+Resets every failed chunk across every experiment in a directory, leaving successful chunks and checkpoints alone.
+
+```bash
+lyricscribe finetune retry-all --experiments-dir ./experiments
+```
+
+Options:
+
+- `--experiments-dir`: Directory containing experiment subdirectories (required)
+
+#### `lyricscribe finetune reset`
+
+Resets an experiment to start from scratch, deleting its checkpoints and metrics.
+
+```bash
+lyricscribe finetune reset --job-dir ./experiments/my_experiment
+```
+
+Options:
+
+- `--job-dir`: Path to the experiment directory (required)
+
+#### `lyricscribe finetune tune-batch`
+
+Finds the largest batch size that fits a model on the current GPUs. Each trial is a short `torchrun` training run on real songs; the sweep steps up through candidate sizes until the first OOM, then bisects. Canary sweeps `batch_duration` in seconds instead of a sample count.
+
+```bash
+lyricscribe finetune tune-batch \
+    --dataset-dir /path/to/train \
+    --filename htdemucs_ft_vocals.wav \
+    --model nvidia/parakeet-tdt-0.6b-v3
+```
+
+Options:
+
+- `--dataset-dir`: Directory of song subdirectories (required)
+- `--filename`: Audio file to read in each song directory; match production (required)
+- `--model`: Model id (required)
+- `--freeze-encoder`: Freeze the encoder (Canary/Parakeet); match production
+- `--max-duration`: Clip length in seconds; match production (default: 30)
+- `--start` / `--max`: Smallest and largest values to try (default: 1 and 2400)
+- `--min-gap`: Stop bisecting once the gap is this small (default: 2)
+- `--safety-margin`: Percent taken off the VRAM ceiling when there is no throughput plateau (default: 15)
+- `--timeout`: Seconds before a trial is killed (default: 900)
+
+#### `lyricscribe finetune export-model`
+
+Exports a checkpoint for use with `lyricscribe transcribe`.
+
+```bash
+lyricscribe finetune export-model \
+    --job-dir ./experiments/my_experiment \
+    --output ./models/my_finetuned_model \
+    --epoch 3
+```
+
+Options:
+
+- `--job-dir`: Path to the experiment directory (required)
+- `--output`: Path to save the exported model (required)
 - `--epoch`: Epoch to export (default: latest)
 
+#### `lyricscribe finetune eval-loss`
+
+Compares a base Qwen model against finetuned checkpoints by mean per-token cross-entropy on held-out windows. Use this rather than the trainer's logged loss, which is accumulation-scaled and measured in train mode.
+
+```bash
+lyricscribe finetune eval-loss \
+    --base-model Qwen/Qwen3-ASR-1.7B-hf \
+    --checkpoint ./experiments/qasr_run/checkpoints/epoch_3 \
+    --manifest ./experiments/qasr_run/val_manifest.jsonl
+```
+
+Options:
+
+- `--base-model`: Base hub id or path (required)
+- `--checkpoint`: Checkpoint to compare; repeatable. A full model for Qwen3-ASR, a LoRA adapter for Qwen3-Omni. (required)
+- `--manifest`: Manifest to sample held-out windows from (required)
+- `--rows`: Windows to evaluate (default: 32)
+- `--seed`: Window sampling seed (default: 1234)
+- `--batch-size`: Evaluation batch size (default: 2)
+- `--output`: Write results as JSON
+
+</details>
+
+<details>
+<summary><h3>lyricscribe ensemble</h3></summary>
+
+The `ensemble` commands combine and repair transcription jobs. Their outputs are standard job directories, so `evaluate`, `analyze` and further ensembling all work on them.
+
+#### `lyricscribe ensemble rover`
+
+ROVER (Fiscus, 1997): aligns each system's hypothesis into a word confusion network and takes a frequency vote per slot, with ties going to the earlier member. Systems and datasets come from a spec file, ad-hoc flags, or both:
+
+```yaml
+root: /path/to/project   # relative paths resolve here; default: the spec's directory
+datasets:
+  dev: data/dev
+  test: {dir: data/test, expected: 100}   # expected: optional song-count check
+systems:
+  whisper: {dev: jobs/whisper/dev, test: jobs/whisper/test}
+  parakeet: {dev: jobs/parakeet/dev, test: jobs/parakeet/test}
+  qwen: {dev: jobs/qwen/dev, test: jobs/qwen/test}
+subsets:
+  trio: [whisper, parakeet, qwen]   # the first member is the alignment pivot
+```
+
+```bash
+# From a spec
+lyricscribe ensemble rover --spec ensemble.yaml --subset trio --dataset test --out ./jobs/rover
+
+# Ad hoc
+lyricscribe ensemble rover \
+    --dataset-dir test=./dataset/test \
+    --system whisper=./jobs/whisper/test \
+    --system qwen=./jobs/qwen/test \
+    --subset whisper,qwen \
+    --dataset test \
+    --out ./jobs/rover
+```
+
+Output is written to `<out>/<tag>/vote/<dataset>`.
+
+Options:
+
+- `--subset`: Subset name from the spec, or comma-separated members in alignment order; repeatable (required)
+- `--dataset`: Dataset name; repeatable (required)
+- `--out`: Output root (required)
+- `--spec`: Ensemble spec file (YAML or JSON)
+- `--system`: Ad-hoc system as `name=job_dir` (single `--dataset`) or `name:dataset=job_dir`; repeatable
+- `--dataset-dir`: Ad-hoc dataset as `name=dataset_dir`; repeatable
+- `--orderings`: Vote under N member orderings (the given one plus N-1 seeded shuffles) and re-vote the results; 1 is plain ROVER (default: 1)
+- `--seed`: Seed for the `--orderings` shuffles (default: 0)
+- `--null-weight`: Weight of a NULL vote; 1.0 is plain ROVER (default: 1.0)
+- `--oracle` / `--no-oracle`: Also report the oracle WER, the best any slot-wise selection could reach (default: on)
+- `--tag`: Output directory name (default: the subset name, plus `_ORDER<N>` with `--orderings`)
+- `--workers`: Alignment processes (default: 16)
+
+#### `lyricscribe ensemble deloop`
+
+Collapses runaway repetition, where a short cycle of words is repeated far more often than a real chorus would be, and writes a new job directory. Meant for output decoded without `--no-repeat-ngram-size`.
+
+```bash
+lyricscribe ensemble deloop ./jobs/qwen3omni/jam_alt --out ./jobs/qwen3omni_deloop/jam_alt --max-run 5
+```
+
+Options:
+
+- `SRC`: Source job directory (positional, required)
+- `--out`: Destination job directory (required)
+- `--max-run`: Repeats kept of a looping cycle (default: 5)
+- `--max-cycle`: Longest cycle length, in words (default: 25)
+
+</details>
+
+<details>
+<summary><h3>lyricscribe analyze</h3></summary>
+
+The `analyze` commands score and compare transcription jobs using the same normalisation as `lyricscribe evaluate`. Jobs with missing songs or corrupt result lines are refused unless explicitly allowed.
+
+#### `lyricscribe analyze score`
+
+Scores one or more job directories: WER with insertion/deletion/substitution counts and shares.
+
+```bash
+lyricscribe analyze score ./jobs/whisper/jam_alt ./jobs/qwen/jam_alt --by-language
+```
+
+Options:
+
+- `JOB_DIRS`: Job directories to score (positional, required)
+- `--selfwer-file`: Self-WER artifact from `analyze selfwer`; adds a slice restricted to songs with trustworthy references
+- `--max-self-wer`: Inclusive self-WER cutoff for that slice (default: 0.3)
+- `--common`: Score only songs present in every job (for comparing partial runs)
+- `--by-language`: Per-language breakdown
+- `--raw`: Also report WER on un-normalised text
+- `--allow-partial`: Score jobs with missing songs or corrupt result lines
+- `--out`: Write results as JSON
+
+#### `lyricscribe analyze score-all`
+
+Scores every complete job under a root and prints a ranking; partial or corrupt jobs are listed and skipped.
+
+```bash
+lyricscribe analyze score-all ./jobs --pattern "*/jam_alt" --top 20
+```
+
+Options:
+
+- `ROOT`: Directory to search (positional, required)
+- `--pattern`: Glob for job directories relative to `ROOT` (default: `**`)
+- `--selfwer-file` / `--max-self-wer`: As for `score`; ranks by the filtered slice when given
+- `--top`: Ranked rows to print (default: 20)
+- `--out`: Write results as JSON
+
+#### `lyricscribe analyze selfwer`
+
+Each song's `lyrics.json` carries two independent reference transcripts (`unsynced`, which WER is graded against, and `synced`). This writes their mutual WER per song. A high self-WER flags a broken reference, such as the wrong song version or missing sections.
+
+```bash
+lyricscribe analyze selfwer ./dataset/jam_alt --out ./artifacts/jam_alt_selfwer.jsonl
+```
+
+Options:
+
+- `DATASET_DIR`: Dataset directory (positional, required)
+- `--out`: Destination JSONL file (required)
+
+#### `lyricscribe analyze bootstrap`
+
+Paired song-level bootstrap confidence interval on WER(A) − WER(B). Each resample recomputes WER from summed errors, and pairing on songs cancels song difficulty.
+
+```bash
+lyricscribe analyze bootstrap ./jobs/whisper/jam_alt ./jobs/qwen/jam_alt
+```
+
+Options:
+
+- `JOB_A`, `JOB_B`: The two job directories (positional, required)
+- `--n-resamples`: Bootstrap resamples (default: 2000)
+- `--seed`: Resampling seed (default: 0)
+- `--selfwer-file` / `--max-self-wer`: Restrict to songs with trustworthy references
+
+#### `lyricscribe analyze merge`
+
+Averages the weights of finetunes of the same base model into one model ("model soup"). Works on any HF safetensors checkpoints that share parameter names; keys missing from some members are dropped and reported.
+
+```bash
+lyricscribe analyze merge \
+    --member ./experiments/run_a/checkpoints/epoch_3 \
+    --member ./experiments/run_b/checkpoints/epoch_3 \
+    --out ./models/soup
+```
+
+Options:
+
+- `--member`: Checkpoint directory; repeatable. Config and tokenizer come from the first. (required)
+- `--out`: Output model directory (required)
+- `--weights`: Comma-separated weights (default: uniform)
+- `--dtype`: Saved dtype (default: `float16`)
+
+</details>

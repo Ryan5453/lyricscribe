@@ -734,7 +734,7 @@ def finetune_setup(
     batch_duration: float = typer.Option(
         None,
         "--batch-duration",
-        help="Canary-only: Lhotse batch duration in seconds (default: 600; lower for <24GB GPUs)",
+        help="Canary-only: Lhotse batch duration in seconds (default: 1440; lower for <24GB GPUs)",
     ),
     freeze_encoder: bool = typer.Option(
         False,
