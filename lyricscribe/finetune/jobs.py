@@ -138,9 +138,6 @@ def update_chunk_status(
                 status in ("pending", "running")
                 and job_status.get("status") in ("complete", "complete_with_failures")
             ):
-                # A chunk was reopened after a previous completion state
-                # (manual retry/orchestrator recovery). Clear stale top-level
-                # completion so monitors show the experiment as active again.
                 job_status["status"] = "pending"
 
             all_chunks = list((job_dir / "chunks").glob("chunk_*.json"))
@@ -162,6 +159,11 @@ def update_chunk_status(
 
 
 def show_job_stats(job_dir: Path) -> None:
+    """
+    Log a finetuning job's progress, chunk states, checkpoints and per-epoch metrics.
+
+    :param job_dir: Job directory.
+    """
     status = load_job_status(job_dir)
 
     logger.info(f"Experiment: {status['exp_name']}")
@@ -184,7 +186,6 @@ def show_job_stats(job_dir: Path) -> None:
         if count > 0:
             logger.info(f"  {status_name}: {count}")
 
-    # List checkpoints
     ckpt_dir = job_dir / "checkpoints"
     if ckpt_dir.exists():
         checkpoints = sorted(
@@ -196,7 +197,6 @@ def show_job_stats(job_dir: Path) -> None:
             for ckpt in checkpoints:
                 logger.info(f"  {ckpt.name}")
 
-    # Show training metrics
     metrics_path = job_dir / "metrics.jsonl"
     if metrics_path.exists():
         logger.info("Metrics:")
@@ -217,8 +217,8 @@ def show_job_stats(job_dir: Path) -> None:
 
 def reset_failed_chunks(job_dir: Path) -> int:
     """
-    Reset all failed chunks in a job back to ``pending`` so the
-    orchestrator will resubmit them.
+    Reset all failed chunks in a job back to ``pending`` so they can be
+    re-run.
 
     Unlike :func:`reset_job`, this preserves successful chunks and
     existing checkpoints.
@@ -240,7 +240,6 @@ def reset_failed_chunks(job_dir: Path) -> int:
             reset += 1
 
     if reset > 0:
-        # Reset the top-level status if it was marked complete-with-failures
         job_status = load_job_status(job_dir)
         if job_status.get("status") == "complete_with_failures":
             job_status["status"] = "pending"
@@ -274,6 +273,12 @@ def gather_experiment_status(job_dir: Path) -> dict:
         ckpts = [p for p in ckpt_dir.iterdir() if p.name.startswith("epoch_")]
         if ckpts:
             def epoch_num(p: Path) -> int:
+                """
+                Epoch number of an ``epoch_N`` checkpoint, or -1.
+
+                :param p: Checkpoint path.
+                :return: The epoch.
+                """
                 try:
                     return int(p.stem.split("_")[1])
                 except (IndexError, ValueError):

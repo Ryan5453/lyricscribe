@@ -9,18 +9,28 @@ logger = logging.getLogger(__name__)
 
 _TOKENIZER = LyricsTokenizer()
 
-# Cache normalized references per dataset directory. Keyed on resolved Path.
-# Jobs that share a dataset (all Whisper musdb_alt configs, etc.) walk the
-# directory + tokenize every reference exactly once instead of once per job.
 _DATASET_CACHE: dict[Path, dict] = {}
 
 
 def _language_for(lyrics_data: dict) -> str:
+    """
+    Base language code of a song from its ``lyrics.json``.
+
+    :param lyrics_data: Parsed ``lyrics.json``.
+    :return: Lowercase base language code, ``"en"`` if none is set.
+    """
     lang = lyrics_data.get("detected_language") or "en"
     return lang.split("-")[0].split("_")[0].lower() or "en"
 
 
 def _normalized(text: str, language: str) -> str:
+    """
+    Normalise text with the alt-eval tokenizer into space-joined lowercase words.
+
+    :param text: Lyrics or transcription text.
+    :param language: Language code.
+    :return: The normalised text.
+    """
     tokens = _TOKENIZER(text, language=language)
     return " ".join(t.text.lower() for t in tokens_as_words(tokens) if WORD in t.tags)
 
@@ -30,6 +40,9 @@ def _load_dataset(directory: Path) -> dict:
     Walk *directory* once, load every song's ``lyrics.json``, and
     pre-normalize the reference text. Cached by resolved path so repeated
     calls for the same dataset are free.
+
+    :param directory: Dataset directory of song subdirectories.
+    :return: ``{"refs_normalized": {song: ref}, "languages": {song: code}}``.
     """
     key = directory.resolve()
     cached = _DATASET_CACHE.get(key)
@@ -65,6 +78,11 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
     tokenizer and normalizer (Cífka et al. 2024) before WER / I / D / S
     are computed, so differences in casing, punctuation, and per-language
     contraction handling are not counted as errors.
+
+    :param job_dir: Transcription job directory.
+    :param verbose: Log why songs or the job are skipped.
+    :return: ``n_songs``, ``wer``, ``insertions``, ``deletions``,
+        ``substitutions``, ``hits`` and ``config``, or ``None``.
     """
     config_path = job_dir / "config.json"
     if not config_path.exists():
@@ -111,7 +129,6 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
             logger.warning("No results found in job directory")
         return None
 
-    # Collect paired refs/hyps for a single corpus-level jiwer call.
     refs_list: list[str] = []
     hyps_list: list[str] = []
     for song_id, r in results_map.items():
@@ -159,6 +176,9 @@ def collect_evaluation_data(jobs_dir: Path) -> list[dict]:
     """
     Walk all job subdirectories under *jobs_dir*, evaluate each one, and
     return a list of flat summary dicts ready to be turned into a DataFrame.
+
+    :param jobs_dir: Root searched recursively for ``config.json``.
+    :return: One summary dict per job that could be evaluated.
     """
     all_stats: list[dict] = []
 
@@ -178,19 +198,11 @@ def collect_evaluation_data(jobs_dir: Path) -> list[dict]:
                 ),
                 "filename": config.get("filename", ""),
                 "vad": vad_on,
-                # ``vad_method`` was added when RMS-VAD landed; older configs
-                # have no field — implicitly Silero. Report blank when VAD
-                # is off so the column reads cleanly.
                 "vad_method": (
                     config.get("vad_method", "silero") if vad_on else ""
                 ),
                 "vad_source": config.get("vad_filename") or "",
                 "chunked": config.get("chunked", False),
-                # ``repetition_penalty`` and ``no_repeat_ngram_size`` are
-                # HF-generation-only knobs. NeMo's RNNT/Canary decoders
-                # don't expose them, so emit ``-`` for those models to
-                # avoid implying ``1.0``/``0`` (vanilla decode) — which
-                # would be a category error.
                 "repetition_penalty": (
                     float(config.get("repetition_penalty", 1.0) or 1.0)
                     if "whisper" in config.get("model", "").lower()

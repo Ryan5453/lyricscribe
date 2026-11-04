@@ -8,6 +8,7 @@ import pandas as pd
 
 from lyricscribe.evaluate import collect_evaluation_data
 from lyricscribe.latex_tables import DATASET_DISPLAY
+from lyricscribe.transcribe.artifacts.correlation import analyse
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ def _model_label(full_name: str) -> str:
     a hyphen-split, title-cased form otherwise.
 
     :param full_name: full model identifier, e.g. ``'openai/whisper-large-v3'``.
-    :returns: readable label, e.g. ``'Whisper large-v3'``.
+    :return: readable label, e.g. ``'Whisper large-v3'``.
     """
     if full_name in _MODEL_LABELS:
         return _MODEL_LABELS[full_name]
@@ -77,7 +78,7 @@ def _model_colors(models: list[str]) -> dict[str, str]:
     Assign a colour from :data:`_MODEL_PALETTE` to each model.
 
     :param models: ordered list of model identifiers.
-    :returns: mapping of model identifier to hex colour string.
+    :return: mapping of model identifier to hex colour string.
     """
     return {m: _MODEL_PALETTE[i % len(_MODEL_PALETTE)] for i, m in enumerate(models)}
 
@@ -90,7 +91,7 @@ def _config_label(row: pd.Series) -> str:
     ``+vad`` / ``+chunked`` suffixes when those options are enabled.
 
     :param row: a single row from the evaluation summary DataFrame.
-    :returns: newline-separated label string suitable for tick labels.
+    :return: newline-separated label string suitable for tick labels.
     """
     stem = Path(row["filename"]).stem
     ds = DATASET_DISPLAY.get(row["dataset"], row["dataset"])
@@ -176,6 +177,12 @@ def plot_baseline_wer(df: pd.DataFrame, output_path: Path) -> None:
 def plot_artifact_quartile_error(
     quartile_data: list[dict], output_path: Path
 ) -> None:
+    """
+    Plot each model's WER across artifact-to-signal quartiles.
+
+    :param quartile_data: Rows with ``model``, ``quartile`` and ``error_rate`` keys.
+    :param output_path: File path to write the plot image to.
+    """
     _apply_style()
 
     rows = quartile_data
@@ -241,6 +248,13 @@ def plot_artifact_quartile_error(
 
 
 def plot_error_type_shares(df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Plot each model's mean insertion, deletion and substitution share of its errors.
+
+    :param df: Evaluation summary DataFrame as returned by
+        :func:`~lyricscribe.evaluate.collect_evaluation_data`.
+    :param output_path: File path to write the plot image to.
+    """
     _apply_style()
     df = df.copy()
 
@@ -327,7 +341,7 @@ def plot_wer_heatmap(df: pd.DataFrame, output_path: Path) -> None:
         Build a single-line config label for heatmap columns.
 
         :param row: a single row from the evaluation summary DataFrame.
-        :returns: compact label string, e.g. ``'jam-alt / mix (+vad)'``.
+        :return: compact label string, e.g. ``'jam-alt / mix (+vad)'``.
         """
         stem = Path(row["filename"]).stem
         ds = DATASET_DISPLAY.get(row["dataset"], row["dataset"])
@@ -423,11 +437,7 @@ def plot_error_type_breakdown(df: pd.DataFrame, output_path: Path) -> None:
         & (~df["vad"])
         & (~df["chunked"])
     ]
-    # For Whisper the (no-VAD, no-chunked) filter matches both MIT and
-    # no-MIT rows. Keep only the no-MIT row so the per-model breakdown is
-    # comparable: NeMo models have no MIT toggle, so they're already at
-    # default decode. Whisper's repetition_penalty is "1.0" with no MIT
-    # and 1.7 with MIT (the column is "-" for NeMo).
+    # Drop Whisper's MIT rows so every model is at default decode.
     is_whisper = baseline["model"].str.contains("whisper", case=False, na=False)
     baseline = baseline[~is_whisper | (baseline["repetition_penalty"].astype(str) == "1.0")]
     agg = baseline.groupby("model")[
@@ -549,8 +559,7 @@ def plot_pipeline_shift(df: pd.DataFrame, output_path: Path) -> None:
 
     # Filter to musdb_alt (only dataset with clean stems baseline)
     df = df[df["dataset"] == "musdb_alt"]
-    # Drop Whisper MIT rows so the cross-model comparison uses default
-    # decode for all three models (NeMo models have no MIT toggle).
+    # Drop Whisper's MIT rows so every model is at default decode.
     is_whisper = df["model"].str.contains("whisper", case=False, na=False)
     df = df[~is_whisper | (df["repetition_penalty"].astype(str) == "1.0")]
     df = df.drop_duplicates(subset=["model", "filename", "vad", "chunked"])
@@ -665,8 +674,6 @@ def generate_all_plots(
         When provided, job evaluation is skipped and this frame is used
         directly — useful when the caller has already paid that cost.
     """
-    from lyricscribe.transcribe.artifacts.correlation import analyse
-
     if df is None:
         all_stats = collect_evaluation_data(jobs_dir)
         if not all_stats:

@@ -17,7 +17,7 @@ Note: The project is configured for CUDA 12.9 (`cu129`). If you need a different
 
 ## CLI Usage
 
-The LyricScribe CLI contains six subcommands: `lyricscribe dataset` for downloading public ALT datasets and running word-level forced alignment on them, `lyricscribe separate` for mass vocal separation using [demucs-next](https://github.com/ryan5453/demucs-next), `lyricscribe transcribe` for batch ASR transcription, `lyricscribe evaluate` for transcription quality evaluation and plotting, `lyricscribe artifacts` for artifact feature extraction and correlation analysis, and `lyricscribe finetune` for ASR model finetuning with epoch-level SLURM checkpointing.
+The LyricScribe CLI contains eight subcommands: `lyricscribe dataset` for downloading public ALT datasets and running word-level forced alignment on them, `lyricscribe separate` for mass vocal separation using [Unblend](https://pypi.org/project/unblend/), `lyricscribe transcribe` for batch ASR transcription, `lyricscribe evaluate` for transcription quality evaluation and plotting, `lyricscribe artifacts` for artifact feature extraction and correlation analysis, `lyricscribe finetune` for ASR model finetuning with epoch-level SLURM checkpointing, `lyricscribe ensemble` for ROVER system combination across transcription jobs, and `lyricscribe analyze` for scoring, reference self-WER, significance testing and checkpoint averaging.
 
 <details>
 <summary><h3>lyricscribe dataset</h3></summary>
@@ -178,8 +178,13 @@ Options:
 
 - `--job-dir`: Directory to create for job files (required)
 - `--filename`: Audio filename to process within each subdirectory, e.g. `mix.wav` (required)
-- `--model`: Demucs model to use (default: htdemucs)
+- `--model`: Unblend model to use (default: htdemucs). Run `unblend models list` to see the options; custom checkpoints are added with `unblend models import`.
 - `--stem`: Which stem to isolate - vocals, drums, bass, or other. If not specified, all stems are saved.
+- `--output-filename`: Output filename for a single isolated stem (default `{model}_{stem}.wav`)
+- `--shifts`: Random time-shift passes to average; 0 is deterministic (default: 1)
+- `--split-overlap`: Overlap between consecutive model segments, in [0, 1) (default: 0.25)
+- `--seed`: Seed for the shift offsets (default: 0)
+- `--dtype`: Compute precision: auto (FP16 on CUDA), float32, float16 or bfloat16 (default: auto)
 - `--chunks`: Number of chunks to split dataset into (default: 5)
 
 #### `lyricscribe separate run`
@@ -212,7 +217,7 @@ Options:
 
 #### `lyricscribe separate reset`
 
-This command resets a separation job so it can be re-run from scratch. It deletes the tracked Demucs outputs for the job and resets all chunk entries back to `pending`.
+This command resets a separation job so it can be re-run from scratch. It deletes the tracked separation outputs for the job and resets all chunk entries back to `pending`.
 
 ```bash
 uv run lyricscribe separate reset --job-dir ./jobs/htdemucs_ft
