@@ -109,7 +109,7 @@ def _load_results(result_files: list[Path]) -> dict[tuple[str, str], str]:
     return results
 
 
-def _load_ground_truth(musedb_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
+def _load_ground_truth(musdb_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
     """
     Load ground truth lyrics and language for each MUSDB song from its lyrics.json file.
 
@@ -118,7 +118,7 @@ def _load_ground_truth(musedb_dir: Path) -> tuple[dict[str, str], dict[str, str]
     """
     ground_truth = {}
     languages = {}
-    for song_path in musedb_dir.iterdir():
+    for song_path in musdb_dir.iterdir():
         if not song_path or not song_path.is_dir():
             continue
         lyric_path = song_path / "lyrics.json"

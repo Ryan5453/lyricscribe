@@ -1,20 +1,3 @@
-"""
-Single-trial VRAM probe for finetuning, designed to be invoked via
-``torchrun --nproc_per_node=N``.
-
-Runs exactly ``--n-steps`` training steps at ``--bs`` against a
-pre-built manifest, replicating production's trainer setup 1:1: same
-trainer class, same model load path, same Lhotse vs. standard dataloader
-dispatch, same PL strategy, same DDP rank count. Rank 0 writes the peak
-VRAM + median step time to ``--output`` as JSON; other ranks exit
-silently.
-
-Intended to be driven by :mod:`lyricscribe.finetune.tune_batch`, which
-builds the manifest once and invokes this module as a torchrun
-subprocess per trial so OOMs cleanly kill the whole DDP group without
-poisoning a parent process's CUDA state.
-"""
-
 import argparse
 import json
 import logging
@@ -27,7 +10,9 @@ logger = logging.getLogger(__name__)
 
 
 def _is_rank0() -> bool:
-    """True on the single rank that owns writing the result file."""
+    """
+    True on the single rank that owns writing the result file.
+    """
     return int(os.environ.get("RANK", "0")) == 0
 
 
@@ -59,21 +44,14 @@ def _build_probe_config(
         "use_augmentation": True,
         "freeze_encoder": freeze_encoder,
         "num_workers": 2,
-        # ``max_duration`` caps the NeMo dataloader's per-sample audio
-        # length; match production's 240s so long-clip OOM cases still
-        # reproduce in the probe.
+        # Production's max_duration, so long-clip OOMs reproduce.
         "max_duration": max(max_duration_s, 240.0),
     }
     if architecture == "canary":
-        # batch_size is ignored (setup sets it to None); duration is the
-        # real memory lever here. Pass a conservative placeholder for
-        # batch_size so any stray reference doesn't crash.
         config["batch_size"] = 1
         config["batch_duration"] = batch_value
     else:
         config["batch_size"] = batch_value
-        # Keep a reasonable batch_duration default for code paths that
-        # read it unconditionally; Parakeet/Whisper ignore this field.
         config["batch_duration"] = 600
     return config
 
@@ -142,8 +120,7 @@ def main() -> int:
     trainer_obj = create_trainer(config)
     trainer_obj.setup(train_manifest=args.manifest, val_manifest=None)
 
-    # Freeze encoder after setup so the config change is reflected in the
-    # optimizer's trainable-parameter list when PL Trainer initializes it.
+    # After setup, so the optimizer sees the frozen parameters.
     if args.freeze_encoder and architecture in ("canary", "parakeet"):
         frozen = sum(1 for _ in trainer_obj.model.encoder.parameters())
         for p in trainer_obj.model.encoder.parameters():

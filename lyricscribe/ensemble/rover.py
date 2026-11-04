@@ -1,23 +1,3 @@
-"""
-ROVER system combination (Fiscus 1997) over transcription job dirs.
-
-Each system's hypothesis is aligned, in member order, into a shared
-confusion network (one slot = one aligned position; NULL is a real
-candidate). Two selections over the network:
-
-- **vote**: frequency voting, ties broken toward the earliest member. Only
-  ever emits a token some system produced, so it is a deployable decoder.
-- **oracle**: the per-slot choice minimising edit distance to the reference.
-  Not deployable -- it bounds every slot-wise selection rule, and a generative
-  method scoring *below* it must be injecting outside knowledge.
-
-Everything is aligned in alt_eval's normalised token space (the space
-``evaluate_job`` scores in), so casing and punctuation never create fake
-disagreement. Member order changes the network itself (different slots and
-candidate sets); :func:`orderings` / :func:`combine_orderings` vote under many
-orderings and re-vote their outputs to reduce that sensitivity.
-"""
-
 from __future__ import annotations
 
 import json

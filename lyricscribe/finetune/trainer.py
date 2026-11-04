@@ -41,9 +41,6 @@ def _configure_cuda_toolkit_for_numba() -> None:
 
     os.environ.setdefault("CUDA_HOME", str(nvcc_root))
 
-    # Numba's find_lib requires versioned sonames (``libnvvm.so.4``) but
-    # the pip-installed cuda-nvcc ships only the unversioned ``libnvvm.so``.
-    # Read the SONAME and create a matching symlink so find_lib picks it up.
     nvvm_lib64 = nvcc_root / "nvvm" / "lib64"
     nvvm_unversioned = nvvm_lib64 / "libnvvm.so"
     if nvvm_unversioned.exists():
@@ -62,10 +59,6 @@ def _configure_cuda_toolkit_for_numba() -> None:
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    # Numba finds ``libcudart`` via ``CUDA_HOME/lib64`` (not via
-    # LD_LIBRARY_PATH — setting LD_LIBRARY_PATH at Python runtime is
-    # ignored by the dynamic linker). Create ``cuda_nvcc/lib64/`` and
-    # symlink libcudart into it so numba's ``find_lib`` picks it up.
     if cudart_lib.exists():
         versioned = cudart_lib / "libcudart.so.12"
         if versioned.exists():
@@ -105,8 +98,10 @@ logger = logging.getLogger(__name__)
 
 
 def _is_main_process() -> bool:
-    """Return True if this is rank 0 (or single-GPU). Used to guard
-    file writes (checkpoints, metrics, config) in multi-GPU DDP."""
+    """
+    Return True if this is rank 0 (or single-GPU). Used to guard
+    file writes (checkpoints, metrics, config) in multi-GPU DDP.
+    """
     import os
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
 
@@ -137,7 +132,8 @@ def _build_mono_averaging_canary_dataset_cls():
     from nemo.collections.common.data import apply_prompt_format_fn
 
     class MonoAveragingPromptedDataset(PromptedAudioToTextLhotseDataset):
-        """Load audio, average stereo channels, and format prompts as usual.
+        """
+        Load audio, average stereo channels, and format prompts as usual.
 
         Keeps the original cuts (which may already carry pre-formatted
         prompt attributes from NeMo's ``pretokenize`` step) — the prompt
@@ -146,8 +142,6 @@ def _build_mono_averaging_canary_dataset_cls():
         """
 
         def __getitem__(self, cuts: CutSet) -> PromptedAudioToTextMiniBatch:
-            # Load per-cut and average channels so we never pass
-            # (B, C, T) to the model (the preprocessor only accepts (B, T)).
             audios: list[torch.Tensor] = []
             audio_lens_list: list[int] = []
             for cut in cuts:
@@ -163,7 +157,6 @@ def _build_mono_averaging_canary_dataset_cls():
             audio_lens = torch.tensor(audio_lens_list, dtype=torch.int32)
             audio = collate_vectors(audios, padding_value=0.0)
 
-            # Mirror the fast/slow prompt paths from the upstream dataset.
             attrs = ("input_ids", "context_ids", "answer_ids")
             pre_formatted = all(hasattr(c, a) for c in cuts for a in attrs)
             if pre_formatted:
@@ -233,9 +226,6 @@ def _patch_prompt_format_for_multi_channel() -> None:
         )
 
     for key, existing in list(_prompt_fn.PROMPT_FORMAT_FNS.items()):
-        # The registry is keyed by either ``example_type`` or
-        # ``(example_type, formatter_type)``. Only patch entries whose
-        # example type is a Cut (that's where MultiCut can show up).
         if isinstance(key, tuple):
             example_type = key[0]
         else:
@@ -264,9 +254,6 @@ def _install_mono_averaging_dataloader(model) -> None:
     """
     from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 
-    # Must patch the prompt format registry before the dataloader tokenizes
-    # cuts (with pretokenize=True, CutSet.map runs the formatter at manifest
-    # iteration time, before our dataset ever sees the cut).
     _patch_prompt_format_for_multi_channel()
 
     dataset_cls = _build_mono_averaging_canary_dataset_cls()
@@ -308,7 +295,6 @@ class _SkipNaNOrInfLossCallback(Callback):
             skip_flag = torch.zeros(1, device=pl_module.device)
             out = original_step(batch, batch_idx)
 
-            # training_step may return a tensor or a dict with 'loss'.
             if isinstance(out, dict):
                 loss = out.get("loss")
             else:
@@ -333,7 +319,8 @@ class _SkipNaNOrInfLossCallback(Callback):
 
 
 class _SkipBadBatchCallback(Callback):
-    """Skip training batches that crash the RNNT/TDT loss.
+    """
+    Skip training batches that crash the RNNT/TDT loss.
 
     NeMo's RNNT loss raises ``RuntimeError: Invalid parameter`` when a
     sample has zero encoder frames after subsampling (e.g. audio at the
@@ -448,20 +435,14 @@ class NeMoTrainer:
 
         if self.model is None:
             logger.info(f"Loading NeMo model: {self.config['base_model']}")
-            # ``map_location='cpu'`` is critical for multi-GPU DDP: NeMo's
-            # default placement sends weights to ``cuda:0``, so without this
-            # every rank's subprocess briefly holds a full model copy on
-            # GPU 0 before Lightning moves it to the rank-specific device.
-            # On tight GPUs (e.g. 16 GB A4000 as cuda:0) that OOMs before
-            # training ever starts.
+            # cpu: NeMo's default puts every DDP rank's copy on cuda:0 first.
             self.model = nemo_asr.models.ASRModel.from_pretrained(
                 model_name=self.config["base_model"],
                 map_location="cpu",
             )
             self.model = self.model.cpu()
 
-        # Disable CUDA graphs for RNNT/TDT models (e.g. Parakeet).
-        # CUDA graphs cause illegal memory access on H200 GPUs.
+        # CUDA graphs cause illegal memory accesses on H200.
         decoding = getattr(self.model, "decoding", None)
         inner = getattr(decoding, "decoding", None)
         computer = getattr(inner, "decoding_computer", None)
@@ -474,22 +455,16 @@ class NeMoTrainer:
         is_canary = self.config["architecture"] == "canary"
 
         if is_canary:
-            # Canary hard-requires Lhotse (asserts use_lhotse=True).
-            # Fix broken None defaults in pretrained configs (NeMo #14816).
+            # Pretrained configs ship None for these (NeMo #14816).
             cfg.train_ds.num_buckets = cfg.train_ds.get("num_buckets") or 30
             cfg.train_ds.min_tps = cfg.train_ds.get("min_tps") if cfg.train_ds.get("min_tps") is not None else -1
             cfg.train_ds.max_tps = cfg.train_ds.get("max_tps") if cfg.train_ds.get("max_tps") is not None else float("inf")
             cfg.train_ds.batch_duration = self.config.get("batch_duration", 600)
             cfg.train_ds.batch_size = None
 
-            # Canary rejects multi-channel cuts in its prompt formatter and
-            # has no on-the-fly stereo→mono averaging. Install a dataset
-            # subclass that averages channels per-sample before collation.
             _install_mono_averaging_dataloader(self.model)
 
         else:
-            # Parakeet: use the standard NeMo dataloader.
-            # channel_selector="average" mixes stereo to mono at load time.
             cfg.train_ds.use_lhotse = False
             cfg.train_ds.channel_selector = "average"
             cfg.train_ds.batch_size = self.config["batch_size"]
@@ -498,11 +473,6 @@ class NeMoTrainer:
         cfg.train_ds.min_duration = 0.1
         cfg.train_ds.max_duration = self.config.get("max_duration", 240.0)
 
-        # Optional encoder freeze for both Canary and Parakeet: cuts
-        # AdamW state by the ratio of encoder-to-total params (~5x for
-        # Canary, ~2x for Parakeet) so the full-Adam finetune fits on
-        # a 12–16 GB GPU. No effect on Whisper. Enable via
-        # ``"freeze_encoder": true`` in the job config.
         if self.config.get("freeze_encoder", False):
             frozen = 0
             for p in self.model.encoder.parameters():
@@ -510,13 +480,9 @@ class NeMoTrainer:
                 frozen += 1
             logger.info(f"Froze {frozen} encoder parameter tensors")
 
-        # Ensure the RNNT/TDT loss returns a scalar (mean over batch).
-        # Newer NeMo/PL versions error on logging per-sample loss vectors.
         if hasattr(cfg, "loss") and cfg.loss is not None:
             cfg.loss.reduction = "mean_batch"
         cfg.train_ds.shuffle = True
-        # num_workers overrideable via config — on tight-CPU dev boxes
-        # 4 is optimal, on H200 nodes with 64+ cores raise to 16–32.
         cfg.train_ds.num_workers = self.config.get("num_workers", 4)
         cfg.train_ds.pin_memory = True
 
@@ -550,11 +516,9 @@ class NeMoTrainer:
         if val_manifest:
             self.model.setup_validation_data(cfg.validation_ds)
 
-        # Re-disable struct mode — setup_training_data/setup_validation_data
-        # can re-enable it on sub-configs.
+        # setup_*_data can re-enable struct mode on sub-configs.
         OmegaConf.set_struct(cfg, False)
 
-        # Configure optimizer and scheduler once across all chunks
         cfg.optim.name = "adamw"
         cfg.optim.lr = self.config["learning_rate"]
         cfg.optim.weight_decay = 0.01
@@ -598,9 +562,6 @@ class NeMoTrainer:
             if num_gpus > 1:
                 logger.info(f"Multi-GPU detected: {num_gpus} devices, using DDP")
 
-            # Mid-epoch step checkpoints so SLURM timeouts don't waste
-            # an entire epoch of training. PL restores full state (model,
-            # optimizer, scheduler, step counter) on resume.
             self._step_ckpt_dir = (
                 Path(self.config["output_dir"])
                 / self.config["exp_name"]
@@ -613,10 +574,7 @@ class NeMoTrainer:
                 filename="step-{step:08d}",
             )
 
-            # Epoch-boundary checkpoint so the next fit() resumes
-            # optimizer/scheduler state instead of restarting warmup.
-            # Must be its own ModelCheckpoint: save_on_train_epoch_end
-            # is a no-op on one that sets every_n_train_steps.
+            # save_on_train_epoch_end is a no-op on a checkpoint with every_n_train_steps.
             epoch_checkpoint = ModelCheckpoint(
                 dirpath=str(self._step_ckpt_dir),
                 every_n_epochs=1,
@@ -625,11 +583,6 @@ class NeMoTrainer:
                 save_on_train_epoch_end=True,
             )
 
-            # Both NeMo architectures can produce non-finite losses on rare
-            # bad samples (Canary: bf16 attention overflow on long prompts;
-            # Parakeet: bf16 RNNT logit overflow). Skip those batches
-            # instead of poisoning the optimizer and driving every
-            # subsequent step to NaN.
             callbacks = [
                 step_checkpoint,
                 epoch_checkpoint,
@@ -651,11 +604,6 @@ class NeMoTrainer:
                 log_every_n_steps=1,
             )
 
-            # No limit_val_batches: the val manifest passed in is already
-            # the fixed-size subset written at setup time, so we evaluate
-            # all of it. This keeps Whisper and NeMo aligned on the same
-            # samples. Full-corpus eval goes through the inference harness.
-
             if uses_lhotse:
                 # Lhotse iterable datasets don't have __len__.
                 trainer_kwargs["use_distributed_sampler"] = False
@@ -665,9 +613,6 @@ class NeMoTrainer:
 
         self.trainer.fit_loop.max_epochs = target_epoch
 
-        # Resume from the latest step checkpoint if one exists (e.g. after
-        # a SLURM timeout mid-epoch). PL restores model weights, optimizer,
-        # scheduler, and dataloader position so we lose at most ~2000 steps.
         ckpt_path = None
         step_ckpt_dir = getattr(self, "_step_ckpt_dir", None)
         if step_ckpt_dir and step_ckpt_dir.exists():
@@ -786,7 +731,6 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         for entries that have ``segments``. Use 0.0 for eval datasets.
     """
 
-    # Whisper's decoder context cap.
     MAX_LABEL_TOKENS = 448
     TIME_PRECISION = 0.02  # seconds per timestamp token step
 
@@ -818,16 +762,13 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
         Returns ``None`` if the result exceeds the decoder cap.
         """
         tokenizer = self.processor.tokenizer
-        # [<|sot|>, <|lang|>, <|transcribe|>] — no <|notimestamps|>.
         ids = list(tokenizer.prefix_tokens)
         prev_end = 0.0
         for start_s, end_s, seg_text in entry["segments"]:
             start_s = max(float(start_s), prev_end)
             end_s = max(float(end_s), start_s)
             ids.append(self._timestamp_token(start_s))
-            # Labels start with a space to match Whisper's native segment
-            # tokenization; without it words glue together once timestamps
-            # are stripped at decode time.
+            # Leading space matches Whisper's native segment tokenization.
             ids.extend(tokenizer(" " + seg_text, add_special_tokens=False).input_ids)
             ids.append(self._timestamp_token(end_s))
             prev_end = end_s
@@ -907,12 +848,7 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
             audio.numpy(), sampling_rate=16000, return_tensors="pt"
         ).input_features[0]
 
-        # Set per-sample decoder prefix tokens so each label sequence starts
-        # with the correct <|lang|><|transcribe|> prefix Whisper expects.
-        # Each DataLoader worker has its own dataset/processor copy and
-        # __getitem__ runs sequentially within a worker, so mutating the
-        # tokenizer state here is safe. ``predict_timestamps`` must be set
-        # explicitly on every call because it persists on the tokenizer.
+        # predict_timestamps persists on the tokenizer, so set it on every call.
         labels = None
         use_timestamps = (
             self.timestamp_prob > 0
@@ -930,7 +866,6 @@ class WhisperFinetuneDataset(torch.utils.data.Dataset):
                 language=entry["language"], task="transcribe",
                 predict_timestamps=False,
             )
-            # Same leading-space convention as timestamp mode.
             text = " " + entry["text"] if entry["text"] else entry["text"]
             labels = self.processor.tokenizer(text).input_ids
 
@@ -977,18 +912,12 @@ class WhisperDataCollator:
         label_ids = labels_batch["input_ids"]
         attention_mask = labels_batch.attention_mask
 
-        # Labels already start with <|startoftranscript|> and
-        # shift_tokens_right prepends it again; strip it so decoder
-        # inputs match generation's [SOT, lang, ...] seeding.
+        # shift_tokens_right prepends SOT again.
         if (label_ids[:, 0] == self.decoder_start_token_id).all():
             label_ids = label_ids[:, 1:]
             attention_mask = attention_mask[:, 1:]
 
-        # Compute decoder_input_ids before -100 masking so teacher-forcing
-        # inputs are actual token ids. HF's Trainer pops ``labels`` before
-        # the model forward when label_smoothing_factor > 0, so Whisper's
-        # built-in labels -> decoder_input_ids shift never runs and forward
-        # crashes. Pre-computing here makes the batch self-sufficient.
+        # Label smoothing makes the Trainer pop labels, so the model can't shift them itself.
         decoder_input_ids = shift_tokens_right(
             label_ids,
             self.pad_token_id,
@@ -1054,10 +983,6 @@ class WhisperTrainer:
         pred_ids = pred.predictions
         label_ids = pred.label_ids
 
-        # Sanitize both pred and label IDs before decoding. Generated
-        # predictions can contain -100 padding or out-of-vocab values
-        # when the model hallucinates, which trips batch_decode with
-        # OverflowError. Clip to the valid tokenizer vocab range.
         pad_id = self.processor.tokenizer.pad_token_id
         vocab_size = self.processor.tokenizer.vocab_size
 
@@ -1068,10 +993,7 @@ class WhisperTrainer:
         pred_str = self.processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
         label_str = self.processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-        # jiwer rejects batches with any empty reference (division by zero
-        # on 0-word references). Our manifests include empty-text windows
-        # that land on purely instrumental regions — drop those pairs
-        # before computing WER instead of crashing the whole chunk.
+        # jiwer rejects empty references (instrumental windows).
         paired = [(r, h) for r, h in zip(label_str, pred_str) if r.strip()]
         if not paired:
             return {"wer": 0.0}
@@ -1098,15 +1020,10 @@ class WhisperTrainer:
             )
             self.processor = WhisperProcessor.from_pretrained(self.config["base_model"])
 
-            # In-loop eval cannot pass per-sample language to generate(), so
-            # let Whisper auto-detect language per sample. The training-time
-            # labels still get the correct per-sample prefix via the dataset.
+            # In-loop eval can't pass per-sample language to generate().
             self.model.generation_config.language = None
             self.model.generation_config.task = "transcribe"
             self.model.generation_config.forced_decoder_ids = None
-
-            # Don't manually move to CUDA here — Seq2SeqTrainer handles
-            # device placement, including multi-GPU DDP via torchrun.
 
     def train_one_epoch(self, target_epoch: int) -> dict:
         """
@@ -1128,12 +1045,6 @@ class WhisperTrainer:
         )
         eval_dataset = None
         if self.val_manifest:
-            # The val manifest passed in here is the fixed-size subset
-            # materialized at setup time (``val_subset_manifest.jsonl``),
-            # so we don't re-subset in Python. That keeps this eval pool
-            # identical to what NeMo sees. Full-corpus eval runs
-            # separately via the inference harness. Timestamp mode is
-            # disabled for eval so in-loop WER is deterministic.
             eval_dataset = WhisperFinetuneDataset(
                 self.val_manifest, self.processor, timestamp_prob=0.0
             )
@@ -1147,8 +1058,6 @@ class WhisperTrainer:
             self.config.get("warmup_epochs", 5) / max(self.config["max_epochs"], 1),
         )
 
-        # Create trainer once and reuse to preserve optimizer state across epochs.
-        # num_train_epochs is set to the total so the LR schedule spans the full run.
         if self.hf_trainer is None:
             logger.info(
                 f"Whisper training: {len(train_dataset)} samples. "
@@ -1171,33 +1080,14 @@ class WhisperTrainer:
                 label_names=["labels"],
                 weight_decay=0.01,
                 max_grad_norm=1.0,
-                # Prevent decoder over-confidence on repeated-token targets.
-                # Without smoothing the cross-entropy pushes P(same token | ..)
-                # arbitrarily high on repetitive music hooks, which at
-                # inference produces "i i i i..." loops once teacher forcing
-                # ends. 0.1 is the seq2seq standard.
                 label_smoothing_factor=0.1,
                 dataloader_num_workers=16,
-                # Keep workers alive across epoch boundaries instead of
-                # re-spawning — eliminates the ~2 s per-epoch cold start
-                # where every worker re-imports transformers + torch.
                 dataloader_persistent_workers=True,
-                # Each worker keeps N batches pre-fetched ahead of the
-                # GPU, so even a slow individual batch decode gets hidden
-                # behind the prior step's compute. 4 is conservative —
-                # memory cost = 4 × batch of mel spectrograms per worker,
-                # typically well under 1 GB of host RAM.
                 dataloader_prefetch_factor=4,
                 dataloader_pin_memory=True,
                 predict_with_generate=True,
                 report_to="none",
                 run_name=self.config["exp_name"],
-                # ``torch_compile`` can fuse Whisper's small ops and
-                # eliminate dtype-cast traffic, but the compile cost
-                # hits the first ~10 steps and only amortizes in long
-                # training runs. Default off — enable explicitly with
-                # ``"torch_compile": true`` in the job config for
-                # production runs where it pays back.
                 torch_compile=self.config.get("torch_compile", False),
             )
 
@@ -1222,13 +1112,8 @@ class WhisperTrainer:
             if eval_dataset is not None:
                 self.hf_trainer.eval_dataset = eval_dataset
 
-        # num_train_epochs stays at max_epochs (full-run LR schedule);
-        # the callback stops training once target_epoch is reached.
         self._stop_callback.target_epoch = target_epoch
 
-        # Resume from the latest *complete* HF step checkpoint if one
-        # exists. Incomplete checkpoints (from SLURM-killed mid-save) are
-        # detected by missing trainer_state.json and removed.
         hf_trainer_dir = Path(self.config["output_dir"]) / self.config["exp_name"] / "hf_trainer"
         resume_ckpt = None
         if hf_trainer_dir.exists():
@@ -1362,7 +1247,6 @@ class WhisperTrainer:
         except (IndexError, ValueError):
             epoch = 0
 
-        # Seq2SeqTrainer handles device placement (including multi-GPU).
         return epoch
 
 
@@ -1460,10 +1344,6 @@ def run_training_job(
                 config["batch_size"] = new_bs
             with open(job_dir / "config.json", "w") as f:
                 json.dump(config, f, indent=2)
-            # Force garbage collection of the old trainer/model before
-            # clearing CUDA cache. Without this, the old model's GPU
-            # tensors are still referenced and empty_cache() can't free
-            # them, causing each retry to OOM on top of the previous.
             import gc
             gc.collect()
             torch.cuda.empty_cache()
@@ -1481,8 +1361,7 @@ def _run_training_job_inner(
     the latest checkpoint if any, and trains the requested epochs. Any
     OOM raised here is caught and handled by ``run_training_job``.
     """
-    # cuDNN SDPA rebuilds its graph for every new sequence shape, i.e. every
-    # padded batch.
+    # cuDNN SDPA rebuilds its graph for every padded batch shape.
     torch.backends.cuda.enable_cudnn_sdp(False)
     trainer = create_trainer(config)
 
@@ -1528,7 +1407,6 @@ def _run_training_job_inner(
 
         last_checkpoint_path = trainer.save_checkpoint(epoch, checkpoint_dir)
 
-        # Only rank 0 writes config/metrics to avoid races in multi-GPU DDP.
         if _is_main_process():
             config["current_epoch"] = epoch
             config["completed_epochs"] = epoch

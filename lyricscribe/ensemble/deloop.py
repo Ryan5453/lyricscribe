@@ -1,13 +1,3 @@
-"""
-Post-hoc repair of runaway repetition in a transcription job.
-
-A cycle of length L (<= ``max_cycle`` words) repeated more than ``max_run``
-times in a row is a decoding loop -- real choruses repeat a line a handful of
-times, never dozens -- and is collapsed to ``max_run`` repeats. Intended for
-models decoded *without* ``no_repeat_ngram_size``; on output that already had
-a decode-time block it is a near no-op and can hurt marginally.
-"""
-
 from __future__ import annotations
 
 import json

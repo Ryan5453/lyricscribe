@@ -270,8 +270,6 @@ def download_musdb_alt(output_dir: Path) -> None:
         song_dir = output_dir / safe_name
         lyrics_path = song_dir / "lyrics.json"
 
-        # While in theory this should not be needed, if there is any
-        # issues with this code then it should make rerunning it faster.
         if lyrics_path.exists():
             skipped += 1
             continue

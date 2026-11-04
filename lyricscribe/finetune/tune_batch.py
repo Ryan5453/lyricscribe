@@ -1,14 +1,3 @@
-"""
-Batch-size sweep orchestrator.
-
-Drives :mod:`lyricscribe.finetune.probe` to find the largest fitting
-batch size for a given (model, audio-filename, GPU, DDP rank count)
-combination. Builds one shared manifest from the real dataset, then
-invokes each probe trial as a fresh ``torchrun`` subprocess so an OOM
-kills the whole DDP group without poisoning the orchestrator's CUDA
-state between trials.
-"""
-
 import json
 import logging
 import os
@@ -20,15 +9,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-# Whisper / Parakeet sweep batch_size (per-rank sample count).
-# 24 is the Whisper default, 48 and 96 are common non-power-of-2 stops.
-# Sweep stops at the first OOM; bisection fills in the gap afterwards.
 _BATCH_SIZE_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
 
-# Canary uses Lhotse duration batching — batch_size is ignored by its
-# training dataloader. Sweep batch_duration (seconds of audio per batch)
-# instead. Production default is 1440s; stop-points chosen to cover
-# common GPU budgets from 40 GB up through H200-class.
+# Canary batches by duration (Lhotse), so sweep batch_duration in seconds.
 _BATCH_DURATION_CANDIDATES: tuple[int, ...] = (60, 120, 300, 600, 900, 1200, 1440, 1800, 2400)
 
 
@@ -133,7 +116,6 @@ def _run_trial(
         print(f"  [bs={bs}] TIMEOUT after {timeout_s}s")
         return {"bs": bs, "phase": phase, "status": "timeout"}
 
-    # Success path: result file was written by rank 0 with all metrics.
     if result_file.exists():
         try:
             payload = json.loads(result_file.read_text())
@@ -150,11 +132,7 @@ def _run_trial(
             )
             return result
 
-    # Non-zero exit code → DDP group died. Most common cause is OOM on
-    # at least one rank. Distinguishing genuine crashes from OOMs from
-    # the parent is unreliable — torchrun reports 1 for both. Treat as
-    # OOM so the sweep correctly bisects below; a real crash will still
-    # be visible in the stderr output above.
+    # torchrun exits 1 for both OOMs and crashes; treat it as OOM so the sweep bisects.
     print(f"  [bs={bs}] OOM (torchrun exit={proc.returncode})")
     return {"bs": bs, "phase": phase, "status": "oom", "exitcode": proc.returncode}
 
@@ -288,7 +266,6 @@ def tune_batch_size(
                 elif r["status"] == "oom":
                     hi = mid
                 else:
-                    # Timeout or crash — can't tell which side, stop.
                     break
 
     _print_summary(results, safety_margin_pct)

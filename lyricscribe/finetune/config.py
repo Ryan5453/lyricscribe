@@ -62,7 +62,6 @@ _CONFIG_KEYS = {
     "manifests_from",
 }
 
-# Defaults where the Qwen families differ from the Whisper/NeMo ones.
 _ARCH_DEFAULTS = {
     "qwen3_asr": {
         "batch_size": 4, "grad_accum": 4, "max_epochs": 3, "epochs_per_job": 3,
@@ -111,15 +110,6 @@ def create_finetune_config(
     filenames_short = "_".join(Path(f).stem for f in filenames)
     exp_name = kwargs.get("exp_name") if kwargs.get("exp_name") else f"{arch_short}_{filenames_short}_{timestamp}"
 
-    # Per-architecture finetune LR defaults. These aren't lumped by
-    # training library — each model has its own sensitivity:
-    #  - Whisper: HF's ``Seq2SeqTrainer`` + ``fp16``, 244M–1.55B params.
-    #    1e-5 is the community-standard finetune LR.
-    #  - Canary: 1B encoder-decoder with bf16 attention that can overflow
-    #    at hot LRs. NVIDIA's finetune recipes sit at 5e-6 to 1e-5.
-    #  - Parakeet: 600M RNNT/TDT. The bf16 RNNT logits can overflow under
-    #    aggressive LRs, so we default lower than NVIDIA's published 1e-4
-    #    recipe; users can override back up via ``--learning-rate``.
     default_lr = {
         "whisper": 1e-5,
         "canary": 1e-5,
@@ -151,8 +141,6 @@ def create_finetune_config(
         # Reject windows whose sung time is >this fraction unlabeled
         # (None = off). Offsets are re-drawn rather than dropped.
         "max_unlabeled_vocal_frac": kwargs.get("max_unlabeled_vocal_frac"),
-        # Manifest-construction settings, recorded so config.json can
-        # reproduce its own manifest.
         "use_alignment": kwargs.get("use_alignment", True),
         "windows_per_song": kwargs.get("windows_per_song", 1),
         "line_overlap_threshold": kwargs.get("line_overlap_threshold", 0.7),

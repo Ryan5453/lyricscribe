@@ -1,11 +1,3 @@
-"""
-Paired song-level bootstrap between two job dirs.
-
-WER is a ratio of sums, so each resample recomputes it from summed errors
-and reference words rather than averaging per-song WERs. Pairing on songs
-cancels song-difficulty variance.
-"""
-
 from pathlib import Path
 
 import numpy as np

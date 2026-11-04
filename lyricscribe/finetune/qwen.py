@@ -1,27 +1,3 @@
-"""
-Finetuning for the Qwen audio-LLM families, on the standard window manifests.
-
-Two trainers share one HF ``Trainer`` harness:
-
-* :class:`Qwen3ASRTrainer` — full finetune of Qwen3-ASR, via the
-  transformers-native ``Qwen3ASRForConditionalGeneration`` and its ``-hf``
-  checkpoints (e.g. ``Qwen/Qwen3-ASR-1.7B-hf``). Supports torchrun DDP.
-* :class:`Qwen3OmniLoraTrainer` — LoRA on the thinker of Qwen3-Omni-30B-A3B.
-  Single GPU: the frozen bf16 base is ~60 GB and the adapter is tiny.
-
-Manifests are the model-agnostic ones ``finetune setup`` writes
-(``audio_filepath`` / ``offset`` / ``duration`` / ``text`` / ``language``),
-so manifests built for other architectures are usable unchanged.
-
-Step checkpoints are written every ``save_steps`` and resumed automatically.
-Under Slurm, a ``STEP_BUDGET`` log line projects epoch time against the
-remaining walltime early in each run.
-
-The Trainer's logged training loss is not a reliable objective readout here
-(it is accumulation-scaled and measured in train mode). Use
-:func:`mean_token_ce` (``lyricscribe finetune eval-loss``) to compare models.
-"""
-
 import json
 import logging
 import os
@@ -40,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 
-# Full language names, as the Qwen prompts use them.
 LANGUAGE_NAMES = {
     "en": "English", "es": "Spanish", "de": "German", "fr": "French",
     "it": "Italian", "pt": "Portuguese", "ru": "Russian",
@@ -260,7 +235,9 @@ def mean_token_ce(model, collator, dataset, batch_size: int = 2) -> float:
 
 
 def _slurm_seconds_left() -> float | None:
-    """Remaining walltime of the current Slurm job, or ``None`` outside Slurm."""
+    """
+    Remaining walltime of the current Slurm job, or ``None`` outside Slurm.
+    """
     job = os.environ.get("SLURM_JOB_ID")
     if not job:
         return None
@@ -323,7 +300,9 @@ class _StepBudgetCallback(TrainerCallback):
 
 
 class _StopAfterEpochCallback(TrainerCallback):
-    """Save and stop once ``target_epoch`` is reached (LR schedule spans the run)."""
+    """
+    Save and stop once ``target_epoch`` is reached (LR schedule spans the run).
+    """
 
     def __init__(self):
         self.target_epoch = None
@@ -437,7 +416,9 @@ class _QwenTrainerBase:
 
 
 class Qwen3ASRTrainer(_QwenTrainerBase):
-    """Full finetune of transformers-native Qwen3-ASR (``*-hf`` checkpoints)."""
+    """
+    Full finetune of transformers-native Qwen3-ASR (``*-hf`` checkpoints).
+    """
 
     collator_cls = Qwen3ASRCollator
 
@@ -501,7 +482,9 @@ def load_omni_thinker(base_model: str, device: str = "cuda:0"):
 
 
 class Qwen3OmniLoraTrainer(_QwenTrainerBase):
-    """LoRA on the Qwen3-Omni thinker; checkpoints are PEFT adapters."""
+    """
+    LoRA on the Qwen3-Omni thinker; checkpoints are PEFT adapters.
+    """
 
     collator_cls = Qwen3OmniCollator
 

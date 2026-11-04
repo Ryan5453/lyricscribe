@@ -1,15 +1,3 @@
-"""
-RMS-amplitude voice activity detection on separated vocals.
-
-Ported from https://github.com/jaza-syed/mss-alt
-(Syed et al., "Exploiting Music Source Separation for Automatic Lyrics
-Transcription with Whisper", arXiv:2506.15514).
-
-Unlike speech-trained VAD (Silero), this thresholds the normalized RMS
-amplitude of the (already separated) vocal track. Works on sustained
-tones, melismas, and non-lexical vocables that speech VAD under-fires on.
-"""
-
 from dataclasses import dataclass
 
 import librosa
@@ -18,7 +6,9 @@ import numpy as np
 
 @dataclass
 class RmsVadOptions:
-    """Threshold and shape options for RMS-based VAD."""
+    """
+    Threshold and shape options for RMS-based VAD.
+    """
 
     onset: float = 0.1
     offset: float = 0.1
@@ -28,6 +18,7 @@ class RmsVadOptions:
     speech_pad_ms: float = 200
 
 
+# Ported from https://github.com/jaza-syed/mss-alt (Syed et al., arXiv:2506.15514).
 def get_speech_timestamps_rms(
     audio: np.ndarray,
     vad_options: RmsVadOptions,

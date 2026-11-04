@@ -138,9 +138,6 @@ def update_chunk_status(
                 status in ("pending", "running")
                 and job_status.get("status") in ("complete", "complete_with_failures")
             ):
-                # A chunk was reopened after a previous completion state
-                # (manual retry). Clear stale top-level
-                # completion so monitors show the experiment as active again.
                 job_status["status"] = "pending"
 
             all_chunks = list((job_dir / "chunks").glob("chunk_*.json"))
@@ -184,7 +181,6 @@ def show_job_stats(job_dir: Path) -> None:
         if count > 0:
             logger.info(f"  {status_name}: {count}")
 
-    # List checkpoints
     ckpt_dir = job_dir / "checkpoints"
     if ckpt_dir.exists():
         checkpoints = sorted(
@@ -196,7 +192,6 @@ def show_job_stats(job_dir: Path) -> None:
             for ckpt in checkpoints:
                 logger.info(f"  {ckpt.name}")
 
-    # Show training metrics
     metrics_path = job_dir / "metrics.jsonl"
     if metrics_path.exists():
         logger.info("Metrics:")
@@ -240,7 +235,6 @@ def reset_failed_chunks(job_dir: Path) -> int:
             reset += 1
 
     if reset > 0:
-        # Reset the top-level status if it was marked complete-with-failures
         job_status = load_job_status(job_dir)
         if job_status.get("status") == "complete_with_failures":
             job_status["status"] = "pending"

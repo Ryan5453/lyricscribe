@@ -1,11 +1,3 @@
-"""
-RMS-VAD chunking shared by the audio-LLM transcribers (Qwen3-ASR, Qwen3-Omni,
-Voxtral, Music Flamingo, Gemini).
-
-Audio is loaded with ``librosa.load`` (Whisper and NeMo use torchaudio). The
-resampler choice changes the waveform, so swapping loaders changes outputs.
-"""
-
 import numpy as np
 
 from lyricscribe.transcribe.rms_vad import (

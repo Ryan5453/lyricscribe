@@ -97,9 +97,6 @@ class WhisperTranscriber(Transcriber):
             generate_kwargs["prompt_ids"] = self.pipe.tokenizer.get_prompt_ids(
                 initial_prompt, return_tensors="pt"
             ).to(self.pipe.model.device)
-        # Decoder anti-stutter knobs. Both ``1.0`` / ``0`` disable the
-        # corresponding constraint; defaults reproduce a vanilla Whisper
-        # decode unless the caller opts in via job config.
         if repetition_penalty and repetition_penalty != 1.0:
             generate_kwargs["repetition_penalty"] = repetition_penalty
         if no_repeat_ngram_size and no_repeat_ngram_size > 0:
@@ -160,9 +157,6 @@ class WhisperTranscriber(Transcriber):
                     return_seconds=False,
                 )
             else:
-                # RMS-VAD on the (separated) vocal track. The raw segment
-                # output is fine-grained — merge into <=30s chunks so each
-                # call to Whisper sees as much context as it can handle.
                 rms_segments = get_speech_timestamps_rms(
                     vad_1d.numpy(),
                     vad_options=RmsVadOptions(),
@@ -178,7 +172,6 @@ class WhisperTranscriber(Transcriber):
 
             wav_1d = wav.squeeze(0)
 
-            # Clamp timestamps to the length of the transcription audio
             max_samples = wav_1d.shape[0]
             timestamps = [
                 {

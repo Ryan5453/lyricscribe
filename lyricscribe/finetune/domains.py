@@ -1,21 +1,3 @@
-"""
-Audio-domain assignment for multi-file finetune manifests.
-
-``create_manifest`` picks a random available ``--filename`` per song, so a
-multi-file experiment ends up with an uncontrolled mix of audio domains. The
-``"balanced"`` mode instead assigns every song *wholly* to one domain and
-balances the two domains 50/50 by window count; ``"fallback"`` puts every
-song in domain B. Both are a post-pass over the finished manifests: offsets,
-labels and filtering are unchanged and only ``audio_filepath`` is swapped,
-which requires every audio file of a song to be a time-aligned full-song
-render (e.g. separator outputs and the mix).
-
-Domains are defined by the experiment's ``--filename`` list: the first
-filename is domain A (e.g. ``vocals.wav``); the remaining filenames form
-domain B in preference order (e.g. ``audio.wav`` then ``audio.mp3``, the
-first one that exists is used).
-"""
-
 import hashlib
 import json
 import logging

@@ -1,7 +1,3 @@
-"""
-Shared loaders for job dirs and dataset references.
-"""
-
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +6,6 @@ import jiwer
 
 from lyricscribe.evaluate import _language_for, _load_dataset, _normalized
 
-# Keyed by dataset directory name; jobs with fewer songs are refused as partial.
 EXPECTED_SONGS = {"jam-alt": 79, "jam_alt": 79, "musdb_alt": 39}
 
 
@@ -41,7 +36,9 @@ class Job:
 
     @property
     def expected(self) -> int | None:
-        """Song count this job should have, or ``None`` if unknown."""
+        """
+        Song count this job should have, or ``None`` if unknown.
+        """
         for d in self.dataset_dirs:
             if d.name in EXPECTED_SONGS:
                 return EXPECTED_SONGS[d.name]

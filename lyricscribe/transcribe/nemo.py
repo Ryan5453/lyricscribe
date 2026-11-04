@@ -137,9 +137,6 @@ class NemoTranscriber(Transcriber):
         """
         logger.info(f"CUDA available: {torch.cuda.is_available()}")
         logger.info(f"Loading NeMo model: {self.model_name}")
-        # ``from_pretrained`` only accepts HF-hub repo IDs; local
-        # ``.nemo`` checkpoints (e.g. finetune outputs) must be
-        # loaded via ``restore_from``.
         from pathlib import Path
         if Path(self.model_name).is_file():
             # ``ASRModel.restore_from`` can't build multitask models; use their class.
@@ -156,8 +153,7 @@ class NemoTranscriber(Transcriber):
             )
         self.is_multitask = isinstance(self.model, EncDecMultiTaskModel)
 
-        # Disable CUDA graphs for RNNT/TDT models (e.g. Parakeet).
-        # CUDA graphs cause illegal memory access on H200 GPUs.
+        # CUDA graphs cause illegal memory accesses on H200.
         decoding = getattr(self.model, "decoding", None)
         inner = getattr(decoding, "decoding", None)
         computer = getattr(inner, "decoding_computer", None)
@@ -261,8 +257,6 @@ class NemoTranscriber(Transcriber):
                     return_seconds=True,
                 )
             else:
-                # RMS-VAD returns sample indices; merge into <=30s chunks
-                # then convert to seconds for NeMo's manifest format.
                 rms_segments = get_speech_timestamps_rms(
                     vad_1d.numpy(),
                     vad_options=RmsVadOptions(),

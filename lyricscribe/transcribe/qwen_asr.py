@@ -1,23 +1,3 @@
-"""
-Qwen3-ASR transcription on transformers' native ``qwen3_asr`` implementation.
-
-The ``qwen-asr`` package pins transformers 4.57.6, so it can't share an
-environment with the rest of LyricScribe. This module reproduces its
-transformers-backend inference (prompt, audio normalisation, chunking,
-batching, output parsing) on ``Qwen3ASRForConditionalGeneration`` from
-transformers >= 5.19.
-
-Checkpoints in the original ``qwen-asr`` layout (``thinker.*`` weights,
-``thinker_config`` in config.json), such as the hub base models, are
-converted on load; the native config/processor come from the matching
-``Qwen/Qwen3-ASR-*-hf`` repo.
-
-``_split_audio_into_chunks``, ``_detect_and_fix_repetitions`` and
-``_parse_asr_output`` are copied from qwen-asr 0.0.6
-(``qwen_asr/inference/utils.py``, Copyright 2026 The Alibaba Qwen team,
-Apache-2.0); the prompt format follows its ``Qwen3ASRModel._build_text_prompt``.
-"""
-
 import copy
 import json
 import logging
@@ -208,6 +188,9 @@ def _float_range_normalize(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio, -1.0, 1.0)
 
 
+# _split_audio_into_chunks, _detect_and_fix_repetitions and _parse_asr_output are from
+# qwen-asr 0.0.6 (qwen_asr/inference/utils.py), Copyright 2026 The Alibaba Qwen team,
+# Apache-2.0.
 def _split_audio_into_chunks(
     wav: np.ndarray,
     sr: int,
@@ -215,7 +198,9 @@ def _split_audio_into_chunks(
     search_expand_sec: float = 5.0,
     min_window_ms: float = 100.0,
 ) -> list[np.ndarray]:
-    """Split at low-energy points near ``max_chunk_sec``; pad short chunks (qwen-asr)."""
+    """
+    Split at low-energy points near ``max_chunk_sec``; pad short chunks (qwen-asr).
+    """
     wav = np.asarray(wav, dtype=np.float32)
     total_len = int(wav.shape[0])
     chunks = []
@@ -252,7 +237,9 @@ def _split_audio_into_chunks(
 
 
 def _detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
-    """Collapse >threshold character / short-pattern repeats (qwen-asr)."""
+    """
+    Collapse >threshold character / short-pattern repeats (qwen-asr).
+    """
 
     def fix_char_repeats(s, thresh):
         res, i, n = [], 0, len(s)
@@ -301,7 +288,9 @@ def _detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
 
 
 def _parse_asr_output(raw: str, forced_language: str | None) -> str:
-    """Strip the ``language X<asr_text>`` header and repetitions (qwen-asr)."""
+    """
+    Strip the ``language X<asr_text>`` header and repetitions (qwen-asr).
+    """
     s = (raw or "").strip()
     if not s:
         return ""

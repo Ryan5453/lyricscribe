@@ -6,9 +6,6 @@ from pathlib import Path
 
 import typer
 
-# Lightweight imports only — heavy modules (torch, transformers, nemo,
-# unblend, librosa) are imported lazily inside the commands that need them
-# so the CLI starts in well under a second for status/retry/inspect.
 from lyricscribe.finetune import jobs as finetune_jobs
 from lyricscribe.finetune.config import (
     create_finetune_config,
@@ -65,7 +62,6 @@ def _collect_result_files(
             )
         result_files.extend(discovered)
 
-    # Preserve order while deduplicating.
     unique: list[Path] = []
     seen: set[Path] = set()
     for path in result_files:
@@ -355,9 +351,6 @@ def transcribe_setup(
         repetition_penalty = 1.7
         no_repeat_ngram_size = 5
     if vad and vad_method == "rms" and not vad_source_file:
-        # RMS-VAD thresholds amplitude. Run on a mixed track and the drums,
-        # bass, etc. drown the vocal-presence signal — segments end up
-        # near-useless. Require an explicit separated-vocals or stems file.
         raise typer.BadParameter(
             "--vad-method=rms requires --vad-source pointing to a separated "
             "vocal track (e.g. htdemucs_ft_vocals.wav) or a true vocal stem "
@@ -433,14 +426,12 @@ def transcribe_reset(
 
     Deletes results files and resets all chunk statuses to pending.
     """
-    # Delete results files
     deleted = 0
     for p in job_dir.glob("results*.jsonl"):
         p.unlink(missing_ok=True)
         deleted += 1
     logger.info(f"Deleted {deleted} results file(s)")
 
-    # Reset chunk statuses
     reset_count = 0
     for chunk_path in sorted(job_dir.glob("chunk_*.json")):
         with open(chunk_path) as f:
@@ -509,7 +500,8 @@ def evaluate_run(
         None, "--musdb-dir", help="Root MUSDB directory (alignments + ground-truth both come from each song's lyrics.json)"
     ),
 ):
-    """Aggregate evaluation results into a CSV + LaTeX tables and generate analysis plots.
+    """
+    Aggregate evaluation results into a CSV + LaTeX tables and generate analysis plots.
 
     All outputs land in --output-dir:
       - evaluation_summary.csv
@@ -584,7 +576,9 @@ def artifact_extract(
     musdb_dir: Path = typer.Option(..., "--musdb-dir", help="Root MUSDB directory"),
     output_dir: Path = typer.Option(..., "--output-dir", help="Directory to write artifact feature JSON files"),
 ):
-    """Extract per-frame artifact features for each song."""
+    """
+    Extract per-frame artifact features for each song.
+    """
     from lyricscribe.transcribe.artifacts import extractor
 
     extractor.process_dataset(musdb_dir, output_dir)
@@ -672,7 +666,8 @@ def artifact_build(
         ..., "--output", help="Path to write the word-level CSV dataset"
     ),
 ):
-    """Build the word-level dataset combining alignments, artifacts, and errors.
+    """
+    Build the word-level dataset combining alignments, artifacts, and errors.
 
     Alignments are read from the ``alignment`` field of each song's
     ``lyrics.json`` — run ``lyricscribe dataset align`` on the MUSDB
@@ -862,8 +857,6 @@ def finetune_setup(
     import random
     import shutil as _shutil
 
-    # Lazy import: data.py pulls in transformers (WhisperTokenizer),
-    # which is heavy. Only setup needs it.
     from lyricscribe.finetune import data as finetune_data
     from lyricscribe.finetune import domains as finetune_domains
 
@@ -998,8 +991,6 @@ def finetune_setup(
                 filenames=config['filenames'],
             )
             val_manifest = job_dir / "val_manifest.jsonl"
-            # Validation manifest stays at windows_per_song=1: eval is just a
-            # sanity check, we don't need the same over-sampling as training.
             n_val = finetune_data.create_manifest(
                 val_dataset,
                 val_manifest,
@@ -1014,10 +1005,6 @@ def finetune_setup(
             )
             logger.info(f"Validation: {n_val} chunks")
 
-            # Write a fixed-size shuffled subset that both Whisper and NeMo
-            # evaluate against each epoch. Without this each trainer picks
-            # its own window (Subset vs. limit_val_batches) so cross-arch
-            # WER comparisons are over different audio — see #2.
             subset_size = config.get("eval_subset_size", 200)
             val_subset_manifest = job_dir / "val_subset_manifest.jsonl"
             n_subset = finetune_data.write_subset_manifest(
@@ -1057,8 +1044,6 @@ def finetune_run(
     
     This is typically called from a SLURM job, not run directly.
     """
-    # Lazy import: trainer pulls in NeMo + Lightning + transformers,
-    # which takes a long time. Avoid that overhead for non-run commands.
     from lyricscribe.finetune import trainer as finetune_trainer
 
     config_path = job_dir / "config.json"
@@ -1066,7 +1051,6 @@ def finetune_run(
         logger.error(f"No config found at {config_path}")
         return
 
-    # status.json is the source of truth for current_epoch
     config = load_finetune_config(job_dir)
     status = finetune_jobs.load_job_status(job_dir)
     config["current_epoch"] = status["current_epoch"]
@@ -1079,8 +1063,6 @@ def finetune_run(
     logger.info(f"Processing chunk {chunk_id}: epochs {chunk_data['start_epoch']} to {chunk_data['end_epoch']}")
 
     train_manifest = job_dir / "train_manifest.jsonl"
-    # Prefer the fixed-size subset manifest so every architecture evaluates
-    # on identical samples; fall back to the full val manifest without one.
     val_subset = job_dir / "val_subset_manifest.jsonl"
     val_full = job_dir / "val_manifest.jsonl"
     if val_subset.exists():
@@ -1114,7 +1096,9 @@ def finetune_run(
 def finetune_inspect(
     job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
 ):
-    """Inspect finetuning job details and processing statistics."""
+    """
+    Inspect finetuning job details and processing statistics.
+    """
     if not (job_dir / "status.json").exists():
         logger.error(f"No job found at {job_dir}")
         return

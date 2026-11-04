@@ -112,7 +112,6 @@ def _segments_for_window(
             if w["start"] >= window_start_ms
             and w["start"] + w["duration"] <= window_end_ms
         ]
-        # Split into segments at pauses >1s.
         for w in kept:
             w_start = w["start"]
             w_end = w["start"] + w["duration"]
@@ -182,7 +181,6 @@ class LyricsDataset:
             if not lyrics_path.exists():
                 continue
 
-            # Song must have at least one of the requested audio files
             available = [f for f in filenames if (song_dir / f).exists()]
             if not available:
                 continue
@@ -377,7 +375,6 @@ def create_manifest(
                     skipped_no_sync += 1
                     continue
 
-                # Opt-in word-level filtering when MFA alignment is present.
                 aligned_words = None
                 if use_alignment:
                     alignment = lyrics_data.get("alignment")
@@ -400,9 +397,6 @@ def create_manifest(
                     skipped_too_short += 1
                     continue
 
-                # Songs shorter than one window collapse to a single entry
-                # at offset 0 (no point in sampling the same position
-                # multiple times).
                 if song_duration <= window_seconds:
                     num_windows = 1
                     max_offset = 0.0

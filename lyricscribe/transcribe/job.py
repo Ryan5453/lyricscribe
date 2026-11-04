@@ -258,6 +258,7 @@ def setup_job(
         to read ``detected_language`` from in each subdirectory.
     :param vad_filename: Optional audio filename to use as VAD source
         (timestamps from this file, transcription from ``filename``).
+    :param vad_method: ``"silero"`` or ``"rms"``.
     :param repetition_penalty: Whisper decode-time anti-stutter knob.
         ``1.0`` disables (vanilla decode).
     :param no_repeat_ngram_size: Whisper decode-time anti-loop knob.
@@ -301,7 +302,6 @@ def setup_job(
 
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    # Clean up old results when running setup to avoid duplicate appends during run.
     results_path = job_dir / "results.jsonl"
     if results_path.exists():
         results_path.unlink()
@@ -421,6 +421,15 @@ def _transcribe_with_oom_retry(
     :param vad_model: Loaded Silero VAD model, or ``None``.
     :param language: Optional language code.
     :param vad_source: Optional path to VAD source audio file.
+    :param vad_method: Passed through to :meth:`Transcriber.transcribe`.
+    :param repetition_penalty: Passed through.
+    :param no_repeat_ngram_size: Passed through.
+    :param num_beams: Passed through.
+    :param condition_on_prev: Passed through.
+    :param temperature_fallback: Passed through.
+    :param compression_ratio_threshold: Passed through.
+    :param logprob_threshold: Passed through.
+    :param initial_prompt: Passed through.
     :return: Transcribed text.
     :raises torch.cuda.OutOfMemoryError: If OOM persists at batch_size=1.
     """

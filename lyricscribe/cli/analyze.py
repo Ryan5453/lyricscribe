@@ -8,9 +8,6 @@ logger = logging.getLogger(__name__)
 
 analyze_app = typer.Typer(help="Scoring, reference self-WER, significance testing and checkpoint averaging")
 
-# Heavy modules (jiwer/alt_eval, torch, transformers) are imported inside each
-# command so ``lyricscribe --help`` stays fast.
-
 
 def _write_json(path: Path | None, data) -> None:
     if path is not None:

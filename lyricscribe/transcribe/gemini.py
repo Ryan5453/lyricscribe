@@ -1,12 +1,3 @@
-"""
-Gemini (Google Generative Language API) as a transcriber, under the same
-RMS-VAD chunked protocol as the open audio-LLMs.
-
-The API key is read from the ``GEMINI_API_KEY`` environment variable only and
-is never written anywhere. Each chunk is one request; 429/500/503/504
-responses and network errors are retried with backoff.
-"""
-
 import base64
 import io
 import json

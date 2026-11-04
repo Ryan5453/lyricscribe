@@ -1,12 +1,3 @@
-"""
-Reference self-WER.
-
-Each song's ``lyrics.json`` carries two independent provider transcripts
-(``unsynced`` — what WER is graded against — and ``synced``). Their mutual
-WER ("self-WER") flags broken references: wrong song version, missing
-sections. Report WER both unfiltered *and* on songs with self-WER <= 0.3.
-"""
-
 import json
 import logging
 from pathlib import Path
@@ -66,7 +57,7 @@ def build_selfwer_artifact(dataset_dir: Path, output_path: Path) -> int:
                     "synced_provider": synced.get("provider"),
                     "ref_words": len(ref_u.split()),
                 }
-            except Exception as e:  # noqa: BLE001 - recorded, not fatal
+            except Exception as e:  # noqa: BLE001
                 row = {"song_id": song_dir.name, "error": str(e)[:80]}
             f.write(json.dumps(row) + "\n")
             n += 1

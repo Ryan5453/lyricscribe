@@ -1,8 +1,3 @@
-"""
-Batch scoring of job dirs: count verification, corrupt-line guard, the
-reference-quality slice, common-song pairing, per-language and raw WER.
-"""
-
 import logging
 from pathlib import Path
 
@@ -17,7 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 class IncompleteJobError(ValueError):
-    """A job dir has fewer usable hypotheses than its dataset has songs."""
+    """
+    A job dir has fewer usable hypotheses than its dataset has songs.
+    """
 
 
 def scorable_songs(job: Job, require_complete: bool = True) -> list[str]:
@@ -153,7 +150,9 @@ def discover_job_dirs(root: Path, pattern: str) -> list[Path]:
 
 
 def format_stats(label: str, s: dict) -> str:
-    """One-line human summary of a stats dict."""
+    """
+    One-line human summary of a stats dict.
+    """
     sh = s["share"]
     return (
         f"{label}: n={s['n']} WER={s['wer']:.4f} "

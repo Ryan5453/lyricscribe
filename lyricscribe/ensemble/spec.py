@@ -1,25 +1,3 @@
-"""
-Ensemble registry: which job dir holds each system's hypotheses per dataset,
-and which ordered member lists (subsets) to combine.
-
-A spec is YAML (or JSON, which is valid YAML)::
-
-    root: /path/to/project   # relative paths resolve here; default: the spec's dir
-    datasets:
-      dev: data/dev
-      test: {dir: data/test, expected: 100}   # expected: optional song-count check
-    systems:
-      whisper: {dev: jobs/whisper/dev, test: jobs/whisper/test}
-      parakeet: {dev: jobs/parakeet/dev, test: jobs/parakeet/test}
-      qwen: {dev: jobs/qwen/dev, test: jobs/qwen/test}
-    subsets:
-      trio: [whisper, parakeet, qwen]
-
-Subset member order matters: the first member is the alignment pivot and
-voting ties break toward earlier members. Duplicate keys anywhere in the file
-are rejected: a shadowed subset would silently run the wrong members.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -29,7 +7,9 @@ import yaml
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    """SafeLoader that rejects duplicate mapping keys instead of keeping the last."""
+    """
+    SafeLoader that rejects duplicate mapping keys instead of keeping the last.
+    """
 
 
 def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False):
@@ -52,7 +32,9 @@ _UniqueKeyLoader.add_constructor(
 
 @dataclass
 class DatasetSpec:
-    """A reference dataset: song dirs with ``lyrics.json``."""
+    """
+    A reference dataset: song dirs with ``lyrics.json``.
+    """
 
     dir: Path
     expected: int | None = None
@@ -60,7 +42,9 @@ class DatasetSpec:
 
 @dataclass
 class EnsembleSpec:
-    """Loaded ensemble registry."""
+    """
+    Loaded ensemble registry.
+    """
 
     datasets: dict[str, DatasetSpec] = field(default_factory=dict)
     systems: dict[str, dict[str, Path]] = field(default_factory=dict)
@@ -123,6 +107,18 @@ class EnsembleSpec:
 def load_spec(path: Path | None) -> EnsembleSpec:
     """
     Load an ensemble spec file; ``None`` returns an empty spec for ad-hoc use.
+
+    ::
+
+        root: /path/to/project   # relative paths resolve here; default: the spec's dir
+        datasets:
+          dev: data/dev
+          test: {dir: data/test, expected: 100}   # expected: optional song-count check
+        systems:
+          whisper: {dev: jobs/whisper/dev, test: jobs/whisper/test}
+          parakeet: {dev: jobs/parakeet/dev, test: jobs/parakeet/test}
+        subsets:
+          duo: [whisper, parakeet]   # first member is the alignment pivot and wins ties
 
     :param path: YAML/JSON spec path.
     :return: The loaded spec.

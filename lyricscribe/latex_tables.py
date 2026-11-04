@@ -32,8 +32,10 @@ def _dataset_tex(ds: str) -> str:
 
 
 def _config_label(job_dir: str) -> str:
-    """Strip the dataset prefix from the job-dir basename to get a compact
-    pipeline config label (e.g. 'stems_vad_chunked', 'mix_cross_vad')."""
+    """
+    Strip the dataset prefix from the job-dir basename to get a compact
+    pipeline config label (e.g. 'stems_vad_chunked', 'mix_cross_vad').
+    """
     basename = job_dir.split("/")[-1]
     for prefix in ("musdb_alt_", "jam_alt_", "final_test_"):
         if basename.startswith(prefix):

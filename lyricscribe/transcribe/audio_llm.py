@@ -1,13 +1,3 @@
-"""
-General audio-LLMs as transcribers: Voxtral, Qwen3-Omni (optionally with a
-LoRA adapter) and Music Flamingo, all native in transformers.
-
-The protocol is deliberately plain and identical across families: each
-RMS-VAD chunk (or the whole song, with VAD off) is written to a 16-bit wav
-and handed to the model in its own chat format with one fixed prompt, greedy
-decoding, ``max_new_tokens`` per chunk; chunk texts are joined with a space.
-"""
-
 import logging
 import os
 import tempfile

@@ -37,7 +37,9 @@ def _language_key(lyrics_data: dict) -> str:
 
 
 def _clean_lyrics(text: str) -> str:
-    """Strip punctuation and normalise whitespace for MFA."""
+    """
+    Strip punctuation and normalise whitespace for MFA.
+    """
     text = text.lower()
     text = re.sub(r"[^\w\s']", " ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -121,7 +123,9 @@ def _recase_segment_words(words: list[dict], orig_text: str) -> list[dict]:
 
 
 def _find_container_runtime() -> str:
-    """Prefer Apptainer (common on HPC), then Singularity."""
+    """
+    Prefer Apptainer (common on HPC), then Singularity.
+    """
     for cmd in ("apptainer", "singularity"):
         if shutil.which(cmd):
             return cmd
@@ -240,16 +244,9 @@ def align(
     song_dirs = sorted([d for d in dataset_dir.iterdir() if d.is_dir()])
     total_found = len(song_dirs)
 
-    # Deterministic chunk partition: take every ``num_chunks``-th song starting
-    # at ``chunk_id``. Deterministic so reruns hit the same songs, cheap to
-    # compute, and naturally balanced for a uniformly-sized dataset.
     if num_chunks > 1:
         song_dirs = song_dirs[chunk_id::num_chunks]
 
-    # Group songs by the MFA model their detected_language dictates.
-    # Songs whose existing alignment already used the correct model are
-    # dropped when skip_existing=True; this lets reruns be safe across
-    # languages without re-aligning the already-correct ones.
     songs_by_model: dict[str, list[Path]] = {}
     unmapped: list[str] = []
     for song_dir in song_dirs:
@@ -323,8 +320,10 @@ def _run_mfa_pass(
     image_arg: str,
     runtime: str,
 ) -> None:
-    """Build an MFA corpus from *song_dirs*, run alignment with *mfa_model*,
-    then write per-song alignments back into each song's ``lyrics.json``."""
+    """
+    Build an MFA corpus from *song_dirs*, run alignment with *mfa_model*,
+    then write per-song alignments back into each song's ``lyrics.json``.
+    """
 
     with tempfile.TemporaryDirectory(prefix="lyricscribe_mfa_") as tmp:
         tmp_path = Path(tmp)

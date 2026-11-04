@@ -10,7 +10,7 @@ ensemble_app = typer.Typer(help="System combination (ROVER) over transcription j
 
 _SPEC_HELP = (
     "Ensemble spec (YAML/JSON): datasets, systems -> per-dataset job dirs, "
-    "and ordered subsets. Format: see the lyricscribe.ensemble.spec docstring."
+    "and ordered subsets. Format: see lyricscribe.ensemble.spec.load_spec."
 )
 _SYSTEM_HELP = (
     "Ad-hoc system: name=job_dir (requires a single --dataset) or "
@@ -45,7 +45,9 @@ def _build_spec(spec_path, systems, dataset_dirs, datasets):
 
 
 def _load(spec, dataset, members):
-    """Reference tokens, languages and normalised hypotheses for *members*."""
+    """
+    Reference tokens, languages and normalised hypotheses for *members*.
+    """
     from lyricscribe.ensemble import rover
 
     if dataset not in spec.datasets:

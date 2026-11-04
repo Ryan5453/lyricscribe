@@ -1,14 +1,3 @@
-"""
-Weight-space averaging of finetunes that share a base ("model soup").
-
-Works for any HF safetensors checkpoints that share parameter names (e.g.
-Whisper or Qwen3-ASR finetunes of one base). Keys missing from some member
-are dropped from the soup and reported: tied weights (e.g. Qwen3-ASR's
-``thinker.lm_head.weight``) may be saved by some checkpoints and not others
-and are re-tied from config on load, but a genuinely missing weight must not
-pass silently.
-"""
-
 import json
 import logging
 import shutil
@@ -16,7 +5,6 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Trainer state, plus the shard index: the soup is saved as one unsharded file.
 _SKIP_FILES = {
     "optimizer.pt",
     "scheduler.pt",
