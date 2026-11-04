@@ -33,7 +33,7 @@ def _build_probe_config(
     Build a minimal config dict that :func:`create_trainer` and
     :meth:`setup` expect. Mirrors :func:`create_finetune_config` but
     drops everything the probe doesn't need (output_dir, exp_name,
-    max_epochs, epochs_per_job, warmup_epochs) — the probe never
+    epochs_per_job, warmup_epochs) — the probe never
     writes checkpoints or runs more than a few steps, and no fake job
     directory is created on disk.
 
@@ -53,6 +53,7 @@ def _build_probe_config(
         "architecture": architecture,
         "base_model": model_name,
         "learning_rate": learning_rate,
+        "max_epochs": 1,
         "use_augmentation": True,
         "freeze_encoder": freeze_encoder,
         "num_workers": 2,
