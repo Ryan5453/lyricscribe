@@ -5,6 +5,8 @@ from pathlib import Path
 import jiwer
 from alt_eval.tokenizer import WORD, LyricsTokenizer, tokens_as_words
 
+from lyricscribe.ensemble.deloop import deloop
+
 logger = logging.getLogger(__name__)
 
 _TOKENIZER = LyricsTokenizer()
@@ -69,20 +71,55 @@ def _load_dataset(directory: Path) -> dict:
     return result
 
 
-def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
+def _registered_songs(job_dir: Path) -> set[str]:
     """
-    Evaluate a single transcription job directory, returning aggregate
-    WER stats and the job config, or None if the job cannot be evaluated.
+    Songs a job registered across its ``chunk_*.json`` manifests.
 
-    References and hypotheses both flow through the alt-eval lyrics
-    tokenizer and normalizer (Cífka et al. 2024) before WER / I / D / S
-    are computed, so differences in casing, punctuation, and per-language
-    contraction handling are not counted as errors.
+    :param job_dir: Transcription job directory.
+    :return: Song ids (empty if the job has no manifests).
+    """
+    names: set[str] = set()
+    for chunk_path in job_dir.glob("chunk_*.json"):
+        try:
+            with open(chunk_path) as f:
+                names.update(entry["name"] for entry in json.load(f).get("files", []))
+        except (json.JSONDecodeError, OSError, KeyError):
+            continue
+    return names
+
+
+def _counts(refs: list[str], hyps: list[str]) -> dict:
+    """
+    Corpus WER and I/D/S/H counts.
+
+    :param refs: Normalised references.
+    :param hyps: Normalised hypotheses.
+    :return: ``n_songs``, ``wer``, ``insertions``, ``deletions``, ``substitutions``, ``hits``.
+    """
+    measures = jiwer.process_words(refs, hyps)
+    ref_length = measures.substitutions + measures.deletions + measures.hits
+    errors = measures.substitutions + measures.deletions + measures.insertions
+    return {
+        "n_songs": len(refs),
+        "wer": errors / ref_length if ref_length else 0.0,
+        "insertions": measures.insertions,
+        "deletions": measures.deletions,
+        "substitutions": measures.substitutions,
+        "hits": measures.hits,
+    }
+
+
+def job_song_pairs(job_dir: Path, verbose: bool = False, deloop_max_run: int | None = None) -> dict | None:
+    """
+    The normalised reference and hypothesis of every scored song in a job,
+    under :func:`evaluate_job`'s rules (failed or missing songs are empty
+    hypotheses; songs without a reference are skipped).
 
     :param job_dir: Transcription job directory.
     :param verbose: Log why songs or the job are skipped.
-    :return: ``n_songs``, ``wer``, ``insertions``, ``deletions``,
-        ``substitutions``, ``hits`` and ``config``, or ``None``.
+    :param deloop_max_run: If set, collapse loops in each normalised hypothesis.
+    :return: ``songs`` (``(song_id, ref, hyp, language)`` tuples, sorted),
+        ``n_failed``, ``n_missing``, ``n_delooped`` and ``config``, or ``None``.
     """
     config_path = job_dir / "config.json"
     if not config_path.exists():
@@ -129,14 +166,10 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
             logger.warning("No results found in job directory")
         return None
 
-    refs_list: list[str] = []
-    hyps_list: list[str] = []
-    for song_id, r in results_map.items():
-        hypothesis = r.get("transcription")
-        if hypothesis is None:
-            if verbose:
-                logger.warning(f"{song_id}: skipped (no transcription)")
-            continue
+    songs = sorted(_registered_songs(job_dir) | set(results_map))
+    pairs: list[tuple[str, str, str, str]] = []
+    n_failed = n_missing = n_delooped = 0
+    for song_id in songs:
         ref_norm = refs_normalized.get(song_id)
         if ref_norm is None:
             if verbose:
@@ -147,27 +180,82 @@ def evaluate_job(job_dir: Path, verbose: bool = False) -> dict | None:
                 logger.warning(f"{song_id}: skipped (empty reference after normalization)")
             continue
         lang = languages[song_id]
+        r = results_map.get(song_id)
+        hypothesis = r.get("transcription") if r else None
+        if hypothesis is None:
+            if r is None:
+                n_missing += 1
+            else:
+                n_failed += 1
+            if verbose:
+                logger.warning(f"{song_id}: scored as empty ({'missing' if r is None else 'failed'})")
+            hypothesis = ""
         hyp_norm = _normalized(hypothesis, lang)
-        refs_list.append(ref_norm)
-        hyps_list.append(hyp_norm)
+        if deloop_max_run:
+            words = hyp_norm.split()
+            fixed = deloop(words, max_run=int(deloop_max_run))
+            if fixed != words:
+                n_delooped += 1
+                hyp_norm = " ".join(fixed)
+        pairs.append((song_id, ref_norm, hyp_norm, lang))
 
-    n = len(refs_list)
-    if n == 0:
+    if not pairs:
         if verbose:
             logger.warning("No songs could be evaluated")
         return None
-
-    measures = jiwer.process_words(refs_list, hyps_list)
-
-    ref_length = measures.substitutions + measures.deletions + measures.hits
-    errors = measures.substitutions + measures.deletions + measures.insertions
     return {
-        "n_songs": n,
-        "wer": errors / ref_length if ref_length else 0.0,
-        "insertions": measures.insertions,
-        "deletions": measures.deletions,
-        "substitutions": measures.substitutions,
-        "hits": measures.hits,
+        "songs": pairs,
+        "n_failed": n_failed,
+        "n_missing": n_missing,
+        "n_delooped": n_delooped,
+        "config": config,
+    }
+
+
+def evaluate_job(job_dir: Path, verbose: bool = False, deloop_max_run: int | None = None) -> dict | None:
+    """
+    Evaluate a single transcription job directory, returning aggregate
+    WER stats and the job config, or None if the job cannot be evaluated.
+
+    References and hypotheses both flow through the alt-eval lyrics
+    tokenizer and normalizer (Cífka et al. 2024) before WER / I / D / S
+    are computed, so differences in casing, punctuation, and per-language
+    contraction handling are not counted as errors.
+
+    Every registered song with a reference is scored: a failed song (no
+    transcription) or one never run counts as an empty hypothesis, so systems
+    are always compared on the same songs. ``complete`` is False when any
+    song was failed or missing.
+
+    :param job_dir: Transcription job directory.
+    :param verbose: Log why songs or the job are skipped.
+    :param deloop_max_run: If set, collapse loops in each normalised
+        hypothesis (:func:`~lyricscribe.ensemble.deloop.deloop`) before scoring.
+    :return: ``n_songs``, ``wer``, ``insertions``, ``deletions``,
+        ``substitutions``, ``hits``, ``n_failed``, ``n_missing``,
+        ``complete``, ``n_delooped``, ``by_language`` and ``config``, or ``None``.
+    """
+    pairs = job_song_pairs(job_dir, verbose=verbose, deloop_max_run=deloop_max_run)
+    if pairs is None:
+        return None
+    config = pairs["config"]
+    n_failed, n_missing, n_delooped = pairs["n_failed"], pairs["n_missing"], pairs["n_delooped"]
+    refs_list = [s[1] for s in pairs["songs"]]
+    hyps_list = [s[2] for s in pairs["songs"]]
+    langs_list = [s[3] for s in pairs["songs"]]
+
+    by_language = {}
+    for lang in sorted(set(langs_list)):
+        idx = [i for i, x in enumerate(langs_list) if x == lang]
+        by_language[lang] = _counts([refs_list[i] for i in idx], [hyps_list[i] for i in idx])
+    return {
+        **_counts(refs_list, hyps_list),
+        "n_failed": n_failed,
+        "n_missing": n_missing,
+        "complete": n_failed == 0 and n_missing == 0,
+        "deloop_max_run": deloop_max_run,
+        "n_delooped": n_delooped,
+        "by_language": by_language,
         "config": config,
     }
 

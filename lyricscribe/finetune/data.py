@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import math
@@ -169,6 +170,46 @@ def _segments_for_window(
     return segments_raw, False
 
 
+def _dedup_segments(segments_raw: list[list], dedup_max_run: int) -> list[list]:
+    """
+    Cap runs of consecutive identical words (case-insensitive) within each segment and
+    drop segments left empty.
+
+    :param segments_raw: ``(start_ms, end_ms, [words])`` segments (modified in place).
+    :param dedup_max_run: Longest allowed run (``0`` = no cap).
+    :return: The non-empty segments.
+    """
+    if dedup_max_run > 0:
+        for seg in segments_raw:
+            deduped: list[str] = []
+            for w in seg[2]:
+                wl = w.lower()
+                if len(deduped) >= dedup_max_run and all(d.lower() == wl for d in deduped[-dedup_max_run:]):
+                    continue
+                deduped.append(w)
+            seg[2] = deduped
+    return [s for s in segments_raw if s[2]]
+
+
+def _relative_segments(segments_raw: list[list], window_start_ms: float, duration: float) -> list[list]:
+    """
+    Whisper ``segments``: window-relative seconds, clamped and monotonic.
+
+    :param segments_raw: ``(start_ms, end_ms, [words])`` segments.
+    :param window_start_ms: Window start.
+    :param duration: Window duration in seconds.
+    :return: ``[start_s, end_s, text]`` rows.
+    """
+    segs = []
+    prev_end = 0.0
+    for s_ms, e_ms, words in segments_raw:
+        s = min(max((s_ms - window_start_ms) / 1000.0, prev_end), duration)
+        e = min(max((e_ms - window_start_ms) / 1000.0, s), duration)
+        segs.append([round(s, 3), round(e, 3), " ".join(words)])
+        prev_end = e
+    return segs
+
+
 class LyricsDataset:
     """
     Dataset that iterates over song directories, yielding audio paths
@@ -278,9 +319,9 @@ def create_manifest(
     This matches the inference-time distribution: HF's Whisper pipeline
     slices long songs into arbitrary 30s windows at inference, so
     training must expose the model to arbitrary boundaries too.
-    Parakeet's NeMo transcribe path handles variable-length audio at
-    inference natively, but still benefits from seeing a mix of vocal
-    and instrumental contexts during training.
+    Parakeet and Canary transcribe VAD chunks of up to 30 s, and still
+    benefit from seeing a mix of vocal and instrumental contexts during
+    training.
 
     The number of windows per song is proportional to song duration so
     longer songs contribute more samples. All offsets are drawn from the
@@ -288,10 +329,6 @@ def create_manifest(
 
     For Whisper, windows whose tokenized text exceeds *max_tokens* are
     dropped (the 448-token decoder cap). Parakeet/Canary skip this check.
-
-    For Canary, each entry additionally carries ``source_lang``,
-    ``target_lang``, ``pnc``, and ``answer`` fields for the Lhotse
-    prompt-based data pipeline.
 
     :param dataset: Dataset instance providing song directories with
         ``lyrics.json`` files.
@@ -475,23 +512,7 @@ def create_manifest(
                             skipped_incomplete += 1
                         continue
 
-                    if dedup_max_run > 0:
-                        for seg in segments_raw:
-                            deduped: list[str] = []
-                            for w in seg[2]:
-                                wl = w.lower()
-                                if (
-                                    len(deduped) >= dedup_max_run
-                                    and all(
-                                        d.lower() == wl
-                                        for d in deduped[-dedup_max_run:]
-                                    )
-                                ):
-                                    continue
-                                deduped.append(w)
-                            seg[2] = deduped
-
-                    segments_raw = [s for s in segments_raw if s[2]]
+                    segments_raw = _dedup_segments(segments_raw, dedup_max_run)
                     text = " ".join(
                         w for seg in segments_raw for w in seg[2]
                     ).strip()
@@ -516,21 +537,7 @@ def create_manifest(
                         "language": detected_language,
                     }
                     if architecture == "whisper" and segments_raw:
-                        # Window-relative seconds, clamped and monotonic.
-                        segs = []
-                        prev_end = 0.0
-                        for s_ms, e_ms, words in segments_raw:
-                            s = min(max((s_ms - window_start_ms) / 1000.0, prev_end), duration)
-                            e = min(max((e_ms - window_start_ms) / 1000.0, s), duration)
-                            segs.append([round(s, 3), round(e, 3), " ".join(words)])
-                            prev_end = e
-                        entry["segments"] = segs
-                    if architecture == "canary":
-                        entry["answer"] = text
-                        entry["source_lang"] = detected_language
-                        entry["target_lang"] = detected_language
-                        # Must match inference, which always sends pnc="yes".
-                        entry["pnc"] = "yes"
+                        entry["segments"] = _relative_segments(segments_raw, window_start_ms, duration)
 
                     f.write(json.dumps(entry) + "\n")
                     count += 1
@@ -561,8 +568,8 @@ def write_subset_manifest(
     """
     Copy a deterministic shuffled subset of a JSONL manifest.
 
-    Used for the during-training validation subset: we want Whisper and
-    NeMo to evaluate on the exact same set of samples each epoch, so we
+    Used for the during-training validation subset: we want every
+    trainer to evaluate on the exact same set of samples each epoch, so we
     materialize one shared subset manifest at setup time instead of
     letting each trainer pick its own window (``torch.Subset`` vs
     ``limit_val_batches``, which produce different sizes *and*
@@ -591,3 +598,268 @@ def write_subset_manifest(
         f.writelines(lines)
 
     return len(lines)
+
+
+# Data keys of the experiment that generated a manifest; recorded with every copy.
+DATA_KEYS = (
+    "filenames",
+    "train_dir",
+    "val_dir",
+    "dedup_max_run",
+    "max_unlabeled_vocal_frac",
+    "use_alignment",
+    "windows_per_song",
+    "line_overlap_threshold",
+    "ref_selfwer_file",
+    "max_ref_self_wer",
+    "audio_domain_mode",
+)
+
+
+def source_data_keys(source: Path) -> dict:
+    """
+    The data-construction keys recorded for a manifest directory: ``data_keys.json`` written by
+    :func:`prepare_manifests`, else the generating experiment's ``config.json``.
+
+    :param source: Experiment or prepared-manifest directory.
+    :return: The keys (with their provenance under ``"source"``).
+    """
+    prepared = source / "data_keys.json"
+    if prepared.exists():
+        return json.loads(prepared.read_text())
+    config = json.loads((source / "config.json").read_text())
+    keys = {k: config.get(k) for k in DATA_KEYS}
+    if config.get("manifests_from"):
+        upstream = Path(config["manifests_from"])
+        keys = source_data_keys(upstream) if (upstream / "config.json").exists() or (upstream / "data_keys.json").exists() else keys
+    keys["source"] = str(source)
+    return keys
+
+
+def _song_id(row: dict) -> str:
+    """
+    Song directory name of a manifest row.
+
+    :param row: Manifest row.
+    :return: Song id.
+    """
+    return Path(row["audio_filepath"]).parent.name
+
+
+@functools.lru_cache(maxsize=4096)
+def _lyrics(path: str) -> dict:
+    """
+    A song's ``lyrics.json``, cached (manifests hold several windows per song).
+
+    :param path: ``lyrics.json`` path.
+    :return: Parsed lyrics.
+    """
+    return json.loads(Path(path).read_text())
+
+
+def derive_whisper_segments(row: dict, keys: dict, window_seconds: float = 30.0) -> list[list] | None:
+    """
+    Rebuild a window's Whisper ``segments`` from its song's lyrics with the generating
+    recipe, so a manifest built for another family gains timestamp labels with identical
+    windows and text.
+
+    :param row: Manifest row (``audio_filepath``, ``offset``, ``duration``, ``text``).
+    :param keys: Source data keys (``use_alignment``, ``line_overlap_threshold``, ``dedup_max_run``).
+    :param window_seconds: Window length the manifest was drawn with.
+    :return: Segments, ``[]`` for an empty label, or ``None`` if the rebuilt text differs.
+    """
+    lyrics = _lyrics(str(Path(row["audio_filepath"]).parent / "lyrics.json"))
+    synced = lyrics.get("synced", {}).get("data", [])
+    aligned = None
+    if keys["use_alignment"] and lyrics.get("alignment"):
+        aligned = lyrics["alignment"].get("words")
+    start_ms = float(row.get("offset", 0.0)) * 1000
+    segments_raw, _ = _segments_for_window(
+        synced, aligned, start_ms, start_ms + window_seconds * 1000, float(keys["line_overlap_threshold"])
+    )
+    segments_raw = _dedup_segments(segments_raw, int(keys["dedup_max_run"] or 0))
+    text = " ".join(w for seg in segments_raw for w in seg[2]).strip()
+    if text != row["text"]:
+        return None
+    return _relative_segments(segments_raw, start_ms, float(row["duration"]))
+
+
+def whisper_label_tokens(row: dict, tokenizer) -> int:
+    """
+    Whisper decoder length of a window's no-timestamp label (prefix, text, end token).
+
+    :param row: Manifest row.
+    :param tokenizer: Whisper tokenizer.
+    :return: Token count.
+    """
+    tokenizer.set_prefix_tokens(language=row["language"], task="transcribe", predict_timestamps=False)
+    text = " " + row["text"] if row["text"] else row["text"]
+    return len(tokenizer(text).input_ids)
+
+
+def _read_rows(path: Path) -> list[dict]:
+    """
+    Read a JSONL manifest.
+
+    :param path: Manifest path.
+    :return: Rows.
+    """
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _write_rows(path: Path, rows: list[dict]) -> None:
+    """
+    Write a JSONL manifest.
+
+    :param path: Manifest path.
+    :param rows: Rows.
+    """
+    with open(path, "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows)
+
+
+def prepare_manifests(
+    source: Path,
+    output_dir: Path,
+    exclude_songs: set[str] | None = None,
+    repoint: str | None = None,
+    whisper_segments: bool = False,
+    whisper_model: str | None = None,
+    whisper_cap: int = 448,
+    eval_exclude_songs: set[str] | None = None,
+    eval_subset_size: int = 200,
+    eval_seed: int = 42,
+    min_window_seconds: float = 0.5,
+    recipe: dict | None = None,
+) -> dict:
+    """
+    Build one shared, family-agnostic manifest set from an experiment's manifests: the same
+    windows and text for every family, minus excluded songs, re-pointed at another audio file,
+    with Whisper timestamp ``segments`` rebuilt from the lyrics, and with windows whose label
+    exceeds Whisper's decoder cap dropped for every family. Writes ``train_manifest.jsonl``,
+    ``val_manifest.jsonl``, ``val_subset_manifest.jsonl``, ``data_keys.json`` and
+    ``prepare_report.json`` to *output_dir*.
+
+    :param source: Experiment (or prepared) directory holding the manifests.
+    :param output_dir: Where to write the prepared set.
+    :param exclude_songs: Song ids removed from training (e.g. near-duplicates of eval songs).
+    :param repoint: Audio filename replacing each row's ``audio_filepath`` basename.
+    :param whisper_segments: Rebuild Whisper ``segments`` for every training row.
+    :param whisper_model: Tokenizer for the Whisper label-cap check (``None`` skips it).
+    :param whisper_cap: Whisper decoder positions.
+    :param eval_exclude_songs: Validation songs the eval-loss subset must avoid (e.g. tune300).
+    :param eval_subset_size: Eval-loss windows.
+    :param eval_seed: Eval-loss subset seed.
+    :param min_window_seconds: Windows with less audio than this after re-pointing are dropped.
+    :param recipe: Data keys the source config doesn't record (e.g. from its launch script),
+        recorded under ``recipe_overrides``.
+    :return: The report (counts per step).
+    :raises FileExistsError: If *output_dir* already holds a train manifest.
+    :raises ValueError: If segment rebuilding needs a recipe key nobody recorded.
+    """
+    if (output_dir / "train_manifest.jsonl").exists():
+        raise FileExistsError(f"{output_dir} already holds manifests")
+    keys = source_data_keys(source)
+    for key, value in (recipe or {}).items():
+        if keys.get(key) is not None and keys[key] != value:
+            raise ValueError(f"recipe {key}={value!r} contradicts the source's recorded {keys[key]!r}")
+        keys[key] = value
+    keys["recipe_overrides"] = recipe or {}
+    if whisper_segments:
+        missing = [k for k in ("use_alignment", "line_overlap_threshold", "dedup_max_run") if keys.get(k) is None]
+        if missing:
+            raise ValueError(f"{source} records no {missing}; pass them as --recipe key=value")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report: dict = {"source": str(source)}
+    train = _read_rows(source / "train_manifest.jsonl")
+    val = _read_rows(source / "val_manifest.jsonl") if (source / "val_manifest.jsonl").exists() else []
+    report["train_in"] = len(train)
+    report["val_in"] = len(val)
+
+    if exclude_songs:
+        before = len(train)
+        dropped_songs = {_song_id(r) for r in train} & exclude_songs
+        train = [r for r in train if _song_id(r) not in exclude_songs]
+        report["excluded_songs"] = len(dropped_songs)
+        report["excluded_windows"] = before - len(train)
+
+    if repoint:
+        info_cache: dict[str, float | None] = {}
+
+        def duration(path: str) -> float | None:
+            """
+            Audio duration in seconds, cached.
+
+            :param path: Audio path.
+            :return: Duration, or ``None`` if unreadable.
+            """
+            if path not in info_cache:
+                try:
+                    info_cache[path] = sf.info(path).duration
+                except Exception:
+                    info_cache[path] = None
+            return info_cache[path]
+
+        missing, short_file, short_window = set(), set(), 0
+        for rows, name in ((train, "train"), (val, "val")):
+            kept = []
+            for r in rows:
+                old = r["audio_filepath"]
+                new = str(Path(old).with_name(repoint))
+                new_dur, old_dur = duration(new), duration(old)
+                if new_dur is None:
+                    missing.add(new)
+                    continue
+                if old_dur is not None and new_dur < old_dur:
+                    short_file.add(new)
+                    continue
+                if new_dur - float(r.get("offset", 0.0)) < min_window_seconds:
+                    short_window += 1
+                    continue
+                kept.append({**r, "audio_filepath": new})
+            report[f"{name}_repointed"] = len(kept)
+            rows[:] = kept
+        report["repoint_missing_files"] = len(missing)
+        report["repoint_shorter_than_source"] = sorted(short_file)[:50]
+        report["repoint_shorter_count"] = len(short_file)
+        report["repoint_short_windows"] = short_window
+
+    if whisper_model:
+        tokenizer = WhisperTokenizer.from_pretrained(whisper_model)
+        over = [r for r in train if whisper_label_tokens(r, tokenizer) > whisper_cap]
+        over_ids = {id(r) for r in over}
+        train = [r for r in train if id(r) not in over_ids]
+        report["whisper_cap"] = whisper_cap
+        report["over_cap_windows"] = len(over)
+
+    if whisper_segments:
+        mismatched = 0
+        for r in train:
+            segs = derive_whisper_segments(r, keys)
+            if segs is None:
+                mismatched += 1
+                r.pop("segments", None)
+            elif segs:
+                r["segments"] = segs
+        report["segments_mismatch"] = mismatched
+        report["segments_rows"] = sum(1 for r in train if r.get("segments"))
+
+    pool = [r for r in val if _song_id(r) not in (eval_exclude_songs or set())]
+    subset = random.Random(eval_seed).sample(pool, min(eval_subset_size, len(pool)))
+    report["val_subset"] = len(subset)
+    report["val_subset_songs"] = len({_song_id(r) for r in subset})
+    report["train_out"] = len(train)
+    report["train_songs"] = len({_song_id(r) for r in train})
+
+    _write_rows(output_dir / "train_manifest.jsonl", train)
+    if val:
+        _write_rows(output_dir / "val_manifest.jsonl", val)
+        _write_rows(output_dir / "val_subset_manifest.jsonl", subset)
+    keys = {**keys, "prepared_from": str(source), "repoint": repoint, "excluded_songs": report.get("excluded_songs", 0)}
+    if repoint:
+        keys["filenames"] = [repoint]
+    (output_dir / "data_keys.json").write_text(json.dumps(keys, indent=2))
+    (output_dir / "prepare_report.json").write_text(json.dumps(report, indent=2))
+    logger.info(f"Prepared manifests in {output_dir}: {json.dumps(report)}")
+    return report

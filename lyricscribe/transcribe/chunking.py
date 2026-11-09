@@ -1,5 +1,10 @@
-import librosa
+from collections.abc import Callable
+
 import numpy as np
+import torch
+import torchaudio
+from silero_vad import get_speech_timestamps
+from torch.jit import ScriptModule
 
 from lyricscribe.transcribe.rms_vad import (
     RmsVadOptions,
@@ -48,19 +53,49 @@ def language_name(language: str | None) -> str | None:
 
 def load_mono(path: str) -> np.ndarray:
     """
-    Load an audio file as 16 kHz mono float32.
+    Load an audio file as 16 kHz mono float32 with torchaudio's decoder and
+    resampler: the one loader every inference backend shares. Trainers read
+    windows with ``finetune.engine.load_window`` (the same mono mean and
+    torchaudio resample, per window).
+
+    Parakeet and Canary match their NeMo transcriptions only with this
+    loader. Samples are not clipped or peak-normalised.
 
     :param path: Audio file path.
     :return: 1-D waveform.
     """
-    audio, _ = librosa.load(str(path), sr=SAMPLE_RATE, mono=True)
-    return audio
+    wav, sr = torchaudio.load(str(path))
+    wav = wav.mean(dim=0)
+    if sr != SAMPLE_RATE:
+        wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+    return wav.numpy().astype(np.float32, copy=False)
+
+
+load_mono_torchaudio = load_mono
+
+
+def pad_short(chunk: np.ndarray, min_seconds: float = 0.5) -> np.ndarray:
+    """
+    Zero-pad a chunk to at least ``min_seconds``.
+
+    RMS-VAD has no minimum speech duration, so it can emit segments too short
+    for a feature extractor's STFT window.
+
+    :param chunk: 16 kHz mono waveform.
+    :param min_seconds: Minimum length after padding.
+    :return: The chunk, padded at the end when shorter than ``min_seconds``.
+    """
+    min_len = int(min_seconds * SAMPLE_RATE)
+    if len(chunk) >= min_len:
+        return chunk
+    return np.pad(chunk, (0, min_len - len(chunk)))
 
 
 def vad_chunks(
     audio_path: str,
     vad_source: str | None = None,
     max_length_s: float = 30,
+    load: Callable[[str], np.ndarray] = load_mono,
 ) -> list[np.ndarray]:
     """
     RMS-VAD segments of ``audio_path`` merged into ``<= max_length_s`` chunks.
@@ -71,11 +106,12 @@ def vad_chunks(
     :param audio_path: Audio to transcribe.
     :param vad_source: Audio to run the VAD on (defaults to ``audio_path``).
     :param max_length_s: Maximum merged chunk length in seconds.
+    :param load: Audio loader returning 16 kHz mono float32.
     :return: Chunk waveforms in order; empty if no speech was found.
     """
-    audio = load_mono(audio_path)
+    audio = load(audio_path)
     if vad_source and str(vad_source) != str(audio_path):
-        vad_audio = load_mono(vad_source)
+        vad_audio = load(vad_source)
     else:
         vad_audio = audio
     timestamps = get_speech_timestamps_rms(
@@ -84,6 +120,43 @@ def vad_chunks(
     timestamps = merge_segments(
         timestamps, max_length_s=max_length_s, sampling_rate=SAMPLE_RATE
     )
+    return _slice_segments(audio, timestamps)
+
+
+def silero_chunks(
+    audio_path: str,
+    vad_model: ScriptModule,
+    vad_source: str | None = None,
+    load: Callable[[str], np.ndarray] = load_mono,
+) -> list[np.ndarray]:
+    """
+    Silero-VAD speech segments of ``audio_path``, unmerged, as the Whisper
+    backend cuts them.
+
+    :param audio_path: Audio to transcribe.
+    :param vad_model: Loaded Silero VAD model.
+    :param vad_source: Audio to run the VAD on (defaults to ``audio_path``).
+    :param load: Audio loader returning 16 kHz mono float32.
+    :return: Chunk waveforms in order; empty if no speech was found.
+    """
+    audio = load(audio_path)
+    vad_audio = load(vad_source) if vad_source and str(vad_source) != str(audio_path) else audio
+    timestamps = get_speech_timestamps(
+        torch.from_numpy(np.ascontiguousarray(vad_audio, dtype=np.float32)),
+        vad_model,
+        sampling_rate=SAMPLE_RATE,
+    )
+    return _slice_segments(audio, timestamps)
+
+
+def _slice_segments(audio: np.ndarray, timestamps: list[dict]) -> list[np.ndarray]:
+    """
+    Cut sample-index segments out of ``audio``, clipped to its length.
+
+    :param audio: 16 kHz mono waveform.
+    :param timestamps: ``{"start", "end"}`` sample-index dicts.
+    :return: Non-empty chunk waveforms in order.
+    """
     chunks = []
     for segment in timestamps:
         start = min(int(segment["start"]), len(audio))
@@ -98,21 +171,28 @@ def song_chunks(
     use_vad: bool,
     vad_method: str,
     vad_source: str | None,
+    load: Callable[[str], np.ndarray] = load_mono,
+    vad_model: ScriptModule | None = None,
 ) -> list[np.ndarray]:
     """
-    Chunks for one song: RMS-VAD chunks, or the whole song when VAD is off.
+    Chunks for one song: RMS-VAD chunks merged to at most 30 s, Silero-VAD
+    speech segments, or the whole song when VAD is off.
 
     :param audio_path: Audio to transcribe.
-    :param use_vad: Whether to segment with RMS-VAD.
-    :param vad_method: Must be ``"rms"`` when ``use_vad`` is set.
+    :param use_vad: Whether to segment with VAD.
+    :param vad_method: ``"rms"`` or ``"silero"``.
     :param vad_source: Optional separate VAD source file.
+    :param load: Audio loader returning 16 kHz mono float32.
+    :param vad_model: Loaded Silero VAD model, required for ``"silero"``.
     :return: Chunk waveforms.
-    :raises ValueError: For Silero VAD, which these backends don't support.
+    :raises ValueError: For an unknown method, or Silero without a model.
     """
     if not use_vad:
-        return [load_mono(audio_path)]
-    if vad_method != "rms":
-        raise ValueError(
-            f"vad_method={vad_method!r} is not supported by this backend; use 'rms'"
-        )
-    return vad_chunks(audio_path, vad_source)
+        return [load(audio_path)]
+    if vad_method == "rms":
+        return vad_chunks(audio_path, vad_source, load=load)
+    if vad_method == "silero":
+        if vad_model is None:
+            raise ValueError("vad_method='silero' needs a loaded Silero VAD model")
+        return silero_chunks(audio_path, vad_model, vad_source, load=load)
+    raise ValueError(f"Unknown vad_method: {vad_method!r}")

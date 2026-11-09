@@ -1,118 +1,64 @@
 import json
 import logging
-import os
 import random
-import shutil
-import subprocess
-import time
+import re
 from pathlib import Path
 
-import librosa
-import numpy as np
 import torch
-from peft import LoraConfig, PeftModel, get_peft_model
-from torch.utils.data import Dataset
+from peft import LoraConfig, get_peft_model
+from peft.utils import ModulesToSaveWrapper
 from transformers import (
     AutoProcessor,
+    MusicFlamingoForConditionalGeneration,
     Qwen3ASRForConditionalGeneration,
     Qwen3OmniMoeForConditionalGeneration,
-    Trainer,
-    TrainerCallback,
-    TrainingArguments,
 )
+
+from lyricscribe.finetune import engine
+from lyricscribe.finetune.engine import (
+    FeatureLayout,
+    FinetuneTrainer,
+    ManifestDataset,
+    TrainingParts,
+    configured_prompt_mode,
+    drop_bad,
+    training_processor,
+)
+from lyricscribe.transcribe.audio_llm import PROMPT_MODES, audio_llm_inputs, audio_llm_prompt, load_omni_adapter
+from lyricscribe.transcribe.chunking import language_name
+from lyricscribe.transcribe.base import shared_prompt
+from lyricscribe.transcribe.qwen_asr import Qwen3ASRTranscriber, _build_prompt, _encode_audio_per_item
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 16000
+# NVIDIA's speechlm2 fine-tuning LoRA block (make_ft_config.py).
+NVIDIA_LORA = {"r": 32, "lora_alpha": 64, "lora_dropout": 0.0}
 
-LANGUAGE_NAMES = {
-    "en": "English", "es": "Spanish", "de": "German", "fr": "French",
-    "it": "Italian", "pt": "Portuguese", "ru": "Russian",
-}
+# Qwen-family features are ``(batch, mel bins, frames)``.
+QWEN_LAYOUT = FeatureLayout(key="input_features", time_dim=2, freq_dim=1)
 
-OMNI_PROMPT = (
-    "Transcribe the sung lyrics in this audio. Output only the lyrics text, "
-    "with no commentary. The language is {language}."
+# NVIDIA recipe mapped onto the Omni thinker: LoRA on the LLM's attention only,
+# routers and routed experts frozen; the audio tower (encoder + proj1/proj2) trains at full rank.
+OMNI_LORA_MODULES = r"model\.language_model\.layers\.\d+\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
+OMNI_FULL_RANK = ["audio_tower"]
+
+# NVIDIA's target names applied literally to a dense LLM (Music Flamingo mapping):
+# attention and mlp.{up,down}_proj, not mlp.gate_proj.
+DENSE_LORA_MODULES = (
+    r"model\.language_model\.layers\.\d+\."
+    r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|mlp\.(?:up_proj|down_proj))"
 )
-
-# LoRA target sets for the Omni thinker. "wide" adds the MoE expert FFNs,
-# which PEFT wraps as ParamWrapper modules that reject nonzero dropout.
-OMNI_LORA_TARGETS = {
-    "attn": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    "wide": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-}
-
-
-def _is_main_process() -> bool:
-    """
-    Whether this process is local rank 0 (or not running under DDP).
-
-    :return: ``True`` on rank 0.
-    """
-    return int(os.environ.get("LOCAL_RANK", 0)) == 0
-
-
-def _language_code(row: dict) -> str:
-    """
-    Base language code of a manifest row, e.g. ``"en"`` from ``"en-US"``.
-
-    :param row: Manifest row; a missing ``language`` counts as English.
-    :return: Lowercase base code.
-    """
-    return (row.get("language") or "en").split("-")[0].split("_")[0].lower()
-
-
-class WindowDataset(Dataset):
-    """
-    Audio windows from a finetune manifest, decoded at 16 kHz mono.
-
-    :param manifest: Manifest JSONL path.
-    """
-
-    def __init__(self, manifest: Path):
-        """
-        Read every row of the manifest.
-
-        :param manifest: Manifest JSONL path.
-        """
-        with Path(manifest).open() as f:
-            self.rows = [json.loads(line) for line in f if line.strip()]
-        logger.info(f"Loaded {len(self.rows)} windows from {manifest}")
-
-    def __len__(self) -> int:
-        """
-        Number of windows.
-
-        :return: Row count.
-        """
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> dict:
-        """
-        Decode one window's audio.
-
-        :param index: Row index.
-        :return: ``{"audio", "text", "language"}`` for the collators.
-        """
-        row = self.rows[index]
-        audio, _ = librosa.load(
-            row["audio_filepath"], sr=SAMPLE_RATE, mono=True,
-            offset=float(row.get("offset", 0.0)),
-            duration=float(row["duration"]) if row.get("duration") else None,
-        )
-        return {
-            "audio": np.asarray(audio, dtype=np.float32),
-            "text": row["text"],
-            "language": _language_code(row),
-        }
+# Qwen3-ASR adapter control: HF 5.22.1 keeps the encoder (Qwen3ASREncoder)
+# at model.audio_tower and the projector at model.multi_modal_projector.
+QWEN3_ASR_LORA_MODULES = DENSE_LORA_MODULES
+QWEN3_ASR_FULL_RANK = ["audio_tower", "multi_modal_projector"]
 
 
 def _pad_stack(tensors: list[torch.Tensor], key: str) -> torch.Tensor:
     """
     Stack per-item tensors, right-padding the last dim to the batch max.
 
-    Widths differ when a window's audio ends before its manifest
-    ``duration``.
+    Widths differ when a window's audio ends before its manifest ``duration``.
 
     :param tensors: Per-item tensors (no batch dim).
     :param key: Feature name, for the one-time ragged-batch notice.
@@ -153,117 +99,129 @@ def _concat_prompt_target(prompt_ids, target_ids, pad_id):
     return input_ids, attention, labels
 
 
+def _target_ids(tokenizer, text: str) -> torch.Tensor:
+    """
+    Transcript followed by the end-of-turn token.
+
+    :param tokenizer: Model tokenizer.
+    :param text: Transcript.
+    :return: 1-D token ids.
+    """
+    return tokenizer(text + tokenizer.eos_token, add_special_tokens=False, return_tensors="pt")["input_ids"][0]
+
+
 class Qwen3ASRCollator:
     """
-    Prompt (processed with its audio, so the audio token is expanded to its
-    true length) followed by the transcript + EOS. The prompt is exactly
-    what native inference sends: ``apply_transcription_request`` with the
-    language forced via the ``language <Name><asr_text>`` prefill.
+    The exact prompt inference sends (:func:`~lyricscribe.transcribe.qwen_asr._build_prompt`
+    with the language forced and an empty context, or the shared prompt as context, processed
+    with its audio so the audio token is expanded to its true length) followed by the
+    transcript + EOS; the prompt is masked out of the loss.
 
     :param processor: ``Qwen3ASRProcessor``.
+    :param prompt_mode: ``native`` or ``shared``.
     """
 
-    def __init__(self, processor):
+    def __init__(self, processor, prompt_mode: str = "native"):
         """
         Keep the processor and resolve the pad id (EOS when the tokenizer has none).
 
         :param processor: ``Qwen3ASRProcessor``.
+        :param prompt_mode: ``native`` or ``shared``.
         """
         self.processor = processor
+        self.prompt_mode = prompt_mode
         self.tokenizer = processor.tokenizer
         self.pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
 
     def __call__(self, features: list[dict]) -> dict:
         """
-        Collate :class:`WindowDataset` items into a training batch.
+        Collate dataset items into a training batch.
 
-        :param features: Dataset items.
-        :return: Token ids, attention mask, labels and the padded audio features.
+        :param features: :class:`~lyricscribe.finetune.engine.ManifestDataset` items.
+        :return: Token ids, attention mask, labels, the padded audio features and the
+            trainer's ``_feature_lengths`` / ``_placeholder``.
         """
+        features = drop_bad(features)
         prompts, targets, feats, masks = [], [], [], []
         for item in features:
-            enc = self.processor.apply_transcription_request(
-                audio=[item["audio"]], language=LANGUAGE_NAMES.get(item["language"], item["language"]),
-            )
+            context = shared_prompt(item["language"]) if self.prompt_mode == "shared" else ""
+            prompt = _build_prompt(context, language_name(item["language"]))
+            enc = self.processor(text=[prompt], audio=[item["audio"]], return_tensors="pt")
             prompts.append(enc["input_ids"][0])
-            targets.append(self.tokenizer(
-                item["text"] + self.tokenizer.eos_token,
-                add_special_tokens=False, return_tensors="pt",
-            )["input_ids"][0])
+            targets.append(_target_ids(self.tokenizer, item["text"]))
             feats.append(enc["input_features"][0])
             masks.append(enc["input_features_mask"][0])
         input_ids, attention, labels = _concat_prompt_target(prompts, targets, self.pad_id)
+        mask = _pad_stack(masks, "input_features_mask")
         return {
             "input_ids": input_ids,
             "attention_mask": attention,
             "labels": labels,
             "input_features": _pad_stack(feats, "input_features"),
-            "input_features_mask": _pad_stack(masks, "input_features_mask"),
+            "input_features_mask": mask,
+            "_feature_lengths": mask.sum(-1),
+            "_placeholder": any(it.get("placeholder") for it in features),
         }
 
 
-class Qwen3OmniCollator:
+class AudioLLMCollator:
     """
-    Plain-instruction prompt + transcript for the Omni thinker.
-    :data:`OMNI_PROMPT` must match the prompt used at inference.
+    Qwen3-Omni / Music Flamingo batches: each window's inputs come from
+    :func:`~lyricscribe.transcribe.audio_llm.audio_llm_inputs`, exactly as inference
+    builds them, followed by the transcript + EOS; the prompt is masked out.
 
-    :param processor: ``Qwen3OmniMoeProcessor``.
+    :param processor: The family's processor.
+    :param family: ``"qwen3_omni"`` or ``"musicflamingo"``.
+    :param prompt_mode: :data:`~lyricscribe.transcribe.audio_llm.PROMPT_MODES` entry.
+    :param mask_key: The processor's per-frame feature mask key.
     """
 
-    def __init__(self, processor):
+    def __init__(self, processor, family: str, prompt_mode: str, mask_key: str):
         """
         Keep the processor and resolve the pad id (EOS when the tokenizer has none).
 
-        :param processor: ``Qwen3OmniMoeProcessor``.
+        :param processor: The family's processor.
+        :param family: Audio-LLM family.
+        :param prompt_mode: Prompt mode.
+        :param mask_key: Feature mask key.
         """
         self.processor = processor
+        self.family = family
+        self.prompt_mode = prompt_mode
+        self.mask_key = mask_key
         self.tokenizer = processor.tokenizer
         self.pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
 
-    def _prompt(self, language: str) -> str:
-        """
-        Chat-templated instruction prompt with one audio slot.
-
-        :param language: Full language name, e.g. ``"English"``.
-        :return: Prompt text ending in the generation prefix.
-        """
-        messages = [{"role": "user", "content": [
-            {"type": "audio", "audio": ""},
-            {"type": "text", "text": OMNI_PROMPT.format(language=language)},
-        ]}]
-        return self.processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False)
-
     def __call__(self, features: list[dict]) -> dict:
         """
-        Collate :class:`WindowDataset` items into a training batch.
+        Collate dataset items into a training batch.
 
-        :param features: Dataset items.
-        :return: Token ids, attention mask, labels and the processor's audio tensors.
+        :param features: :class:`~lyricscribe.finetune.engine.ManifestDataset` items.
+        :return: Token ids, attention mask, labels, the processor's audio tensors and the
+            trainer's ``_feature_lengths`` / ``_placeholder``.
         """
+        features = drop_bad(features)
         prompts, targets, extras = [], [], []
         for item in features:
-            enc = self.processor(
-                text=[self._prompt(LANGUAGE_NAMES.get(item["language"], item["language"]))],
-                audio=[item["audio"]], sampling_rate=SAMPLE_RATE, return_tensors="pt",
-            )
+            prompt = audio_llm_prompt(self.family, self.prompt_mode, item["language"])
+            enc = audio_llm_inputs(self.processor, self.family, prompt, item["audio"])
             prompts.append(enc["input_ids"][0])
-            targets.append(self.tokenizer(
-                item["text"] + self.tokenizer.eos_token,
-                add_special_tokens=False, return_tensors="pt",
-            )["input_ids"][0])
-            # The processor's attention_mask covers the prompt only and must
-            # not overwrite the prompt+target mask built below.
+            targets.append(_target_ids(self.tokenizer, item["text"]))
+            # The processor's attention_mask covers the prompt only.
             extras.append({k: v for k, v in enc.items() if k not in ("input_ids", "attention_mask")})
         input_ids, attention, labels = _concat_prompt_target(prompts, targets, self.pad_id)
         batch = {"input_ids": input_ids, "attention_mask": attention, "labels": labels}
         for key in extras[0]:
-            tensors = [e[key][0] if e[key].dim() > 1 else e[key] for e in extras]
-            if torch.is_tensor(tensors[0]):
-                batch[key] = _pad_stack(tensors, key)
-        assert batch["attention_mask"].shape == batch["input_ids"].shape, (
-            f"attention_mask {tuple(batch['attention_mask'].shape)} != input_ids "
-            f"{tuple(batch['input_ids'].shape)} -- a processor key overwrote it")
+            tensors = [e[key] for e in extras]
+            if not torch.is_tensor(tensors[0]):
+                continue
+            if self.family == "musicflamingo" and key in ("input_features", self.mask_key):
+                # One row per 30 s audio chunk, not per window.
+                batch[key] = torch.cat(tensors, dim=0)
+            else:
+                batch[key] = _pad_stack([t[0] if t.dim() > 1 else t for t in tensors], key)
+        batch["_feature_lengths"] = batch[self.mask_key].sum(-1)
+        batch["_placeholder"] = any(it.get("placeholder") for it in features)
         return batch
 
 
@@ -272,12 +230,9 @@ def mean_token_ce(model, collator, dataset, batch_size: int = 2) -> float:
     """
     Mean per-token cross-entropy over the transcript positions of *dataset*.
 
-    Computed here (eval mode, causal shift, sum over masked tokens) rather
-    than read from the Trainer, whose logged loss is accumulation-scaled.
-
     :param model: Model (or PEFT-wrapped thinker) on its device.
     :param collator: Matching collator.
-    :param dataset: :class:`WindowDataset`.
+    :param dataset: :class:`~lyricscribe.finetune.engine.ManifestDataset`.
     :param batch_size: Windows per forward pass.
     :return: Mean CE in nats per transcript token.
     """
@@ -287,7 +242,7 @@ def mean_token_ce(model, collator, dataset, batch_size: int = 2) -> float:
     total, tokens = 0.0, 0
     for start in range(0, len(dataset), batch_size):
         batch = collator([dataset[i] for i in range(start, min(start + batch_size, len(dataset)))])
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(device) for k, v in batch.items() if torch.is_tensor(v) and not k.startswith("_")}
         if "input_features" in batch:
             batch["input_features"] = batch["input_features"].to(dtype)
         labels = batch.pop("labels")
@@ -301,146 +256,76 @@ def mean_token_ce(model, collator, dataset, batch_size: int = 2) -> float:
     return total / max(tokens, 1)
 
 
-def _slurm_seconds_left() -> float | None:
+def nvidia_adapter(model, modules: str, full_rank: list[str]):
     """
-    Remaining walltime of the current Slurm job.
+    NVIDIA's speechlm2 fine-tuning recipe on an HF audio-LLM: the audio
+    encoder and projection at full rank (``modules_to_save``), LoRA r32/α64 without dropout on
+    the LLM modules matched by *modules*, routers, routed experts and everything else frozen;
+    trainable weights in fp32 over the frozen base.
 
-    :return: Seconds left, or ``None`` outside Slurm or when ``squeue`` can't tell.
+    :param model: The base model.
+    :param modules: Regex of LLM modules that get LoRA.
+    :param full_rank: Module names trained at full rank.
+    :return: The PEFT model.
     """
-    job = os.environ.get("SLURM_JOB_ID")
-    if not job:
-        return None
-    try:
-        left = subprocess.run(
-            ["squeue", "-h", "-j", job, "-o", "%L"],
-            capture_output=True, text=True, timeout=30,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if not left or left in ("UNLIMITED", "NOT_SET", "INVALID"):
-        return None
-    days, _, rest = left.rpartition("-")
-    parts = [int(p) for p in rest.split(":")]
-    while len(parts) < 3:
-        parts.insert(0, 0)
-    h, m, s = parts
-    return (int(days) if days else 0) * 86400 + h * 3600 + m * 60 + s
+    lora = LoraConfig(**NVIDIA_LORA, bias="none", target_modules=modules, modules_to_save=full_rank)
+    peft_model = get_peft_model(model, lora)
+    for p in peft_model.parameters():
+        if p.requires_grad:
+            p.data = p.data.float()
+    summary = engine.parameter_summary(peft_model)
+    logger.info(f"NVIDIA recipe: {summary['trainable'] / 1e6:.1f}M trainable of {summary['total'] / 1e9:.2f}B")
+    return peft_model
 
 
-class _StepBudgetCallback(TrainerCallback):
+def adapter_summary(peft_model) -> dict:
     """
-    Log the step budget up front and, after a few steps, project the time to
-    the end of the target epoch against the remaining Slurm walltime.
+    What a PEFT model actually adapts, read from the wrapped modules rather than the config.
 
-    :param probe_steps: Steps to time before projecting.
+    :param peft_model: The PEFT model.
+    :return: LoRA settings, wrapped LoRA modules (layer index as ``N``) with counts, and the
+        full-rank ``modules_to_save`` copies.
     """
-
-    def __init__(self, probe_steps: int = 20):
-        """
-        Set up timing state; the trainer sets ``target_epoch`` before each call.
-
-        :param probe_steps: Steps to time before projecting.
-        """
-        self.probe_steps = probe_steps
-        self.target_epoch = None
-        self._t0 = None
-        self._step0 = None
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        """
-        Record the start time and step, and log the total step budget.
-
-        :param args: Training arguments.
-        :param state: Trainer state.
-        :param control: Trainer control flags.
-        :param kwargs: Unused callback extras.
-        """
-        self._t0, self._step0 = time.time(), state.global_step
-        per_epoch = state.max_steps / max(args.num_train_epochs, 1e-9)
-        logger.info(
-            f"STEP_BUDGET: {state.max_steps} optimizer steps total "
-            f"({per_epoch:.0f}/epoch), resuming at step {state.global_step}"
-        )
-
-    def on_step_end(self, args, state, control, **kwargs):
-        """
-        After ``probe_steps`` steps, log the projected time to ``target_epoch``
-        on rank 0, warning if it exceeds the remaining Slurm walltime.
-
-        :param args: Training arguments.
-        :param state: Trainer state.
-        :param control: Trainer control flags.
-        :param kwargs: Unused callback extras.
-        """
-        done = state.global_step - (self._step0 or 0)
-        if done != self.probe_steps or not _is_main_process():
-            return
-        per_step = (time.time() - self._t0) / done
-        per_epoch = state.max_steps / max(args.num_train_epochs, 1e-9)
-        target = self.target_epoch or args.num_train_epochs
-        remaining = max(0.0, target * per_epoch - state.global_step) * per_step
-        left = _slurm_seconds_left()
-        msg = (f"STEP_BUDGET: {per_step:.2f} s/step -> {remaining / 3600:.2f} h to "
-               f"epoch {target}")
-        if left is not None:
-            msg += f"; walltime left {left / 3600:.2f} h"
-            if remaining > left:
-                msg += (" -- WALLTIME_WARNING: epoch will not finish in this job; "
-                        f"progress survives via step checkpoints every {args.save_steps} steps")
-        logger.info(msg)
-
-
-class _StopAfterEpochCallback(TrainerCallback):
-    """
-    Save and stop once ``target_epoch`` is reached (LR schedule spans the run).
-    """
-
-    def __init__(self):
-        """
-        Start with no target epoch; the trainer sets it before each call.
-        """
-        self.target_epoch = None
-
-    def on_epoch_end(self, args, state, control, **kwargs):
-        """
-        Request a save and stop once ``target_epoch`` is reached.
-
-        :param args: Training arguments.
-        :param state: Trainer state.
-        :param control: Trainer control flags.
-        :param kwargs: Unused callback extras.
-        :return: The updated *control*.
-        """
-        if self.target_epoch is not None and state.epoch is not None and \
-                state.epoch >= self.target_epoch - 1e-3:
-            control.should_save = True
-            control.should_training_stop = True
-        return control
+    targets: dict[str, int] = {}
+    full_rank = []
+    for name, module in peft_model.named_modules():
+        name = name.removeprefix("base_model.model.")
+        if isinstance(module, ModulesToSaveWrapper):
+            full_rank.append(name)
+        elif hasattr(module, "lora_A") and not name.endswith((".lora_A", ".lora_B")):
+            key = re.sub(r"\.\d+\.", ".N.", name)
+            targets[key] = targets.get(key, 0) + 1
+    cfg = peft_model.peft_config["default"]
+    return {
+        "lora": {"r": cfg.r, "lora_alpha": cfg.lora_alpha, "lora_dropout": cfg.lora_dropout,
+                 "target_modules": sorted(cfg.target_modules) if isinstance(cfg.target_modules, set) else cfg.target_modules},
+        "lora_targets": targets,
+        "modules_to_save": full_rank,
+        "trainable": engine.parameter_summary(peft_model),
+    }
 
 
 class _QwenTrainerBase:
     """
-    Shared HF ``Trainer`` harness implementing the ``create_trainer`` protocol
-    (``setup`` / ``train_one_epoch`` / ``save_checkpoint`` / ``load_checkpoint``).
+    Shared trainer for the audio-LLM style models: :meth:`parts` for
+    :func:`lyricscribe.finetune.engine.run`, and :meth:`export`.
 
     :param config: Job configuration dictionary.
     """
 
-    collator_cls = None
+    loss_mode = "model"
+    layout = QWEN_LAYOUT
+    adapter = False
 
     def __init__(self, config: dict):
         """
-        Store the config; the model loads in :meth:`setup`.
+        Store the config; the model loads in :meth:`parts`.
 
         :param config: Job configuration dictionary.
         """
         self.config = config
         self.model = None
         self.processor = None
-        self.hf_trainer = None
-        self.train_manifest = None
-        self.val_manifest = None
-        self.job_dir = Path(config["output_dir"]) / config["exp_name"]
 
     def _load(self, path: str) -> None:
         """
@@ -451,176 +336,161 @@ class _QwenTrainerBase:
         """
         raise NotImplementedError
 
-    def _training_args(self) -> dict:
+    def collator(self):
         """
-        Extra ``TrainingArguments`` for a subclass.
+        The training collator.
 
-        :return: Keyword overrides (none by default).
+        :return: A collator.
+        :raises NotImplementedError: On the base class.
         """
-        return {}
+        raise NotImplementedError
 
-    def setup(self, train_manifest: Path, val_manifest: Path | None) -> None:
+    def _gc_args(self) -> dict:
         """
-        Record the manifests and load the base model if none is loaded yet.
+        Gradient checkpointing (non-reentrant: reentrant breaks DDP with "marked as ready twice").
 
-        :param train_manifest: Training manifest JSONL.
-        :param val_manifest: Validation manifest JSONL, or ``None``.
+        :return: ``TrainingArguments`` fields.
         """
-        self.train_manifest = train_manifest
-        self.val_manifest = val_manifest
+        return {"gradient_checkpointing": True, "gradient_checkpointing_kwargs": {"use_reentrant": False}}
+
+    def parts(self, manifest: Path, seed: int, eval_manifest: Path | None = None) -> TrainingParts:
+        """
+        The pieces of a run.
+
+        :param manifest: Training manifest.
+        :param seed: Run seed.
+        :param eval_manifest: Held-out windows scored at each export, or ``None``.
+        :return: Model, datasets, collator, trainer class, loss mode and feature layout.
+        """
         if self.model is None:
             self._load(self.config["base_model"])
+        return TrainingParts(
+            model=self.model,
+            dataset=ManifestDataset(manifest, seed=seed, dither=engine.DITHER),
+            eval_dataset=ManifestDataset(eval_manifest, seed=seed) if eval_manifest else None,
+            collator=self.collator(),
+            trainer_cls=FinetuneTrainer,
+            loss_mode=self.loss_mode,
+            layout=self.layout,
+            per_device=int(self.config["batch_size"]),
+            args=self._gc_args(),
+            export=self.export,
+            notes=self.notes(),
+            prompt_mode=self.prompt_mode(),
+        )
 
-    def train_one_epoch(self, target_epoch: int) -> dict:
+    def prompt_mode(self) -> str:
         """
-        Train up to *target_epoch*, resuming from the latest complete step checkpoint.
+        The training prompt, as the inference loader names it; subclasses with a choice override it.
 
-        The HF ``Trainer`` is built on the first call with the LR schedule
-        spanning ``max_epochs``; later calls reuse it.
-
-        :param target_epoch: Epoch to train up to (1-indexed).
-        :return: Eval metrics when a validation manifest is set, plus
-            ``train_loss_logged``, the last logged training loss.
+        :return: ``"native"`` (the model's own transcription prompt).
         """
-        train_dataset = WindowDataset(self.train_manifest)
-        eval_dataset = WindowDataset(self.val_manifest) if self.val_manifest else None
-        if self.hf_trainer is None:
-            # ``warmup_steps`` reads values < 1 as a fraction of all steps and
-            # >= 1 as an absolute step count, so clamp below 1.
-            warmup_ratio = min(0.999, self.config["warmup_epochs"] / max(self.config["max_epochs"], 1))
-            args = TrainingArguments(
-                output_dir=str(self.job_dir / "hf_trainer"),
-                num_train_epochs=self.config["max_epochs"],
-                per_device_train_batch_size=self.config["batch_size"],
-                per_device_eval_batch_size=self.config["batch_size"],
-                gradient_accumulation_steps=self.config.get("grad_accum", 1),
-                learning_rate=self.config["learning_rate"],
-                warmup_steps=warmup_ratio,
-                bf16=True,
-                logging_steps=self.config.get("logging_steps", 10),
-                save_strategy="steps",
-                save_steps=self.config.get("save_steps", 500),
-                save_total_limit=3,
-                eval_strategy="no",
-                gradient_checkpointing=True,
-                # Reentrant checkpointing breaks DDP ("marked as ready twice").
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-                dataloader_num_workers=self.config.get("dataloader_num_workers", 8),
-                remove_unused_columns=False,
-                ddp_find_unused_parameters=False,
-                report_to=[],
-                run_name=self.config["exp_name"],
-                **self._training_args(),
-            )
-            self._stop = _StopAfterEpochCallback()
-            self._budget = _StepBudgetCallback()
-            self.hf_trainer = Trainer(
-                model=self.model, args=args,
-                train_dataset=train_dataset, eval_dataset=eval_dataset,
-                data_collator=self.collator_cls(self.processor),
-                callbacks=[self._stop, self._budget],
-            )
-        self._stop.target_epoch = target_epoch
-        self._budget.target_epoch = target_epoch
+        return configured_prompt_mode(self.config, ("native",))
 
-        resume = None
-        hf_dir = self.job_dir / "hf_trainer"
-        if hf_dir.exists():
-            for ckpt in sorted(hf_dir.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1]),
-                               reverse=True):
-                if (ckpt / "trainer_state.json").exists():
-                    resume = str(ckpt)
-                    break
-                if _is_main_process():
-                    logger.warning(f"Removing incomplete checkpoint: {ckpt}")
-                    shutil.rmtree(ckpt, ignore_errors=True)
-        if resume:
-            logger.info(f"Resuming from HF step checkpoint: {resume}")
-        logger.info(f"Training epoch {target_epoch}...")
-        self.hf_trainer.train(resume_from_checkpoint=resume)
+    def notes(self) -> dict:
+        """
+        Recipe facts recorded in the training state.
 
-        metrics = {}
-        if eval_dataset is not None:
-            metrics = {k: float(v) for k, v in self.hf_trainer.evaluate().items()}
-        for entry in reversed(self.hf_trainer.state.log_history):
-            if "loss" in entry:
-                metrics["train_loss_logged"] = entry["loss"]
-                break
-        return metrics
+        :return: Notes (for adapters, what the wrapped model actually adapts).
+        """
+        if self.adapter:
+            return {"adaptation": "NVIDIA recipe", **adapter_summary(self.model)}
+        return {"adaptation": "full FT, fp32 master weights"}
 
+    def export(self, path: Path) -> Path:
+        """
+        Save the model (or adapter) and processor for inference.
+
+        :param path: Output dir.
+        :return: *path*.
+        """
+        path.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(path)
+        self.processor.save_pretrained(path)
+        return path
 
 class Qwen3ASRTrainer(_QwenTrainerBase):
     """
-    Full finetune of transformers-native Qwen3-ASR (``*-hf`` checkpoints).
+    Qwen3-ASR (``*-hf`` checkpoints): full FT with fp32 master weights, or, with
+    ``adaptation: nvidia_adapter``, the adapter control (frozen bf16 base,
+    full-rank encoder + projector, LoRA on the dense LLM).
     """
 
-    collator_cls = Qwen3ASRCollator
+    def __init__(self, config: dict):
+        """
+        Store the config and the adaptation.
+
+        :param config: Job configuration dictionary.
+        """
+        super().__init__(config)
+        self.adapter = config.get("adaptation") == "nvidia_adapter"
 
     def _load(self, path: str) -> None:
         """
-        Load a transformers-native Qwen3-ASR checkpoint in bf16.
+        Load a transformers-native Qwen3-ASR checkpoint, encoding audio item by item as
+        inference does, and wrap it in an adapter for the adapter recipe.
 
         :param path: Hub id or local checkpoint path.
         """
-        logger.info(f"Loading Qwen3-ASR: {path}")
+        logger.info(f"Loading Qwen3-ASR: {path} ({'adapter recipe' if self.adapter else 'full FT'})")
         self.processor = AutoProcessor.from_pretrained(path)
-        self.model = Qwen3ASRForConditionalGeneration.from_pretrained(path, dtype=torch.bfloat16)
-        self.model.config.use_cache = False
+        # The adapter recipe's frozen base is bf16; ``base_dtype`` overrides it for CPU checks.
+        dtype = getattr(torch, self.config.get("base_dtype") or "bfloat16") if self.adapter else torch.float32
+        model = Qwen3ASRForConditionalGeneration.from_pretrained(path, dtype=dtype, device_map=engine.device_map())
+        model.config.use_cache = False
+        _encode_audio_per_item(model)
         # Qwen3-ASR ships sampling fields alongside do_sample=False, which
         # save_pretrained() rejects; they are unused under greedy decoding.
-        gc = self.model.generation_config
+        gc = model.generation_config
         if gc is not None and not getattr(gc, "do_sample", False):
             for field in ("temperature", "top_p", "top_k", "typical_p", "min_p"):
                 if getattr(gc, field, None) is not None:
-                    logger.info(f"Clearing generation_config.{field}={getattr(gc, field)}")
                     setattr(gc, field, None)
+        self.model = nvidia_adapter(model, QWEN3_ASR_LORA_MODULES, QWEN3_ASR_FULL_RANK) if self.adapter else model
 
-    def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
+    def collator(self):
         """
-        Save the full model and processor to ``epoch_<N>`` (rank 0 only).
+        The training collator.
 
-        :param epoch: Epoch number for the directory name.
-        :param checkpoint_dir: Parent directory for checkpoints.
-        :return: Path to the checkpoint directory.
+        :return: :class:`Qwen3ASRCollator`.
         """
-        path = checkpoint_dir / f"epoch_{epoch}"
-        if _is_main_process():
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            self.model.save_pretrained(path)
-            self.processor.save_pretrained(path)
+        return Qwen3ASRCollator(training_processor(self.processor), self.prompt_mode())
+
+    def prompt_mode(self) -> str:
+        """
+        The training prompt, as :class:`~lyricscribe.transcribe.qwen_asr.Qwen3ASRTranscriber` names it.
+
+        :return: The config's ``prompt_mode`` (default ``native``).
+        """
+        return configured_prompt_mode(self.config, Qwen3ASRTranscriber.prompt_modes)
+
+    def export(self, path: Path) -> Path:
+        """
+        Save the full model (checking the inference architecture name) or the adapter, with the processor.
+
+        :param path: Output dir.
+        :return: *path*.
+        """
+        super().export(path)
+        if not self.adapter:
             cfg = json.loads((path / "config.json").read_text())
             assert cfg.get("architectures") == ["Qwen3ASRForConditionalGeneration"], cfg.get("architectures")
         return path
 
-    def load_checkpoint(self, checkpoint_path: Path) -> int:
-        """
-        Load a full-model checkpoint directory.
-
-        :param checkpoint_path: ``epoch_<N>`` directory.
-        :return: The epoch number from the directory name (0 if unparseable).
-        """
-        self._load(str(checkpoint_path))
-        try:
-            return int(checkpoint_path.name.split("_")[1])
-        except (IndexError, ValueError):
-            return 0
-
-
-def load_omni_thinker(base_model: str, device: str = "cuda:0"):
+def load_omni_thinker(base_model: str, device=None):
     """
-    Load the Qwen3-Omni thinker (the module that actually has a ``forward``).
+    Load the Qwen3-Omni thinker (the module that actually has a ``forward``) in bf16.
 
     ``Qwen3OmniMoeForConditionalGeneration`` is a router over thinker/talker
-    that defines only ``generate``; training it directly hits
-    ``_forward_unimplemented``.
+    that defines only ``generate``; training it directly hits ``_forward_unimplemented``.
 
     :param base_model: Hub id or path of the full Omni checkpoint.
-    :param device: Device map target.
+    :param device: Device map target (default: this rank's GPU).
     :return: ``(thinker, processor)``.
     """
     processor = AutoProcessor.from_pretrained(base_model)
     full = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        base_model, dtype=torch.bfloat16, device_map=device)
+        base_model, dtype=torch.bfloat16, device_map=device or engine.device_map())
     full.disable_talker()
     thinker = full.thinker
     thinker.config.use_cache = False
@@ -631,61 +501,46 @@ def load_omni_thinker(base_model: str, device: str = "cuda:0"):
 
 class Qwen3OmniLoraTrainer(_QwenTrainerBase):
     """
-    LoRA on the Qwen3-Omni thinker; checkpoints are PEFT adapters.
+    NVIDIA's adapter recipe on the Qwen3-Omni thinker (:func:`nvidia_adapter` with the Omni
+    mapping); checkpoints are PEFT adapters holding the LoRA weights and the full-rank audio tower.
     """
 
-    collator_cls = Qwen3OmniCollator
+    adapter = True
 
-    def _load(self, path: str, adapter: str | None = None) -> None:
+    def _load(self, path: str) -> None:
         """
-        Load the Omni thinker and wrap it with a new or saved LoRA adapter.
+        Load the Omni thinker and wrap it with the adapter.
 
         :param path: Hub id or path of the full Omni checkpoint.
-        :param adapter: Saved adapter dir to resume; ``None`` creates a fresh
-            adapter from ``lora_rank`` / ``lora_targets``.
         """
         thinker, self.processor = load_omni_thinker(path)
-        if adapter is not None:
-            self.model = PeftModel.from_pretrained(thinker, adapter, is_trainable=True)
-        else:
-            targets = self.config.get("lora_targets", "attn")
-            rank = self.config.get("lora_rank", 16)
-            peft_config = LoraConfig(
-                r=rank, lora_alpha=2 * rank, bias="none", task_type="CAUSAL_LM",
-                target_modules=OMNI_LORA_TARGETS[targets],
-                lora_dropout=0.0 if targets == "wide" else 0.05,
-            )
-            logger.info(f"LoRA rank={rank} targets={OMNI_LORA_TARGETS[targets]}")
-            self.model = get_peft_model(thinker, peft_config)
-        self.model.print_trainable_parameters()
+        self.model = nvidia_adapter(thinker, OMNI_LORA_MODULES, OMNI_FULL_RANK)
 
-    def save_checkpoint(self, epoch: int, checkpoint_dir: Path) -> Path:
+    def collator(self):
         """
-        Save the LoRA adapter and processor to ``epoch_<N>`` (rank 0 only).
+        The training collator.
 
-        :param epoch: Epoch number for the directory name.
-        :param checkpoint_dir: Parent directory for checkpoints.
-        :return: Path to the checkpoint directory.
+        :return: :class:`AudioLLMCollator` for Omni.
         """
-        path = checkpoint_dir / f"epoch_{epoch}"
-        if _is_main_process():
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            self.model.save_pretrained(path)
-            self.processor.save_pretrained(path)
-        return path
+        return AudioLLMCollator(
+            training_processor(self.processor), "qwen3_omni", self.prompt_mode(), "feature_attention_mask"
+        )
 
-    def load_checkpoint(self, checkpoint_path: Path) -> int:
+    def prompt_mode(self) -> str:
         """
-        Reload the base thinker with a saved adapter.
+        The training prompt.
 
-        :param checkpoint_path: ``epoch_<N>`` adapter directory.
-        :return: The epoch number from the directory name (0 if unparseable).
+        :return: The config's ``prompt_mode`` (default ``"lyrics"``).
         """
-        self._load(self.config["base_model"], adapter=str(checkpoint_path))
-        try:
-            return int(checkpoint_path.name.split("_")[1])
-        except (IndexError, ValueError):
-            return 0
+        return configured_prompt_mode(self.config, PROMPT_MODES, "lyrics")
+
+    def notes(self) -> dict:
+        """
+        Recipe facts recorded in the training state.
+
+        :return: Notes.
+        """
+        return {"adaptation": "NVIDIA recipe mapped to Omni", **adapter_summary(self.model)}
 
 
 def eval_loss(
@@ -702,7 +557,7 @@ def eval_loss(
     same seeded sample of manifest windows.
 
     :param architecture: ``"qwen3_asr"`` (checkpoints are full models) or
-        ``"qwen3_omni"`` (checkpoints are LoRA adapters on *base_model*).
+        ``"qwen3_omni"`` (checkpoints are adapters on *base_model*).
     :param base_model: Base hub id or path.
     :param checkpoints: Checkpoint dirs to compare against the base.
     :param manifest: Manifest to sample windows from (use one not trained on).
@@ -711,8 +566,8 @@ def eval_loss(
     :param batch_size: Windows per forward pass.
     :return: ``{"base": ce, <checkpoint>: ce, ...}``.
     """
-    torch.backends.cuda.enable_cudnn_sdp(False)  # see _run_training_job_inner
-    dataset = WindowDataset(manifest)
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    dataset = ManifestDataset(manifest)
     if rows and rows < len(dataset.rows):
         dataset.rows = random.Random(seed).sample(dataset.rows, rows)
     results = {}
@@ -720,20 +575,79 @@ def eval_loss(
         collator = Qwen3ASRCollator(AutoProcessor.from_pretrained(base_model))
         for name in [base_model, *checkpoints]:
             model = Qwen3ASRForConditionalGeneration.from_pretrained(name, dtype=torch.bfloat16).to("cuda:0")
+            _encode_audio_per_item(model)
             results["base" if name == base_model else name] = mean_token_ce(model, collator, dataset, batch_size)
             logger.info(f"{name}: CE {results['base' if name == base_model else name]:.4f}")
             del model
             torch.cuda.empty_cache()
     elif architecture == "qwen3_omni":
-        thinker, processor = load_omni_thinker(base_model)
-        collator = Qwen3OmniCollator(processor)
+        thinker, processor = load_omni_thinker(base_model, device="cuda:0")
+        collator = AudioLLMCollator(processor, "qwen3_omni", "lyrics", "feature_attention_mask")
         results["base"] = mean_token_ce(thinker, collator, dataset, batch_size)
         logger.info(f"base: CE {results['base']:.4f}")
         for path in checkpoints:
-            peft = PeftModel.from_pretrained(thinker, path, is_trainable=False)
+            peft = load_omni_adapter(thinker, path)
             results[path] = mean_token_ce(peft, collator, dataset, batch_size)
             logger.info(f"{path}: CE {results[path]:.4f}")
             thinker = peft.unload()
     else:
         raise ValueError(f"eval-loss supports qwen3_asr / qwen3_omni, got {architecture}")
     return results
+
+
+# NVIDIA recipe mapped onto Music Flamingo's dense Qwen2.5 LLM; encoder and projector at full rank.
+MF_LORA_MODULES = DENSE_LORA_MODULES
+MF_FULL_RANK = ["audio_tower", "multi_modal_projector"]
+
+
+class MusicFlamingoTrainer(_QwenTrainerBase):
+    """
+    NVIDIA's adapter recipe on Music Flamingo (~8B);
+    checkpoints are PEFT adapters holding the LoRA weights, the audio tower and the projector.
+    """
+
+    adapter = True
+
+    def _load(self, path: str) -> None:
+        """
+        Load Music Flamingo and wrap it with the adapter. The frozen base is bf16 by
+        default (its checkpoint dtype, as for Omni and Nemotron); ``base_dtype`` overrides it.
+
+        :param path: Hub id or path of the base checkpoint.
+        """
+        dtype = getattr(torch, self.config.get("base_dtype") or "bfloat16")
+        logger.info(f"Loading Music Flamingo: {path} ({dtype} base)")
+        self.processor = AutoProcessor.from_pretrained(path)
+        model = MusicFlamingoForConditionalGeneration.from_pretrained(path, dtype=dtype, device_map=engine.device_map())
+        model.config.use_cache = False
+        self.model = nvidia_adapter(model, MF_LORA_MODULES, MF_FULL_RANK)
+
+    def collator(self):
+        """
+        The training collator.
+
+        :return: :class:`AudioLLMCollator` for Music Flamingo.
+        """
+        return AudioLLMCollator(
+            training_processor(self.processor), "musicflamingo", self.prompt_mode(), "input_features_mask"
+        )
+
+    def prompt_mode(self) -> str:
+        """
+        The training prompt.
+
+        :return: The config's ``prompt_mode`` (default ``"asr"``).
+        """
+        return configured_prompt_mode(self.config, PROMPT_MODES, "asr")
+
+    def notes(self) -> dict:
+        """
+        Recipe facts recorded in the training state.
+
+        :return: Notes.
+        """
+        return {
+            "adaptation": "NVIDIA recipe mapped to Music Flamingo",
+            "base_dtype": self.config.get("base_dtype") or "bfloat16",
+            **adapter_summary(self.model),
+        }

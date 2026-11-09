@@ -16,7 +16,16 @@ from transformers import (
 )
 from transformers.models.qwen3_asr.modeling_qwen3_asr import _get_feat_extract_output_lengths
 
-from lyricscribe.transcribe.base import Transcriber
+from lyricscribe.transcribe.adapter import TrainRecordMismatch, check_train_record, load_adapter
+from lyricscribe.transcribe.base import (
+    DECODE_KNOBS,
+    MAX_NEW_TOKENS,
+    Decode,
+    Transcriber,
+    describe_kwargs,
+    generate_kwargs,
+    shared_prompt,
+)
 from lyricscribe.transcribe.chunking import SAMPLE_RATE, language_name, song_chunks
 
 logger = logging.getLogger(__name__)
@@ -180,25 +189,7 @@ def _encode_audio_per_item(model) -> None:
     inner.get_audio_features = per_item
 
 
-def _float_range_normalize(audio: np.ndarray) -> np.ndarray:
-    """
-    Cast to float32 and peak-normalise into [-1, 1] (qwen-asr's input normalisation).
-
-    :param audio: Waveform.
-    :return: The normalised waveform; silent or empty input is returned as float32 unchanged.
-    """
-    audio = audio.astype(np.float32)
-    if audio.size == 0:
-        return audio
-    peak = float(np.max(np.abs(audio)))
-    if peak == 0.0:
-        return audio
-    if peak > 1.0:
-        audio = audio / peak
-    return np.clip(audio, -1.0, 1.0)
-
-
-# _split_audio_into_chunks, _detect_and_fix_repetitions and _parse_asr_output are from
+# _split_audio_into_chunks and _parse_asr_output are adapted from
 # qwen-asr 0.0.6 (qwen_asr/inference/utils.py), Copyright 2026 The Alibaba Qwen team,
 # Apache-2.0.
 def _split_audio_into_chunks(
@@ -254,79 +245,10 @@ def _split_audio_into_chunks(
     ]
 
 
-def _detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
-    """
-    Collapse >threshold character / short-pattern repeats (qwen-asr).
-
-    :param text: Decoded text.
-    :param threshold: Repeat count that triggers collapsing.
-    :return: The repaired text.
-    """
-
-    def fix_char_repeats(s, thresh):
-        """
-        Collapse runs of one character longer than *thresh* to a single character.
-
-        :param s: Text.
-        :param thresh: Longest run kept as is.
-        :return: The repaired text.
-        """
-        res, i, n = [], 0, len(s)
-        while i < n:
-            count = 1
-            while i + count < n and s[i + count] == s[i]:
-                count += 1
-            res.append(s[i] if count > thresh else s[i:i + count])
-            i += count
-        return "".join(res)
-
-    def fix_pattern_repeats(s, thresh, max_len=20):
-        """
-        Collapse a pattern of up to *max_len* characters repeated *thresh* or more times.
-
-        :param s: Text.
-        :param thresh: Repeat count that triggers collapsing.
-        :param max_len: Longest pattern searched for.
-        :return: The repaired text.
-        """
-        n = len(s)
-        min_repeat_chars = thresh * 2
-        if n < min_repeat_chars:
-            return s
-        i = 0
-        result = []
-        found = False
-        while i <= n - min_repeat_chars:
-            found = False
-            for k in range(1, max_len + 1):
-                if i + k * thresh > n:
-                    break
-                pattern = s[i:i + k]
-                if all(
-                    s[i + rep * k:i + rep * k + k] == pattern for rep in range(1, thresh)
-                ):
-                    end_index = i + thresh * k
-                    while end_index + k <= n and s[end_index:end_index + k] == pattern:
-                        end_index += k
-                    result.append(pattern)
-                    result.append(fix_pattern_repeats(s[end_index:], thresh, max_len))
-                    i = n
-                    found = True
-                    break
-            if found:
-                break
-            result.append(s[i])
-            i += 1
-        if not found:
-            result.append(s[i:])
-        return "".join(result)
-
-    return fix_pattern_repeats(fix_char_repeats(text, threshold), threshold)
-
-
 def _parse_asr_output(raw: str, forced_language: str | None) -> str:
     """
-    Strip the ``language X<asr_text>`` header and repetitions (qwen-asr).
+    Strip the ``language X<asr_text>`` header (qwen-asr). qwen-asr's
+    repetition fixer is not applied: no backend gets vendor post-processing.
 
     :param raw: Decoded model output.
     :param forced_language: Language forced in the prompt; the output then has
@@ -336,7 +258,6 @@ def _parse_asr_output(raw: str, forced_language: str | None) -> str:
     s = (raw or "").strip()
     if not s:
         return ""
-    s = _detect_and_fix_repetitions(s)
     if forced_language:
         return s
     if _ASR_TEXT_TAG not in s:
@@ -345,6 +266,10 @@ def _parse_asr_output(raw: str, forced_language: str | None) -> str:
     if "language none" in meta.lower():
         return text.strip()
     return text.strip()
+
+
+# How training records this backend's native prompt (forced language, empty context).
+PROMPT_MODE = "native"
 
 
 def _build_prompt(context: str, language: str | None) -> str:
@@ -375,15 +300,20 @@ class Qwen3ASRTranscriber(Transcriber):
     ``batch_size`` is qwen-asr's ``max_inference_batch_size``: consecutive
     chunks of one song decoded together.
     The per-song prompt (``initial_prompt``) is passed as Qwen's ``context``
-    system message.
+    system message; ``prompt_mode="shared"`` passes the shared prompt there instead.
     """
+
+    supports = frozenset(DECODE_KNOBS)
+    prompt_modes = (PROMPT_MODE, "shared")
 
     def __init__(
         self,
         model_name: str,
         batch_size: int = 8,
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = MAX_NEW_TOKENS,
         auto_language: bool = False,
+        adapter: str | None = None,
+        prompt_mode: str | None = None,
     ) -> None:
         """
         :param model_name: Hub id or checkpoint dir.
@@ -391,47 +321,59 @@ class Qwen3ASRTranscriber(Transcriber):
         :param max_new_tokens: Generation cap per chunk.
         :param auto_language: Ignore the provided language and let the model
             identify it (qwen-asr's default behaviour).
+        :param adapter: PEFT adapter dir (the NVIDIA-recipe control) merged into the model, or ``None``.
+        :param prompt_mode: ``native`` (empty context, default) or ``shared``.
         """
-        super().__init__(model_name, batch_size)
+        super().__init__(model_name, batch_size, prompt_mode)
         self.max_new_tokens = max_new_tokens
         self.auto_language = auto_language
+        self.adapter = adapter
+        self.train_record = None
         self.model = None
         self.processor = None
         self.generation_config = None
 
     def load(self) -> None:
         """
-        Load the model and processor onto the GPU (CPU without CUDA).
+        Load the model and processor onto the GPU (CPU without CUDA), merging the adapter if any.
+
+        :raises RuntimeError: If the checkpoint's training record has another prompt.
         """
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
         logger.info(f"Loading Qwen3-ASR: {self.model_name} on {device}")
         # cuDNN SDPA rebuilds its graph per sequence shape, which stalls decoding.
         torch.backends.cuda.enable_cudnn_sdp(False)
+        self.train_record = check_train_record(
+            self.adapter or self.model_name, self.prompt_mode, self.model_name if self.adapter else None
+        )
         self.model, self.processor, self.generation_config = load_qwen3_asr(
             self.model_name, dtype, device
         )
+        if self.adapter:
+            self.model = load_adapter(self.model, self.adapter).merge_and_unload()
+            logger.info(f"Merged adapter {self.adapter}")
+        # After the merge: the patch wraps the merged model's audio path.
         _encode_audio_per_item(self.model)
 
     @torch.inference_mode()
-    def _decode(
-        self, wavs: list[np.ndarray], context: str, language: str | None,
-        no_repeat_ngram_size: int,
-    ) -> list[str]:
+    def _decode(self, wavs: list[np.ndarray], context: str, language: str | None, decode: Decode) -> list[str]:
         """
         Decode chunks of one song in batches of ``batch_size``.
 
         :param wavs: 16 kHz mono chunks.
         :param context: Qwen ``context`` system message.
         :param language: Language name to force, or ``None`` to let the model identify it.
-        :param no_repeat_ngram_size: Decoder ``no_repeat_ngram_size`` (0 = off).
+        :param decode: Decoding settings.
         :return: Parsed transcription text per chunk.
+        :raises TrainRecordMismatch: For a context on a checkpoint trained with the native (empty-context) prompt.
         """
+        if context and getattr(self, "train_record", None) and self.prompt_mode == PROMPT_MODE:
+            raise TrainRecordMismatch(f"{self.adapter or self.model_name} was trained with an empty context; got {context[:60]!r}")
         prompt = _build_prompt(context, language)
         config = copy.deepcopy(self.generation_config)
-        config.max_new_tokens = self.max_new_tokens
-        config.do_sample = False
-        config.no_repeat_ngram_size = no_repeat_ngram_size or 0
+        kwargs = generate_kwargs(self.max_new_tokens, decode)
+        self.last_generate_kwargs = {**describe_kwargs(kwargs), "prompt": prompt}
         outs = []
         for i in range(0, len(wavs), max(1, self.batch_size)):
             sub = wavs[i:i + max(1, self.batch_size)]
@@ -439,7 +381,7 @@ class Qwen3ASRTranscriber(Transcriber):
                 text=[prompt] * len(sub), audio=sub, return_tensors="pt", padding=True
             )
             inputs = inputs.to(self.model.device).to(self.model.dtype)
-            ids = self.model.generate(**inputs, generation_config=config)
+            ids = self.model.generate(**inputs, generation_config=config, **kwargs)
             outs.extend(
                 self.processor.batch_decode(
                     ids[:, inputs["input_ids"].shape[1]:],
@@ -458,9 +400,7 @@ class Qwen3ASRTranscriber(Transcriber):
         language: str | None = None,
         vad_source: str | None = None,
         vad_method: str = "silero",
-        repetition_penalty: float = 1.0,
-        no_repeat_ngram_size: int = 0,
-        num_beams: int = 5,
+        decode: Decode = Decode(),
         condition_on_prev: bool = True,
         temperature_fallback: bool = False,
         compression_ratio_threshold: float | None = None,
@@ -468,28 +408,26 @@ class Qwen3ASRTranscriber(Transcriber):
         initial_prompt: str | None = None,
     ) -> str:
         """
-        Transcribe one song. Only ``no_repeat_ngram_size`` and
-        ``initial_prompt`` (as the ``context``) are honoured; the other
-        decoding knobs are accepted and ignored.
+        Transcribe one song. ``initial_prompt`` (or the shared prompt) becomes Qwen's ``context``.
         """
-        del vad_model, use_chunked, repetition_penalty, num_beams
-        del condition_on_prev, temperature_fallback
+        del use_chunked, condition_on_prev, temperature_fallback
         del compression_ratio_threshold, logprob_threshold
+        self.check_decode(decode)
+        if self.prompt_mode == "shared":
+            if initial_prompt:
+                raise ValueError("A per-song initial_prompt and prompt_mode 'shared' can't be combined")
+            initial_prompt = shared_prompt(language)
         forced = None if self.auto_language else language_name(language)
-        segments = song_chunks(audio_path, use_vad, vad_method, vad_source)
-        # Each VAD segment is one qwen-asr input; inputs over 20 min are
-        # split further and re-joined without a separator, as qwen-asr does.
+        segments = song_chunks(audio_path, use_vad, vad_method, vad_source, vad_model=vad_model)
+        # Each VAD segment is one qwen-asr input; inputs over 20 min are split
+        # further and re-joined without a separator, and short ones padded to 0.5 s.
         pieces: list[tuple[int, np.ndarray]] = []
         for idx, seg in enumerate(segments):
-            for part in _split_audio_into_chunks(
-                _float_range_normalize(seg), SAMPLE_RATE, _MAX_ASR_INPUT_SECONDS
-            ):
+            for part in _split_audio_into_chunks(seg, SAMPLE_RATE, _MAX_ASR_INPUT_SECONDS):
                 pieces.append((idx, part))
         if not pieces:
             return ""
-        texts = self._decode(
-            [p for _, p in pieces], initial_prompt or "", forced, no_repeat_ngram_size
-        )
+        texts = self._decode([p for _, p in pieces], initial_prompt or "", forced, decode)
         per_segment = [""] * len(segments)
         for (idx, _), text in zip(pieces, texts):
             per_segment[idx] += text

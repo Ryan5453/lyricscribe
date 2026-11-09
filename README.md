@@ -21,14 +21,14 @@ Note: The project is configured for CUDA 12.9 (`cu129`). If you need a different
 |---------|---------|
 | `lyricscribe dataset` | Download public ALT datasets and add word-level forced alignments |
 | `lyricscribe separate` | Batch vocal separation with [Unblend](https://pypi.org/project/unblend/) |
-| `lyricscribe transcribe` | Batch transcription with Whisper, NeMo, Qwen3-ASR, audio-LLM and Gemini backends |
+| `lyricscribe transcribe` | Batch transcription with Whisper, Parakeet, Canary, Qwen3-ASR, Cohere, Granite, Nemotron and audio-LLM backends |
 | `lyricscribe evaluate` | WER evaluation, LaTeX tables and plots across transcription jobs |
 | `lyricscribe artifacts` | Separation-artifact features and a word-level error dataset |
-| `lyricscribe finetune` | Finetuning with epoch-level checkpointing for SLURM |
+| `lyricscribe finetune` | Finetuning with step-based schedules, resumable on SLURM |
 | `lyricscribe ensemble` | ROVER system combination and repetition repair |
 | `lyricscribe analyze` | Scoring, reference self-WER, significance testing and checkpoint averaging |
 
-`separate`, `transcribe` and `finetune` share a job model: `setup` writes a job directory split into chunks, `run --chunk-id N` processes one chunk (typically one SLURM array task), and finished work is skipped on rerun. Every command takes `--help`.
+`separate` and `transcribe` share a job model: `setup` writes a job directory split into chunks, `run --chunk-id N` processes one chunk (typically one SLURM array task), and finished work is skipped on rerun. A `finetune` job is one run that `finetune run` resumes. Every command takes `--help`.
 
 <details>
 <summary><h3>lyricscribe dataset</h3></summary>
@@ -231,14 +231,16 @@ The `transcribe` commands run batch ASR over a dataset of song subdirectories. T
 | Backend | Example models |
 |---------|----------------|
 | `whisper` | `openai/whisper-large-v3`, Whisper finetunes |
-| `nemo` | `nvidia/parakeet-tdt-0.6b-v3`, `nvidia/canary-1b-v2` |
 | `qwen3_asr` | `Qwen/Qwen3-ASR-1.7B` and finetunes |
 | `qwen3_omni` | `Qwen/Qwen3-Omni-30B-A3B-Instruct`, optionally with a LoRA `--adapter` |
-| `voxtral` | `mistralai/Voxtral-Mini-3B-2507` (needs `mistral-common` installed separately) |
 | `musicflamingo` | NVIDIA Music Flamingo |
-| `gemini` | Gemini models via the Google API; reads `GEMINI_API_KEY` |
+| `cohere` | `CohereLabs/cohere-transcribe-03-2026` |
+| `granite` | `ibm-granite/granite-speech-5.0-2b` |
+| `nemotron` | `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` |
+| `parakeet` | `nvidia/parakeet-tdt-0.6b-v3` and Parakeet TDT finetunes |
+| `canary` | `nvidia/canary-1b-v2` and Canary finetunes |
 
-The LLM-decoder backends (Qwen3-ASR, the audio-LLMs and Gemini) take the whole song, or RMS-VAD chunks of it with `--vad --vad-method rms`; they don't support Silero VAD.
+Every backend takes the whole song, or VAD segments of it with `--vad`: Silero VAD gives the raw speech segments, `--vad-method rms` merges RMS-VAD segments into chunks of at most 30 s. Checkpoints must be in transformers format; `.nemo` files are not supported.
 
 #### `lyricscribe transcribe setup`
 
@@ -282,13 +284,13 @@ Segmentation:
 Decoding:
 
 - `--repetition-penalty`: Whisper decoder repetition penalty; 1.0 disables (default: 1.0)
-- `--no-repeat-ngram-size`: Block repeated n-grams; 0 disables. Applies to Whisper, Canary, Qwen3-ASR and the audio-LLMs. (default: 0)
+- `--no-repeat-ngram-size`: Block repeated n-grams; 0 disables. Applies to Whisper, Canary, Qwen3-ASR, the audio-LLMs, Cohere, Granite and Nemotron. (default: 0)
 - `--mit`: Shortcut for `--repetition-penalty 1.7 --no-repeat-ngram-size 5`
 - `--num-beams`: Whisper beam width; 1 is greedy (default: 5)
 - `--condition-on-prev` / `--no-condition-on-prev`: Whisper long-form conditioning on previous windows (default: on)
 - `--temperature-fallback`: Whisper temperature fallback, triggered by `--compression-ratio-threshold` (default 2.4) and `--logprob-threshold` (default -1.0)
 - `--prompt-from-dirname`: Use the song directory name as Whisper's decoder prompt or Qwen3-ASR's context
-- `--max-new-tokens`: Per-chunk generation cap for the LLM-decoder backends (default: 1024)
+- `--max-new-tokens`: Per-chunk generation cap for the autoregressive backends other than Whisper; Canary also stops at its encoder length + 50 tokens (default: 1024)
 - `--adapter`: LoRA adapter directory merged into Qwen3-Omni
 - `--auto-language`: Let Qwen3-ASR identify the language instead of forcing the `--lyrics-file` one
 - `--deloop-max-run`: Collapse any short cycle repeated more than this many times; the raw text is kept as `transcription_raw`
@@ -431,41 +433,46 @@ Options:
 <details>
 <summary><h3>lyricscribe finetune</h3></summary>
 
-The `finetune` commands train Whisper, Parakeet, Canary, Qwen3-ASR (full finetune) or Qwen3-Omni (LoRA) on 30-second windows sampled from songs. Training is split into chunks of epochs for SLURM, with a checkpoint after every epoch and mid-epoch step checkpoints to resume from after a timeout. Each song directory needs a `lyrics.json` and at least one of the `--filename` audio files.
+The `finetune` commands train Whisper, Parakeet, Canary, Cohere Transcribe, Qwen3-ASR or Granite Speech (full finetune), or Qwen3-Omni, Nemotron 3.5 Transcribe or Music Flamingo (NVIDIA's adapter recipe: full-rank audio encoder and projector, LoRA on the LLM), on 30-second windows sampled from songs. Each song directory needs a `lyrics.json` and at least one of the `--filename` audio files.
 
-**Audio files must be PCM WAV.** Lossy formats like MP3 report a header duration that can differ from the decoded sample count by up to ~1s, which makes Lhotse reject cuts near the end of a song.
+Every model trains with the same loop: a seeded window order, a global batch made up by gradient accumulation, AdamW, SpecAugment on the log-mel features, a token-level loss over the whole global batch, and a step-based learning-rate schedule. A run resumes from its latest checkpoint, so rerunning `finetune run` after a time limit continues it.
+
+**Audio files should be PCM WAV.** Lossy formats like MP3 report a header duration that can differ from the decoded sample count by up to ~1s, so windows near the end of a song can come back short.
 
 #### `lyricscribe finetune setup`
 
-Builds the train/validation manifests and the chunk files for an experiment.
+Builds (or copies) the train/validation manifests and fixes the run's step plan.
 
 ```bash
-# Whisper on separated vocals
+# Whisper on separated vocals, 3 epochs, warmup-stable-decay with a 20% cooldown
 lyricscribe finetune setup /path/to/train \
     --output-dir ./experiments \
     --val-dir /path/to/validation \
     --model openai/whisper-large-v3 \
-    --filename htdemucs_ft_vocals.wav
+    --filename vocals.wav
 
-# Qwen3-ASR on vocals and the mix, each song wholly in one domain
+# Parakeet with a cosine schedule, exporting a model after every epoch
 lyricscribe finetune setup /path/to/train \
     --output-dir ./experiments \
-    --val-dir /path/to/validation \
-    --model Qwen/Qwen3-ASR-1.7B \
+    --model nvidia/parakeet-tdt-0.6b-v3 \
     --filename vocals.wav \
-    --filename audio.wav \
-    --audio-domain-mode balanced
+    --schedule cosine --warmup-steps 5000 --min-lr 5e-6 --learning-rate 1e-4 \
+    --export-every-epoch
 ```
 
 Defaults depend on the architecture:
 
-| Architecture | Batch size | Max epochs | Epochs per job | Learning rate |
-|--------------|-----------|------------|----------------|---------------|
-| Whisper | 24 | 10 | 5 | 1e-5 |
-| Parakeet | 16 | 10 | 3 | 5e-5 |
-| Canary | 1440 s of audio (`--batch-duration`) | 10 | 3 | 1e-5 |
-| Qwen3-ASR | 4 (× 4 grad accum) | 3 | 3 | 3e-5 |
-| Qwen3-Omni | 1 (× 16 grad accum) | 1 | 1 | 1e-4 |
+| Architecture | Batch size per device | Learning rate | Adaptation |
+|--------------|----------------------:|--------------:|------------|
+| Whisper | 16 | 1e-5 | full |
+| Parakeet | 4 | 3.16e-5 | full |
+| Canary | 16 | 3.16e-5 | full |
+| Cohere Transcribe | 8 | 3.16e-5 | full |
+| Qwen3-ASR | 4 | 3.16e-5 | full (or `nvidia_adapter`, LR 1e-4) |
+| Granite Speech | 1 | 3.16e-5 | full |
+| Nemotron 3.5 Transcribe | 1 | 1e-4 | `nvidia_adapter` |
+| Qwen3-Omni | 1 | 1e-4 | `nvidia_adapter` |
+| Music Flamingo | 1 | 1e-4 | `nvidia_adapter` |
 
 Core options:
 
@@ -473,12 +480,27 @@ Core options:
 - `--output-dir`: Directory for experiment outputs (required)
 - `--model`: Base model id; the architecture is detected from it (required)
 - `--filename`: Audio filename to train on; repeat for multi-file training (required)
-- `--val-dir`: Directory of validation songs (recommended)
+- `--val-dir`: Directory of validation songs; a fixed subset is scored at every export
 - `--exp-name`: Experiment directory name (default: `<arch>_<filenames>_<UTC timestamp>`)
-- `--batch-size`, `--max-epochs`, `--epochs-per-job`, `--learning-rate`, `--grad-accum`: Override the defaults above
-- `--warmup-epochs`: Linear warmup before cosine decay, may be fractional (default: 5; Qwen uses a short fraction)
+- `--batch-size`, `--learning-rate`, `--adaptation`: Override the defaults above
+- `--global-batch`: Windows per optimizer step; gradient accumulation makes up the rest (default: 64)
+- `--weight-decay`: AdamW weight decay, not on biases or norms (default: 0.01)
+- `--seed`: Seeds the window order, dither, SpecAugment masks and LoRA init (default: 0)
+- `--prompt-mode`: Training prompt, named as in `transcribe setup --prompt-mode`; recorded with every export
 - `--no-augment`: Disable SpecAugment
-- `--eval-subset-size`: Fixed number of validation windows evaluated each epoch (default: 200)
+- `--eval-subset-size`: Validation windows scored at every export (default: 200)
+
+Run length, schedule and outputs:
+
+- `--epochs` / `--max-steps`: Run length in (possibly fractional) epochs or optimizer steps (default: 3 epochs)
+- `--schedule`: `wsd` (warmup, constant, then a (1 − √) cooldown; default), `cosine` or `linear`
+- `--warmup-steps`: Linear warmup steps (default: 200)
+- `--cooldown`: `wsd` only: fraction of the run that cools down (default: 0.2). `0` gives a constant-LR run to continue with `extend` and branch cooldowns off with `branch`.
+- `--min-lr`: Final learning rate for `cosine` and `linear` (default: 0)
+- `--keep`: Step whose resumable checkpoint is kept; repeatable (rolling checkpoints are otherwise replaced)
+- `--resume-every`: Steps between rolling resume checkpoints (default: 500)
+- `--export-every-epoch` / `--export-step`: Also export inference models at these steps
+- `--no-export-final`: Don't export at the final step
 
 Training windows and labels:
 
@@ -490,98 +512,67 @@ Training windows and labels:
 - `--dedup-max-run`: Cap runs of identical consecutive label words; 0 disables (default: 0)
 - `--whisper-timestamp-prob`: Whisper only: fraction of samples trained with timestamp labels; 0 breaks >30s decoding (default: 0.5)
 - `--audio-domain-mode`: With several `--filename` values, `balanced` puts each song wholly in the first file's domain or the rest, 50/50 by window count; `fallback` uses the rest. Default: a random file per song.
-- `--manifests-from`: Copy the manifests from an existing experiment instead of building them
-- `--max-train-windows` / `--all-train-windows` / `--train-window-seed`: Train on a seeded random subset of windows (Qwen3-Omni defaults to 20000)
-
-Architecture-specific:
-
-- `--batch-duration`: Canary: seconds of audio per Lhotse batch (default: 1440; lower for <24 GB GPUs)
-- `--freeze-encoder`: Canary: train only the decoder and head
-- `--save-steps`: Qwen: optimizer steps between step checkpoints (default: 500)
-- `--lora-rank` / `--lora-targets`: Qwen3-Omni: LoRA rank (default: 16) and targets, `attn` (default) or `wide` (adds the MoE expert FFNs)
+- `--manifests-from`: Copy the manifests from an existing experiment or a `prepare-manifests` set instead of building them
+- `--max-train-windows` / `--train-window-seed`: Train on a seeded random subset of windows
+- `--freeze-encoder`: Parakeet/Canary: train only the decoder and joint/head
 
 #### `lyricscribe finetune run`
 
-Trains one chunk of epochs, resuming from the latest checkpoint. Usually launched from a SLURM script.
+Trains a job to its final step, resuming from its latest checkpoint. For several GPUs, launch it through `torchrun`.
 
 ```bash
-lyricscribe finetune run --job-dir ./experiments/my_experiment --chunk-id 1
+lyricscribe finetune run --job-dir ./experiments/my_experiment
+
+# Four GPUs
+torchrun --nproc_per_node=4 -m lyricscribe.cli.main finetune run --job-dir ./experiments/my_experiment
 ```
 
-Options:
+Each export is written to `exports/step_<N>` with a `lyricscribe_train.json` record of how it was trained; `metrics.jsonl` gets one row per export with the last training loss and, with a validation set, the evaluation loss.
 
-- `--job-dir`: Path to the experiment directory (required)
-- `--chunk-id`: Chunk to process, 1-indexed (required)
+#### `lyricscribe finetune extend` and `lyricscribe finetune branch`
 
-#### `lyricscribe finetune inspect`
-
-Shows progress, chunk statuses, checkpoints and per-epoch metrics.
+A run set up with `--cooldown 0` holds its learning rate constant after warmup. `extend` continues it to a later step, and `branch` starts a cooldown off one of its kept checkpoints as a job of its own under `<job-dir>/branches/<name>`, which `finetune run` trains and exports at its end.
 
 ```bash
-lyricscribe finetune inspect --job-dir ./experiments/my_experiment
+lyricscribe finetune setup /path/to/train --output-dir ./experiments --exp-name trunk \
+    --model nvidia/parakeet-tdt-0.6b-v3 --filename vocals.wav --cooldown 0 --max-steps 780 --no-export-final
+lyricscribe finetune run --job-dir ./experiments/trunk
+lyricscribe finetune branch --job-dir ./experiments/trunk --name short --to 976
+lyricscribe finetune run --job-dir ./experiments/trunk/branches/short
 ```
 
-Options:
+- `extend`: `--job-dir`, `--to` (new final step), `--keep` (extra kept steps, repeatable)
+- `branch`: `--job-dir`, `--name`, `--to` or `--epoch` (end of the branch), `--at` (kept checkpoint to start from; default: `--cooldown` (0.2) of the end step before it)
 
-- `--job-dir`: Path to the experiment directory (required)
+#### `lyricscribe finetune prepare-manifests`
 
-#### `lyricscribe finetune status`
+Prepares one model-agnostic manifest set from an experiment's manifests: drops excluded songs, re-points the audio file name, rebuilds Whisper's timestamp segments, drops windows over Whisper's label limit, and redraws the evaluation subset away from given songs. Use it with `setup --manifests-from`.
 
-Prints one line per experiment: current epoch, chunk counts by status, last checkpoint and last loss.
+#### `lyricscribe finetune throughput`
+
+Times training steps with the full training setup and reports seconds per step, GPU-hours per epoch and peak memory.
 
 ```bash
-lyricscribe finetune status --experiments-dir ./experiments
+lyricscribe finetune throughput --model nvidia/parakeet-tdt-0.6b-v3 \
+    --manifest ./prepared/train_manifest.jsonl --output-dir /tmp/throughput
 ```
 
-Options:
+#### `lyricscribe finetune inspect` and `lyricscribe finetune status`
 
-- `--experiments-dir`: Directory containing experiment subdirectories (required)
+`inspect --job-dir` shows one job's progress, exports and metrics; `status --experiments-dir` prints one line per job: step, status, latest export and last loss.
 
-#### `lyricscribe finetune retry`
+#### `lyricscribe finetune retry`, `retry-all` and `reset`
 
-Resets failed chunks back to `pending` so they can be resubmitted.
-
-```bash
-lyricscribe finetune retry --job-dir ./experiments/my_experiment --chunk-id 3
-```
-
-Options:
-
-- `--job-dir`: Path to the experiment directory (required)
-- `--chunk-id`: Chunk to retry (default: every failed chunk)
-
-#### `lyricscribe finetune retry-all`
-
-Resets every failed chunk across every experiment in a directory, leaving successful chunks and checkpoints alone.
-
-```bash
-lyricscribe finetune retry-all --experiments-dir ./experiments
-```
-
-Options:
-
-- `--experiments-dir`: Directory containing experiment subdirectories (required)
-
-#### `lyricscribe finetune reset`
-
-Resets an experiment to start from scratch, deleting its checkpoints and metrics.
-
-```bash
-lyricscribe finetune reset --job-dir ./experiments/my_experiment
-```
-
-Options:
-
-- `--job-dir`: Path to the experiment directory (required)
+`retry --job-dir` marks a failed job pending again (its checkpoints are kept, so the next run resumes); `retry-all --experiments-dir` does so for every failed job in a directory. `reset --job-dir --force` deletes a job's checkpoints, exports and training state.
 
 #### `lyricscribe finetune tune-batch`
 
-Finds the largest batch size that fits a model on the current GPUs. Each trial is a short `torchrun` training run on real songs; the sweep steps up through candidate sizes until the first OOM, then bisects. Canary sweeps `batch_duration` in seconds instead of a sample count.
+Finds the largest batch size that fits a model on the current GPUs. Each trial is a short `torchrun` training run on real songs; the sweep steps up through candidate sizes until the first OOM, then bisects.
 
 ```bash
 lyricscribe finetune tune-batch \
     --dataset-dir /path/to/train \
-    --filename htdemucs_ft_vocals.wav \
+    --filename vocals.wav \
     --model nvidia/parakeet-tdt-0.6b-v3
 ```
 
@@ -591,28 +582,26 @@ Options:
 - `--filename`: Audio file to read in each song directory; match production (required)
 - `--model`: Model id (required)
 - `--freeze-encoder`: Freeze the encoder (Canary/Parakeet); match production
-- `--max-duration`: Clip length in seconds; match production (default: 30)
-- `--start` / `--max`: Smallest and largest values to try (default: 1 and 2400)
+- `--start` / `--max`: Smallest and largest batch sizes to try (default: 1 and 128)
 - `--min-gap`: Stop bisecting once the gap is this small (default: 2)
 - `--safety-margin`: Percent taken off the VRAM ceiling when there is no throughput plateau (default: 15)
 - `--timeout`: Seconds before a trial is killed (default: 900)
 
 #### `lyricscribe finetune export-model`
 
-Exports a checkpoint for use with `lyricscribe transcribe`.
+Copies one of a job's exports elsewhere for use with `lyricscribe transcribe`.
 
 ```bash
 lyricscribe finetune export-model \
     --job-dir ./experiments/my_experiment \
-    --output ./models/my_finetuned_model \
-    --epoch 3
+    --output ./models/my_finetuned_model
 ```
 
 Options:
 
 - `--job-dir`: Path to the experiment directory (required)
-- `--output`: Path to save the exported model (required)
-- `--epoch`: Epoch to export (default: latest)
+- `--output`: Path to copy the export to (required)
+- `--step`: Export step to copy (default: latest)
 
 #### `lyricscribe finetune eval-loss`
 
@@ -621,7 +610,7 @@ Compares a base Qwen model against finetuned checkpoints by mean per-token cross
 ```bash
 lyricscribe finetune eval-loss \
     --base-model Qwen/Qwen3-ASR-1.7B-hf \
-    --checkpoint ./experiments/qasr_run/checkpoints/epoch_3 \
+    --checkpoint ./experiments/qasr_run/exports/step_11706 \
     --manifest ./experiments/qasr_run/val_manifest.jsonl
 ```
 

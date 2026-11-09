@@ -4,334 +4,143 @@ import logging
 import shutil
 from pathlib import Path
 
+from lyricscribe.finetune.config import list_exports
+from lyricscribe.finetune.engine import STATE_FILE
+
 logger = logging.getLogger(__name__)
 
+STATUSES = ("pending", "running", "complete", "failed")
 
-def setup_finetune_job(config: dict, train_manifest: Path, val_manifest: Path | None) -> Path:
+
+def write_status(job_dir: Path, config: dict, status: str = "pending", global_step: int = 0) -> None:
     """
-    Initialize a finetuning job by saving config and creating job directory.
-    
-    :param config: Configuration dictionary
-    :param train_manifest: Path to training manifest
-    :param val_manifest: Path to validation manifest (optional)
-    :return: Path to job directory
+    Write a job's ``status.json``.
+
+    :param job_dir: Job directory.
+    :param config: Job config.
+    :param status: One of :data:`STATUSES`.
+    :param global_step: Steps trained so far.
     """
-    job_dir = Path(config["output_dir"]) / config["exp_name"]
-    job_dir.mkdir(parents=True, exist_ok=True)
-    
-    with open(job_dir / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
-    
-    status = {
+    (job_dir / "status.json").write_text(json.dumps({
         "exp_name": config["exp_name"],
         "architecture": config["architecture"],
         "base_model": config["base_model"],
         "filenames": config["filenames"],
-        "max_epochs": config["max_epochs"],
-        "epochs_per_job": config["epochs_per_job"],
-        "current_epoch": 0,
-        "status": "pending",
-    }
-    
-    with open(job_dir / "status.json", "w") as f:
-        json.dump(status, f, indent=2)
-    
-    chunks_dir = job_dir / "chunks"
-    chunks_dir.mkdir(exist_ok=True)
-    
-    num_chunks = (config["max_epochs"] + config["epochs_per_job"] - 1) // config["epochs_per_job"]
-    
-    for chunk_id in range(1, num_chunks + 1):
-        start_epoch = (chunk_id - 1) * config["epochs_per_job"]
-        end_epoch = min(start_epoch + config["epochs_per_job"], config["max_epochs"])
-        
-        chunk_data = {
-            "chunk_id": chunk_id,
-            "start_epoch": start_epoch,
-            "end_epoch": end_epoch,
-            "status": "pending",
-        }
-        
-        with open(chunks_dir / f"chunk_{chunk_id}.json", "w") as f:
-            json.dump(chunk_data, f, indent=2)
-    
-    logger.info(f"Job initialized: {config['exp_name']}")
-    logger.info(f"Directory: {job_dir}")
-    logger.info(f"Epochs: {config['max_epochs']} in {num_chunks} chunks")
-    
+        "max_steps": config["max_steps"],
+        "global_step": global_step,
+        "status": status,
+    }, indent=2))
+
+
+def setup_finetune_job(config: dict) -> Path:
+    """
+    Save a new job's config and status.
+
+    :param config: Job config (with its step plan resolved).
+    :return: The job directory.
+    """
+    job_dir = Path(config["output_dir"]) / config["exp_name"]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "config.json").write_text(json.dumps(config, indent=2))
+    write_status(job_dir, config)
+    logger.info(f"Job initialized: {job_dir} ({config['max_steps']} steps, {config['steps_per_epoch']} per epoch)")
     return job_dir
 
 
 def load_job_status(job_dir: Path) -> dict:
     """
-    Load the top-level job status from ``status.json``.
+    Load a job's ``status.json``.
 
-    :param job_dir: Path to the job directory.
+    :param job_dir: Job directory.
     :return: Status dictionary.
     """
-    with open(job_dir / "status.json") as f:
-        return json.load(f)
+    return json.loads((job_dir / "status.json").read_text())
 
 
-def save_job_status(job_dir: Path, status: dict) -> None:
+def set_status(job_dir: Path, status: str, global_step: int | None = None) -> None:
     """
-    Write the top-level job status to ``status.json``.
+    Update a job's status under a file lock.
 
-    :param job_dir: Path to the job directory.
-    :param status: Status dictionary to write.
+    :param job_dir: Job directory.
+    :param status: One of :data:`STATUSES`.
+    :param global_step: Steps trained so far, if known.
     """
-    with open(job_dir / "status.json", "w") as f:
-        json.dump(status, f, indent=2)
-
-
-def load_chunk_status(job_dir: Path, chunk_id: int) -> dict:
-    """
-    Load the status of a single chunk.
-
-    :param job_dir: Path to the job directory.
-    :param chunk_id: Chunk number.
-    :return: Chunk status dictionary.
-    """
-    with open(job_dir / "chunks" / f"chunk_{chunk_id}.json") as f:
-        return json.load(f)
-
-
-def save_chunk_status(job_dir: Path, chunk_id: int, status: dict) -> None:
-    """
-    Write the status of a single chunk.
-
-    :param job_dir: Path to the job directory.
-    :param chunk_id: Chunk number.
-    :param status: Chunk status dictionary to write.
-    """
-    with open(job_dir / "chunks" / f"chunk_{chunk_id}.json", "w") as f:
-        json.dump(status, f, indent=2)
-
-
-def update_chunk_status(
-    job_dir: Path,
-    chunk_id: int,
-    status: str,
-) -> None:
-    """
-    Update chunk status after processing.
-
-    Uses a file lock to prevent concurrent writes from corrupting state.
-
-    :param job_dir: Path to job directory
-    :param chunk_id: Which chunk was processed
-    :param status: New status (pending, running, success, failed)
-    """
-    lock_path = job_dir / ".status.lock"
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    with open(job_dir / ".status.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            chunk_data = load_chunk_status(job_dir, chunk_id)
-            chunk_data["status"] = status
-            save_chunk_status(job_dir, chunk_id, chunk_data)
-
-            job_status = load_job_status(job_dir)
-
-            if status == "success":
-                job_status["current_epoch"] = chunk_data["end_epoch"]
-            elif (
-                status in ("pending", "running")
-                and job_status.get("status") in ("complete", "complete_with_failures")
-            ):
-                job_status["status"] = "pending"
-
-            all_chunks = list((job_dir / "chunks").glob("chunk_*.json"))
-            chunk_statuses = [
-                load_chunk_status(job_dir, int(p.stem.split("_")[1]))["status"]
-                for p in all_chunks
-            ]
-            all_done = all(s in ("success", "failed") for s in chunk_statuses)
-
-            if all_done:
-                if any(s == "failed" for s in chunk_statuses):
-                    job_status["status"] = "complete_with_failures"
-                else:
-                    job_status["status"] = "complete"
-
-            save_job_status(job_dir, job_status)
+            current = load_job_status(job_dir)
+            current["status"] = status
+            if global_step is not None:
+                current["global_step"] = global_step
+            (job_dir / "status.json").write_text(json.dumps(current, indent=2))
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def read_metrics(job_dir: Path) -> list[dict]:
+    """
+    The rows of a job's ``metrics.jsonl`` (one per export).
+
+    :param job_dir: Job directory.
+    :return: Rows, oldest first.
+    """
+    path = job_dir / "metrics.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def show_job_stats(job_dir: Path) -> None:
     """
-    Log a finetuning job's progress, chunk states, checkpoints and per-epoch metrics.
+    Log a job's progress, exports and metrics.
 
     :param job_dir: Job directory.
     """
     status = load_job_status(job_dir)
-
     logger.info(f"Experiment: {status['exp_name']}")
     logger.info(f"Model: {status['architecture']} / {status['base_model']}")
     logger.info(f"Filenames: {', '.join(status['filenames'])}")
-    logger.info(f"Progress: {status['current_epoch']}/{status['max_epochs']} epochs")
-    logger.info(f"Status: {status['status']}")
-
-    chunks_dir = job_dir / "chunks"
-    chunk_files = list(chunks_dir.glob("chunk_*.json"))
-
-    counts = {"pending": 0, "running": 0, "success": 0, "failed": 0}
-    for chunk_file in chunk_files:
-        chunk_id = int(chunk_file.stem.split("_")[1])
-        chunk_data = load_chunk_status(job_dir, chunk_id)
-        counts[chunk_data["status"]] = counts.get(chunk_data["status"], 0) + 1
-
-    logger.info("Chunks:")
-    for status_name, count in counts.items():
-        if count > 0:
-            logger.info(f"  {status_name}: {count}")
-
-    ckpt_dir = job_dir / "checkpoints"
-    if ckpt_dir.exists():
-        checkpoints = sorted(
-            (p for p in ckpt_dir.iterdir() if p.name.startswith("epoch_")),
-            key=lambda p: p.name,
-        )
-        if checkpoints:
-            logger.info(f"Checkpoints: {len(checkpoints)}")
-            for ckpt in checkpoints:
-                logger.info(f"  {ckpt.name}")
-
-    metrics_path = job_dir / "metrics.jsonl"
-    if metrics_path.exists():
-        logger.info("Metrics:")
-        with open(metrics_path) as f:
-            for line in f:
-                entry = json.loads(line)
-                parts = [f"epoch {entry['epoch']}"]
-                for key in sorted(entry):
-                    if key == "epoch":
-                        continue
-                    val = entry[key]
-                    if isinstance(val, float):
-                        parts.append(f"{key}={val:.4f}")
-                    else:
-                        parts.append(f"{key}={val}")
-                logger.info(f"  {', '.join(parts)}")
-
-
-def reset_failed_chunks(job_dir: Path) -> int:
-    """
-    Reset all failed chunks in a job back to ``pending`` so they can be
-    re-run.
-
-    Unlike :func:`reset_job`, this preserves successful chunks and
-    existing checkpoints.
-
-    :param job_dir: Path to the job directory.
-    :return: Number of chunks that were reset.
-    """
-    chunks_dir = job_dir / "chunks"
-    if not chunks_dir.exists():
-        return 0
-
-    reset = 0
-    for chunk_file in sorted(chunks_dir.glob("chunk_*.json")):
-        chunk_id = int(chunk_file.stem.split("_")[1])
-        chunk_data = load_chunk_status(job_dir, chunk_id)
-        if chunk_data["status"] == "failed":
-            chunk_data["status"] = "pending"
-            save_chunk_status(job_dir, chunk_id, chunk_data)
-            reset += 1
-
-    if reset > 0:
-        job_status = load_job_status(job_dir)
-        if job_status.get("status") == "complete_with_failures":
-            job_status["status"] = "pending"
-            save_job_status(job_dir, job_status)
-
-    return reset
+    logger.info(f"Progress: step {status['global_step']}/{status['max_steps']} ({status['status']})")
+    exports = list_exports(job_dir)
+    if exports:
+        logger.info(f"Exports: {', '.join(p.name for _, p in exports)}")
+    for row in read_metrics(job_dir):
+        logger.info("  " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()))
 
 
 def gather_experiment_status(job_dir: Path) -> dict:
     """
-    Collect a one-line summary of an experiment's progress.
+    One-line summary of a job.
 
-    :param job_dir: Path to the job directory.
-    :return: Dict with ``exp_name``, ``architecture``, ``filenames``,
-        chunk counts (``done``, ``failed``, ``running``, ``pending``),
-        ``last_checkpoint``, and ``last_metrics``.
+    :param job_dir: Job directory.
+    :return: ``exp_name``, ``status``, ``global_step``, ``max_steps``, ``last_export`` and ``last_metrics``.
     """
     status = load_job_status(job_dir)
-
-    chunks_dir = job_dir / "chunks"
-    counts = {"pending": 0, "running": 0, "success": 0, "failed": 0}
-    if chunks_dir.exists():
-        for chunk_file in chunks_dir.glob("chunk_*.json"):
-            chunk_id = int(chunk_file.stem.split("_")[1])
-            chunk_data = load_chunk_status(job_dir, chunk_id)
-            counts[chunk_data["status"]] = counts.get(chunk_data["status"], 0) + 1
-
-    last_checkpoint = None
-    ckpt_dir = job_dir / "checkpoints"
-    if ckpt_dir.exists():
-        ckpts = [p for p in ckpt_dir.iterdir() if p.name.startswith("epoch_")]
-        if ckpts:
-            def epoch_num(p: Path) -> int:
-                """
-                Epoch number of an ``epoch_N`` checkpoint, or -1.
-
-                :param p: Checkpoint path.
-                :return: The epoch.
-                """
-                try:
-                    return int(p.stem.split("_")[1])
-                except (IndexError, ValueError):
-                    return -1
-            last_checkpoint = max(ckpts, key=epoch_num).name
-
-    last_metrics = None
-    metrics_path = job_dir / "metrics.jsonl"
-    if metrics_path.exists():
-        with open(metrics_path) as f:
-            lines = f.readlines()
-        if lines:
-            last_metrics = json.loads(lines[-1])
-
+    exports = list_exports(job_dir)
+    metrics = read_metrics(job_dir)
     return {
         "exp_name": status["exp_name"],
-        "architecture": status["architecture"],
-        "filenames": status["filenames"],
-        "max_epochs": status["max_epochs"],
-        "current_epoch": status.get("current_epoch", 0),
-        "status": status.get("status", "unknown"),
-        "chunks": counts,
-        "last_checkpoint": last_checkpoint,
-        "last_metrics": last_metrics,
+        "status": status["status"],
+        "global_step": status["global_step"],
+        "max_steps": status["max_steps"],
+        "last_export": exports[-1][1].name if exports else None,
+        "last_metrics": metrics[-1] if metrics else None,
     }
 
 
 def reset_job(job_dir: Path) -> None:
     """
-    Reset a finetuning job to start from scratch.
-    
-    Deletes all checkpoints and resets chunk statuses.
-    
-    :param job_dir: Path to job directory
+    Delete a job's checkpoints, exports, training state and metrics, and mark it pending.
+
+    :param job_dir: Job directory.
+    :raises RuntimeError: If branches still link to its checkpoints.
     """
-    status = load_job_status(job_dir)
-    status["current_epoch"] = 0
-    status["status"] = "pending"
-    save_job_status(job_dir, status)
-    
-    chunks_dir = job_dir / "chunks"
-    for chunk_file in chunks_dir.glob("chunk_*.json"):
-        chunk_id = int(chunk_file.stem.split("_")[1])
-        chunk_data = load_chunk_status(job_dir, chunk_id)
-        chunk_data["status"] = "pending"
-        save_chunk_status(job_dir, chunk_id, chunk_data)
-    
-    checkpoint_dir = job_dir / "checkpoints"
-    if checkpoint_dir.exists():
-        shutil.rmtree(checkpoint_dir)
-
-    metrics_path = job_dir / "metrics.jsonl"
-    if metrics_path.exists():
-        metrics_path.unlink()
-
+    branches = sorted(p.name for p in (job_dir / "branches").glob("*")) if (job_dir / "branches").is_dir() else []
+    if branches:
+        raise RuntimeError(f"{job_dir} has branches {branches} linked to its checkpoints; remove them first")
+    for name in ("hf_trainer", "exports"):
+        shutil.rmtree(job_dir / name, ignore_errors=True)
+    for name in (STATE_FILE, "metrics.jsonl"):
+        (job_dir / name).unlink(missing_ok=True)
+    set_status(job_dir, "pending", 0)
     logger.info(f"Job reset: {job_dir}")

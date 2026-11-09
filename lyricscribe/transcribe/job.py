@@ -1,9 +1,12 @@
 import fcntl
+import hashlib
+import importlib.metadata
 import json
 import logging
 import os
 import random
 import re
+import subprocess
 import time
 import traceback
 from datetime import datetime, timezone
@@ -11,14 +14,17 @@ from pathlib import Path
 
 import torch
 from silero_vad import load_silero_vad
-from torch.jit import ScriptModule
 
 from lyricscribe.ensemble.deloop import deloop
 from lyricscribe.jobs import update_status
+from lyricscribe.transcribe.adapter import TrainRecordMismatch
 from lyricscribe.transcribe.audio_llm import AudioLLMTranscriber
-from lyricscribe.transcribe.base import Transcriber
-from lyricscribe.transcribe.gemini import GeminiTranscriber
-from lyricscribe.transcribe.nemo import NemoTranscriber
+from lyricscribe.transcribe.base import MAX_NEW_TOKENS, Decode, Transcriber
+from lyricscribe.transcribe.canary import CanaryTranscriber
+from lyricscribe.transcribe.cohere import CohereTranscriber
+from lyricscribe.transcribe.granite import GraniteTranscriber
+from lyricscribe.transcribe.nemotron import NemotronTranscriber
+from lyricscribe.transcribe.parakeet import ParakeetTranscriber
 from lyricscribe.transcribe.qwen_asr import Qwen3ASRTranscriber
 from lyricscribe.transcribe.whisper import WhisperTranscriber
 
@@ -27,12 +33,14 @@ logger = logging.getLogger(__name__)
 
 BACKENDS = (
     "whisper",
-    "nemo",
     "qwen3_asr",
     "qwen3_omni",
-    "voxtral",
     "musicflamingo",
-    "gemini",
+    "cohere",
+    "granite",
+    "nemotron",
+    "parakeet",
+    "canary",
 )
 
 # Substrings of hub ids / paths, checked in order.
@@ -42,10 +50,13 @@ _NAME_HINTS = (
     ("qwen3_asr", "qwen3_asr"),
     ("qwen3-omni", "qwen3_omni"),
     ("qwen3_omni", "qwen3_omni"),
-    ("voxtral", "voxtral"),
     ("music-flamingo", "musicflamingo"),
     ("musicflamingo", "musicflamingo"),
-    ("gemini", "gemini"),
+    ("cohere-transcribe", "cohere"),
+    ("granite-speech", "granite"),
+    ("nemotron-3.5-transcribe", "nemotron"),
+    ("parakeet", "parakeet"),
+    ("canary", "canary"),
 )
 # ``model_type`` / architecture strings in a local checkpoint's config.json.
 _CONFIG_HINTS = (
@@ -53,8 +64,12 @@ _CONFIG_HINTS = (
     ("qwen3_asr", "qwen3_asr"),
     ("qwen3omni", "qwen3_omni"),
     ("qwen3_omni", "qwen3_omni"),
-    ("voxtral", "voxtral"),
     ("musicflamingo", "musicflamingo"),
+    ("cohere_asr", "cohere"),
+    ("granite_speech", "granite"),
+    ("nemotron3_5transcribe", "nemotron"),
+    ("parakeet", "parakeet"),
+    ("canary", "canary"),
 )
 
 
@@ -64,11 +79,16 @@ def detect_backend(model_name: str) -> str:
 
     Hub ids are matched by name; local checkpoint dirs (finetune outputs
     rarely carry the family in their path) by their ``config.json``
-    ``model_type`` / ``architectures``. Anything else is treated as NeMo.
+    ``model_type`` / ``architectures``.
 
-    :param model_name: Hub id, local dir, or ``.nemo`` file.
+    :param model_name: Hub id or local checkpoint dir.
     :return: One of :data:`BACKENDS`.
+    :raises ValueError: For a ``.nemo`` file or a model no backend claims.
     """
+    if model_name.endswith(".nemo"):
+        raise ValueError(
+            f"{model_name}: NeMo checkpoints are not supported; convert it to transformers format first"
+        )
     lowered = model_name.lower()
     for hint, backend in _NAME_HINTS:
         if hint in lowered:
@@ -87,7 +107,23 @@ def detect_backend(model_name: str) -> str:
         for hint, backend in _CONFIG_HINTS:
             if hint in joined:
                 return backend
-    return "nemo"
+    raise ValueError(f"Cannot detect the backend for {model_name!r}; pass one of {BACKENDS}")
+
+
+def backend_prompt_modes(backend: str) -> tuple[str, ...]:
+    """
+    The prompt modes a backend's transcriber accepts, its default first.
+
+    :param backend: One of :data:`BACKENDS`.
+    :return: ``Transcriber.prompt_modes`` of that backend.
+    """
+    classes = {
+        "whisper": WhisperTranscriber, "qwen3_asr": Qwen3ASRTranscriber, "qwen3_omni": AudioLLMTranscriber,
+        "musicflamingo": AudioLLMTranscriber, "cohere": CohereTranscriber,
+        "granite": GraniteTranscriber, "nemotron": NemotronTranscriber, "canary": CanaryTranscriber,
+        "parakeet": ParakeetTranscriber,
+    }
+    return classes[backend].prompt_modes
 
 
 def _create_transcriber(model_name: str, batch_size: int, config: dict | None = None) -> Transcriber:
@@ -98,33 +134,51 @@ def _create_transcriber(model_name: str, batch_size: int, config: dict | None = 
     :param batch_size: Batch size for inference.
     :param config: Job config; supplies ``backend`` (overrides detection)
         and backend options (``max_new_tokens``, ``adapter``,
-        ``auto_language``).
+        ``auto_language``, ``prompt_mode``, ``dtype``). ``prompt_mode`` is checked
+        against the backend's ``prompt_modes``; Parakeet takes none.
     :return: An unloaded :class:`Transcriber` instance.
     """
     config = config or {}
     backend = config.get("backend") or detect_backend(model_name)
-    max_new_tokens = int(config.get("max_new_tokens") or 1024)
+    max_new_tokens = int(config.get("max_new_tokens") or MAX_NEW_TOKENS)
+    prompt_mode = config.get("prompt_mode")
     if backend == "whisper":
-        return WhisperTranscriber(model_name, batch_size)
-    if backend == "nemo":
-        return NemoTranscriber(model_name, batch_size)
+        return WhisperTranscriber(model_name, batch_size, dtype=config.get("dtype"), prompt_mode=prompt_mode)
     if backend == "qwen3_asr":
         return Qwen3ASRTranscriber(
             model_name,
             batch_size,
             max_new_tokens=max_new_tokens,
             auto_language=bool(config.get("auto_language", False)),
+            adapter=config.get("adapter"),
+            prompt_mode=prompt_mode,
         )
-    if backend in ("qwen3_omni", "voxtral", "musicflamingo"):
+    if backend in ("qwen3_omni", "musicflamingo"):
         return AudioLLMTranscriber(
             model_name,
             backend,
             batch_size,
             max_new_tokens=max_new_tokens,
             adapter=config.get("adapter"),
+            prompt_mode=prompt_mode or "legacy",
+            dtype=config.get("dtype"),
         )
-    if backend == "gemini":
-        return GeminiTranscriber(model_name, batch_size)
+    if backend == "cohere":
+        return CohereTranscriber(model_name, batch_size, max_new_tokens=max_new_tokens, prompt_mode=prompt_mode)
+    if backend == "granite":
+        return GraniteTranscriber(model_name, batch_size, max_new_tokens=max_new_tokens, prompt_mode=prompt_mode)
+    if backend == "nemotron":
+        return NemotronTranscriber(
+            model_name, batch_size, max_new_tokens=max_new_tokens, adapter=config.get("adapter"), prompt_mode=prompt_mode
+        )
+    if backend == "canary":
+        return CanaryTranscriber(
+            model_name, batch_size, max_new_tokens=max_new_tokens, dtype=config.get("dtype"), prompt_mode=prompt_mode
+        )
+    if prompt_mode not in (None, "native"):
+        raise ValueError(f"{backend} takes no prompt; got prompt_mode {prompt_mode!r}")
+    if backend == "parakeet":
+        return ParakeetTranscriber(model_name, batch_size, dtype=config.get("dtype"))
     raise ValueError(f"Unknown backend {backend!r}; expected one of {BACKENDS}")
 
 
@@ -234,7 +288,7 @@ def setup_job(
     vad_method: str = "silero",
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
-    num_beams: int = 5,
+    num_beams: int = 1,
     condition_on_prev: bool = True,
     temperature_fallback: bool = False,
     compression_ratio_threshold: float | None = None,
@@ -245,6 +299,8 @@ def setup_job(
     adapter: str | None = None,
     auto_language: bool = False,
     deloop_max_run: int | None = None,
+    prompt_mode: str | None = None,
+    dtype: str | None = None,
 ) -> None:
     """
     Initialize a transcription job by scanning directories and writing
@@ -263,11 +319,11 @@ def setup_job(
     :param vad_filename: Optional audio filename to use as VAD source
         (timestamps from this file, transcription from ``filename``).
     :param vad_method: ``"silero"`` or ``"rms"``.
-    :param repetition_penalty: Whisper decode-time anti-stutter knob.
-        ``1.0`` disables (vanilla decode).
-    :param no_repeat_ngram_size: Whisper decode-time anti-loop knob.
+    :param repetition_penalty: Decoder repetition penalty on generated
+        tokens. ``1.0`` disables.
+    :param no_repeat_ngram_size: Decoder n-gram ban on generated tokens.
         ``0`` disables.
-    :param num_beams: Whisper beam width (5 = the HF pipeline default).
+    :param num_beams: Beam width; ``1`` is greedy.
     :param condition_on_prev: Whisper long-form ``condition_on_prev_tokens``.
     :param temperature_fallback: Whisper temperature fallback.
     :param compression_ratio_threshold: Fallback trigger.
@@ -276,15 +332,20 @@ def setup_job(
         directory name (see :func:`metadata_prompt`): a decoder prompt for
         Whisper, the ``context`` for Qwen3-ASR.
     :param backend: Force a backend instead of :func:`detect_backend`.
-    :param max_new_tokens: Per-chunk generation cap for the LLM-decoder
-        backends (default 1024).
-    :param adapter: LoRA adapter dir merged into Qwen3-Omni.
+    :param max_new_tokens: Per-chunk generation cap for the autoregressive
+        backends (default :data:`MAX_NEW_TOKENS`).
+    :param adapter: PEFT adapter dir merged into Qwen3-ASR, Qwen3-Omni, Nemotron or Music Flamingo.
     :param auto_language: Qwen3-ASR: ignore the provided language and let
         the model identify it.
     :param deloop_max_run: If set, collapse any short cycle repeated more
         than this many times in each transcription (post-hoc repair; pairs
         with ``no_repeat_ngram_size=0``). The raw text is kept as
-        ``transcription_raw``.
+        ``transcription_raw``. Prefer scoring-time de-looping
+        (``evaluate_job(deloop_max_run=...)``), which runs on normalised words.
+    :param prompt_mode: The backend's prompt (``Transcriber.prompt_modes``): ``native``
+        or ``shared`` for every backend with a text input, plus ``asr``/``lyrics``/``legacy``
+        for the audio-LLMs and ``asr`` for Granite and Nemotron. ``None`` is the backend default.
+    :param dtype: Compute dtype override (Whisper, Parakeet, Canary, Music Flamingo).
     """
     if backend is not None and backend not in BACKENDS:
         raise ValueError(f"Unknown backend {backend!r}; expected one of {BACKENDS}")
@@ -303,6 +364,12 @@ def setup_job(
 
     random.seed(42)
     random.shuffle(subdirs)
+
+    # The unloaded backend refuses a prompt_mode or dtype it doesn't have before anything is written.
+    _create_transcriber(model, batch_size, {
+        "backend": resolved_backend, "prompt_mode": prompt_mode, "dtype": dtype, "adapter": adapter,
+        "auto_language": auto_language, "max_new_tokens": max_new_tokens,
+    })
 
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -333,6 +400,8 @@ def setup_job(
         "adapter": adapter,
         "auto_language": auto_language,
         "deloop_max_run": deloop_max_run,
+        "prompt_mode": prompt_mode,
+        "dtype": dtype,
         "num_chunks": num_chunks,
         "total_files": total,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -393,73 +462,74 @@ def setup_job(
     logger.info(f"Registered {total} files into {num_chunks} chunks in {job_dir}")
 
 
-def _transcribe_with_oom_retry(
-    transcriber: Transcriber,
-    input_path: str,
-    use_vad: bool,
-    use_chunked: bool,
-    vad_model: ScriptModule | None,
-    language: str | None = None,
-    vad_source: str | None = None,
-    vad_method: str = "silero",
-    repetition_penalty: float = 1.0,
-    no_repeat_ngram_size: int = 0,
-    num_beams: int = 5,
-    condition_on_prev: bool = True,
-    temperature_fallback: bool = False,
-    compression_ratio_threshold: float | None = None,
-    logprob_threshold: float | None = None,
-    initial_prompt: str | None = None,
-) -> str:
+def git_commit(root: Path) -> str | None:
     """
-    Attempt transcription with automatic OOM recovery.
+    The commit the code runs from, suffixed ``_dirty`` when the checkout has
+    uncommitted changes.
 
-    On ``torch.cuda.OutOfMemoryError``, halves the batch size, clears
-    the CUDA cache, and retries. Keeps retrying until batch_size reaches
-    1, at which point the OOM is re-raised.
-
-    :param transcriber: Loaded transcriber instance.
-    :param input_path: Path to the audio file.
-    :param use_vad: Whether to use VAD-based transcription.
-    :param use_chunked: Whether to use chunked inference.
-    :param vad_model: Loaded Silero VAD model, or ``None``.
-    :param language: Optional language code.
-    :param vad_source: Optional path to VAD source audio file.
-    :param vad_method: Passed through to :meth:`Transcriber.transcribe`.
-    :param repetition_penalty: Passed through.
-    :param no_repeat_ngram_size: Passed through.
-    :param num_beams: Passed through.
-    :param condition_on_prev: Passed through.
-    :param temperature_fallback: Passed through.
-    :param compression_ratio_threshold: Passed through.
-    :param logprob_threshold: Passed through.
-    :param initial_prompt: Passed through.
-    :return: Transcribed text.
-    :raises torch.cuda.OutOfMemoryError: If OOM persists at batch_size=1.
+    :param root: Repository root.
+    :return: ``<sha>`` or ``<sha>_dirty``; ``None`` outside a git checkout.
     """
-    while True:
+    try:
+        sha = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--", "lyricscribe", "pyproject.toml", "uv.lock"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return f"{sha}_dirty" if status.strip() else sha
+
+
+def environment_record() -> dict:
+    """
+    Software and hardware a job runs on.
+
+    :return: Code root, commit (:func:`git_commit`), ``uv.lock`` hash, package versions and GPU.
+    """
+    root = Path(__file__).resolve().parents[2]
+    lock = root / "uv.lock"
+    versions = {}
+    for package in ("torch", "torchaudio", "transformers", "peft", "unblend", "alt-eval", "jiwer", "numpy"):
         try:
-            return transcriber.transcribe(
-                input_path,
-                use_vad=use_vad,
-                vad_model=vad_model,
-                use_chunked=use_chunked,
-                language=language,
-                vad_source=vad_source,
-                vad_method=vad_method,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                num_beams=num_beams,
-                condition_on_prev=condition_on_prev,
-                temperature_fallback=temperature_fallback,
-                compression_ratio_threshold=compression_ratio_threshold,
-                logprob_threshold=logprob_threshold,
-                initial_prompt=initial_prompt,
-            )
-        except torch.cuda.OutOfMemoryError:
-            if transcriber.batch_size <= 1:
-                raise
-            transcriber.halve_batch_size()
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    gpu = None
+    if torch.cuda.is_available():
+        gpu = {"name": torch.cuda.get_device_name(0), "capability": list(torch.cuda.get_device_capability(0))}
+    return {
+        "code_root": str(root),
+        "commit": git_commit(root),
+        "uv_lock_sha256": hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else None,
+        "versions": versions,
+        "gpu": gpu,
+        "host": os.uname().nodename,
+    }
+
+
+def _write_effective(job_dir: Path, chunk_id: int, env: dict, transcriber: Transcriber, decode: Decode) -> None:
+    """
+    Record what the chunk actually ran with: environment (including the
+    commit), backend state and the last ``generate()`` call's kwargs.
+
+    :param job_dir: Job directory.
+    :param chunk_id: 1-based chunk id.
+    :param env: :func:`environment_record` output.
+    :param transcriber: Loaded transcriber.
+    :param decode: Decoding settings in force.
+    """
+    record = {
+        "chunk_id": chunk_id,
+        "written_at": datetime.now(timezone.utc).isoformat(),
+        "environment": env,
+        "decode": decode.as_dict(),
+        "backend": transcriber.effective(),
+    }
+    path = job_dir / f"effective_chunk_{chunk_id}.json"
+    path.write_text(json.dumps(record, indent=2, default=str) + "\n")
 
 
 def process_chunk(job_dir: Path, chunk_id: int) -> None:
@@ -470,14 +540,16 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     assigned to the given chunk. Results are appended to a JSONL file
     in the job directory.
 
-    On ``torch.cuda.OutOfMemoryError`` during transcription, the
-    batch size is halved and the file is retried automatically.
+    A ``torch.cuda.OutOfMemoryError`` stops the chunk with the song still
+    pending: the batch size is never changed silently, so rerun with a
+    smaller ``batch_size``. ``effective_chunk_<id>.json`` records what ran.
 
     :param job_dir: Path to the job directory.
     :param chunk_id: 1-based chunk identifier.
     """
     with open(job_dir / "config.json") as f:
         config = json.load(f)
+    env = environment_record()
     model_name = config["model"]
     batch_size = config.get("batch_size", 1)
     if batch_size == 0:
@@ -486,9 +558,11 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     use_chunked = config.get("chunked", False)
     vad_method = config.get("vad_method", "silero")
     vad_filename = config.get("vad_filename")
-    repetition_penalty = float(config.get("repetition_penalty", 1.0) or 1.0)
-    no_repeat_ngram_size = int(config.get("no_repeat_ngram_size", 0) or 0)
-    num_beams = int(config.get("num_beams") or 5)
+    decode = Decode(
+        num_beams=int(config.get("num_beams") or 1),
+        repetition_penalty=float(config.get("repetition_penalty", 1.0) or 1.0),
+        no_repeat_ngram_size=int(config.get("no_repeat_ngram_size", 0) or 0),
+    )
     condition_on_prev = bool(config.get("condition_on_prev", True))
     temperature_fallback = bool(config.get("temperature_fallback", False))
     compression_ratio_threshold = config.get("compression_ratio_threshold")
@@ -504,8 +578,10 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
     deloop_max_run = config.get("deloop_max_run")
     transcriber = _create_transcriber(model_name, batch_size, config)
     transcriber.load()
+    transcriber.check_decode(decode)
+    _write_effective(job_dir, chunk_id, env, transcriber, decode)
 
-    logger.info(f"Using batch_size={transcriber.batch_size}")
+    logger.info(f"Using batch_size={transcriber.batch_size}, decode={decode.as_dict()}")
 
     vad_model = None
     if use_vad and vad_method == "silero":
@@ -548,15 +624,12 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
         start_time = time.time()
 
         try:
-            text = _transcribe_with_oom_retry(
-                transcriber,
+            text = transcriber.transcribe(
                 input_path,
-                use_vad,
-                use_chunked,
-                vad_model,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                num_beams=num_beams,
+                use_vad=use_vad,
+                vad_model=vad_model,
+                use_chunked=use_chunked,
+                decode=decode,
                 condition_on_prev=condition_on_prev,
                 temperature_fallback=temperature_fallback,
                 compression_ratio_threshold=compression_ratio_threshold,
@@ -584,8 +657,16 @@ def process_chunk(job_dir: Path, chunk_id: int) -> None:
                 job_dir, chunk_id, chunk_data, name, "success", duration, None
             )
             logger.info(f"{name} completed in {duration:.2f}s")
+            if success_count == 0:
+                _write_effective(job_dir, chunk_id, env, transcriber, decode)
             success_count += 1
 
+        except torch.cuda.OutOfMemoryError:
+            logger.error(f"{name}: CUDA OOM at batch_size={transcriber.batch_size}; left pending")
+            raise
+        except TrainRecordMismatch:
+            logger.error(f"{name}: decode contradicts the checkpoint's training record; left pending")
+            raise
         except Exception as e:
             duration = time.time() - start_time
             error_msg = str(e)

@@ -13,10 +13,9 @@ from lyricscribe.finetune import jobs as finetune_jobs
 from lyricscribe.finetune.config import (
     create_finetune_config,
     detect_architecture,
-    get_checkpoint_for_epoch,
-    get_latest_checkpoint,
-    list_checkpoints,
+    list_exports,
     load_finetune_config,
+    resolve_steps,
 )
 
 logger = logging.getLogger(__name__)
@@ -260,18 +259,14 @@ def transcribe_setup(
     repetition_penalty: float = typer.Option(
         1.0,
         "--repetition-penalty",
-        help="Whisper decoder ``repetition_penalty``. ``1.0`` disables. "
-             "Recommended ``1.7`` to suppress autoregressive stutter on music. "
-             "Whisper-only.",
+        help="Decoder repetition penalty on generated tokens (never the "
+             "prompt). ``1.0`` disables. Every backend but Parakeet applies it.",
     ),
     no_repeat_ngram_size: int = typer.Option(
         0,
         "--no-repeat-ngram-size",
-        help="Decoder ``no_repeat_ngram_size``. ``0`` disables. Applies to "
-             "Whisper, Canary, Qwen3-ASR and the audio-LLMs; ignored by "
-             "Parakeet. Typical values: 20 for Whisper, 10 for Qwen3-ASR / "
-             "Voxtral, 5 for Music Flamingo; for Qwen3-Omni use 0 with "
-             "--deloop-max-run 5.",
+        help="Decoder ban on repeating a generated n-gram (never the prompt). "
+             "``0`` disables. Every backend but Parakeet applies it.",
     ),
     mit: bool = typer.Option(
         False,
@@ -281,11 +276,10 @@ def transcribe_setup(
              "values for those two flags.",
     ),
     num_beams: int = typer.Option(
-        5,
+        1,
         "--num-beams",
         min=1,
-        help="Whisper beam width (default 5, matching the HF ASR pipeline); "
-             "1 is greedy. Whisper-only.",
+        help="Beam width; 1 (default) is greedy. Every backend but Parakeet applies it.",
     ),
     condition_on_prev: bool = typer.Option(
         True,
@@ -319,20 +313,21 @@ def transcribe_setup(
     backend: str | None = typer.Option(
         None,
         "--backend",
-        help="Force the backend: whisper, nemo, qwen3_asr, qwen3_omni, "
-             "voxtral, musicflamingo, gemini. Default: detected from the "
-             "model id / checkpoint config.json.",
+        help="Force the backend: whisper, qwen3_asr, qwen3_omni, "
+             "musicflamingo, cohere, granite, nemotron, parakeet, canary. "
+             "Default: detected from the model id / checkpoint config.json.",
     ),
     max_new_tokens: int | None = typer.Option(
         None,
         "--max-new-tokens",
-        help="Per-chunk generation cap for LLM-decoder backends (Qwen3-ASR, "
-             "audio-LLMs). Default 1024.",
+        help="Per-chunk generation cap for the autoregressive backends, "
+             "within each decoder's position limit. Default 448 (Whisper's "
+             "decoder limit), which Whisper can't exceed.",
     ),
     adapter: str | None = typer.Option(
         None,
         "--adapter",
-        help="PEFT LoRA adapter dir merged into the Qwen3-Omni thinker.",
+        help="PEFT adapter dir merged into Qwen3-ASR, Qwen3-Omni (its thinker), Nemotron or Music Flamingo.",
     ),
     auto_language: bool = typer.Option(
         False,
@@ -345,7 +340,24 @@ def transcribe_setup(
         "--deloop-max-run",
         min=1,
         help="Post-hoc repair: collapse any <=25-word cycle repeated more "
-             "than this many times. Raw text is kept as transcription_raw.",
+             "than this many times. Raw text is kept as transcription_raw. "
+             "Prefer scoring-time de-looping, which runs on normalised words.",
+    ),
+    prompt_mode: str | None = typer.Option(
+        None,
+        "--prompt-mode",
+        help="Prompt: shared (the one prompt every "
+             "backend with a text input can send) or the backend's own: native "
+             "(Whisper, Canary, Cohere, Qwen3-ASR: no prompt / empty context; "
+             "their default), asr (Granite, Nemotron: the card's prompt; default), "
+             "and for Omni / Music Flamingo legacy (default), asr or lyrics (the "
+             "vendor's documented prompt for that task). Parakeet takes none.",
+    ),
+    dtype: str | None = typer.Option(
+        None,
+        "--dtype",
+        help="Compute dtype override: Whisper (float16 default, bfloat16, float32), "
+             "Parakeet, Canary and Music Flamingo (float32 default, bfloat16).",
     ),
 ):
     """
@@ -394,6 +406,8 @@ def transcribe_setup(
         adapter=adapter,
         auto_language=auto_language,
         deloop_max_run=deloop_max_run,
+        prompt_mode=prompt_mode,
+        dtype=dtype,
     )
 
 
@@ -711,40 +725,46 @@ def finetune_setup(
     val_dir: Path = typer.Option(
         None, "--val-dir", help="Directory containing validation songs (optional but recommended)"
     ),
-    batch_size: int = typer.Option(
-        None, "--batch-size", help="Training batch size (default: arch-dependent)"
+    batch_size: int = typer.Option(None, "--batch-size", help="Windows per device per micro-batch (default: arch-dependent)."),
+    global_batch: int = typer.Option(
+        None, "--global-batch", help="Windows per optimizer step; gradient accumulation makes up the rest (default: 64).",
     ),
-    max_epochs: int = typer.Option(
-        None, "--max-epochs", help="Maximum training epochs (default: from config)"
+    learning_rate: float = typer.Option(None, "--learning-rate", help="Peak learning rate (default: arch-dependent)."),
+    weight_decay: float = typer.Option(None, "--weight-decay", help="AdamW weight decay, not on biases or norms (default: 0.01)."),
+    schedule: str = typer.Option(
+        None, "--schedule",
+        help="LR schedule after warmup: wsd (constant, then a (1 − √) cooldown; default), cosine or linear.",
     ),
-    epochs_per_job: int = typer.Option(
-        None, "--epochs-per-job", help="Epochs to train per SLURM job (default: from config)"
+    warmup_steps: int = typer.Option(None, "--warmup-steps", help="Linear warmup steps (default: 200)."),
+    cooldown: float = typer.Option(
+        None, "--cooldown",
+        help="wsd: fraction of the run that cools down (default: 0.2; 0 = a constant-LR run to branch cooldowns from).",
     ),
-    learning_rate: float = typer.Option(
-        None, "--learning-rate", help="Peak learning rate (default: arch-dependent)"
+    min_lr: float = typer.Option(None, "--min-lr", help="cosine / linear: final learning rate (default: 0)."),
+    epochs: float = typer.Option(None, "--epochs", help="Run length in epochs, possibly fractional (default: 3)."),
+    max_steps: int = typer.Option(None, "--max-steps", help="Run length in optimizer steps (overrides --epochs)."),
+    keep: list[int] = typer.Option(None, "--keep", help="Step whose resumable checkpoint is kept (repeatable)."),
+    export_every_epoch: bool = typer.Option(False, "--export-every-epoch", help="Export an inference model at every epoch end."),
+    export_step: list[int] = typer.Option(None, "--export-step", help="Export an inference model at this step (repeatable)."),
+    no_export_final: bool = typer.Option(False, "--no-export-final", help="Don't export at the final step."),
+    resume_every: int = typer.Option(None, "--resume-every", help="Steps between rolling resume checkpoints (default: 500)."),
+    seed: int = typer.Option(None, "--seed", help="Run seed: window order, dither, masks, LoRA init (default: 0)."),
+    prompt_mode: str = typer.Option(
+        None, "--prompt-mode",
+        help="Training prompt, named as inference's --prompt-mode (e.g. shared, native, asr, lyrics); "
+             "recorded with every export, which inference then refuses to decode with another prompt.",
     ),
-    warmup_epochs: float = typer.Option(
-        None,
-        "--warmup-epochs",
-        help="Epochs (can be fractional) spent on linear LR warmup before cosine decay. Default: 5.",
+    adaptation: str = typer.Option(
+        None, "--adaptation",
+        help="full (default up to 2B) or nvidia_adapter (full-rank encoder + projector, LoRA on the LLM; "
+             "the default for Nemotron, Qwen3-Omni and Music Flamingo, and an option for Qwen3-ASR).",
     ),
-    no_augment: bool = typer.Option(
-        False, "--no-augment", help="Disable SpecAugment"
-    ),
-    batch_duration: float = typer.Option(
-        None,
-        "--batch-duration",
-        help="Canary-only: Lhotse batch duration in seconds (default: 1440; lower for <24GB GPUs)",
-    ),
+    no_augment: bool = typer.Option(False, "--no-augment", help="Disable SpecAugment"),
     freeze_encoder: bool = typer.Option(
-        False,
-        "--freeze-encoder",
-        help="Canary-only: freeze the encoder so only the decoder+head train (fits on 12-16 GB GPUs)",
+        False, "--freeze-encoder", help="Parakeet/Canary: freeze the encoder so only the decoder and joint/head train",
     ),
     eval_subset_size: int = typer.Option(
-        None,
-        "--eval-subset-size",
-        help="Fixed number of validation samples both Whisper and NeMo evaluate against each epoch (default: 200)",
+        None, "--eval-subset-size", help="Validation windows whose loss is computed at every export (default: 200)",
     ),
     windows_per_song: int = typer.Option(
         1,
@@ -811,42 +831,15 @@ def finetune_setup(
         None,
         "--manifests-from",
         help="Copy train/val/val-subset manifests from an existing "
-             "experiment instead of generating them (manifests are "
-             "model-agnostic). Manifest-construction flags are then ignored.",
+             "experiment (or a prepare-manifests set) instead of generating them "
+             "(manifests are model-agnostic). Manifest-construction flags are then ignored.",
     ),
     max_train_windows: int = typer.Option(
-        None,
-        "--max-train-windows",
-        min=1,
-        help="Train on a seeded random subset of this many windows. "
-             "Unset = the architecture default (Qwen3-Omni: 20000; others: "
-             "every window). Use --all-train-windows to train on every window.",
-    ),
-    all_train_windows: bool = typer.Option(
-        False,
-        "--all-train-windows",
-        help="Train on every manifest window even where the architecture "
-             "default is a subset.",
+        None, "--max-train-windows", min=1,
+        help="Train on a seeded random subset of this many windows. Unset = every window.",
     ),
     train_window_seed: int = typer.Option(
         0, "--train-window-seed", help="Seed for --max-train-windows sampling.",
-    ),
-    grad_accum: int = typer.Option(
-        None, "--grad-accum", min=1,
-        help="Gradient accumulation steps (default: arch-dependent).",
-    ),
-    save_steps: int = typer.Option(
-        None, "--save-steps", min=1,
-        help="Qwen only: optimizer steps between resumable step checkpoints "
-             "(default 500).",
-    ),
-    lora_rank: int = typer.Option(
-        None, "--lora-rank", min=1, help="Qwen3-Omni only: LoRA rank (default 16).",
-    ),
-    lora_targets: str = typer.Option(
-        None, "--lora-targets",
-        help="Qwen3-Omni only: 'attn' (q/k/v/o, default) or 'wide' "
-             "(+ MoE expert FFN gate/up/down).",
     ),
     exp_name: str = typer.Option(
         None, "--exp-name",
@@ -855,56 +848,25 @@ def finetune_setup(
     ),
 ):
     """
-    Setup a finetuning experiment with epoch-level checkpointing.
+    Set up a finetuning job: build (or copy) the manifests and fix the step plan.
 
-    Creates job directory with manifests and chunk files for SLURM processing.
-    Architecture is auto-detected from model name.
-
-    Pass multiple --filename flags to train on a random mix of audio types
-    (or a controlled mix with --audio-domain-mode).
+    Architecture is auto-detected from model name. Pass multiple --filename flags to
+    train on a random mix of audio types (or a controlled mix with --audio-domain-mode).
+    Train with ``finetune run``; continue a constant-LR run with ``finetune extend`` and
+    branch cooldowns off it with ``finetune branch``.
     """
     from lyricscribe.finetune import data as finetune_data
 
-    overrides = {
-        k: v
-        for k, v in {
-            "batch_size": batch_size,
-            "max_epochs": max_epochs,
-            "epochs_per_job": epochs_per_job,
-            "learning_rate": learning_rate,
-            "warmup_epochs": warmup_epochs,
-            "batch_duration": batch_duration,
-            "freeze_encoder": freeze_encoder if freeze_encoder else None,
-            "eval_subset_size": eval_subset_size,
-            "whisper_timestamp_prob": whisper_timestamp_prob,
-            "dedup_max_run": dedup_max_run if dedup_max_run else None,
-            "max_unlabeled_vocal_frac": max_unlabeled_vocal_frac,
-            "ref_selfwer_file": str(ref_selfwer_file) if ref_selfwer_file else None,
-            "max_ref_self_wer": max_ref_self_wer,
-            "use_alignment": not no_mfa_alignment,
-            "windows_per_song": windows_per_song,
-            "line_overlap_threshold": line_overlap_threshold,
-            "audio_domain_mode": audio_domain_mode,
-            "manifests_from": str(manifests_from) if manifests_from else None,
-            "max_train_windows": max_train_windows,
-            "train_window_seed": train_window_seed,
-            "grad_accum": grad_accum,
-            "save_steps": save_steps,
-            "lora_rank": lora_rank,
-            "lora_targets": lora_targets,
-            "exp_name": exp_name,
-        }.items()
-        if v is not None
-    }
     if audio_domain_mode and audio_domain_mode not in finetune_domains.AUDIO_DOMAIN_MODES:
         logger.error(f"--audio-domain-mode must be one of {finetune_domains.AUDIO_DOMAIN_MODES}")
         return
-    if lora_targets and lora_targets not in ("attn", "wide"):
-        logger.error("--lora-targets must be 'attn' or 'wide'")
-        return
-    if all_train_windows and max_train_windows:
-        logger.error("--all-train-windows and --max-train-windows are exclusive")
-        return
+    if prompt_mode is not None:
+        from lyricscribe.transcribe.job import backend_prompt_modes
+
+        modes = backend_prompt_modes(detect_architecture(model))
+        if prompt_mode not in modes:
+            logger.error(f"{model} has no prompt {prompt_mode!r}; expected one of {modes}")
+            return
 
     skip_song_ids: set[str] | None = None
     if max_ref_self_wer is not None:
@@ -930,21 +892,49 @@ def finetune_setup(
             output_dir=output_dir,
             filenames=filename,
             val_dir=val_dir,
+            batch_size=batch_size,
+            global_batch=global_batch,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+            schedule=schedule,
+            warmup_steps=warmup_steps,
+            cooldown=cooldown,
+            min_lr=min_lr,
+            epochs=epochs,
+            max_steps=max_steps,
+            keep_steps=keep or None,
+            export_steps=export_step or None,
+            export_every_epoch=export_every_epoch,
+            export_final=not no_export_final,
+            resume_every=resume_every,
+            seed=seed,
+            prompt_mode=prompt_mode,
+            adaptation=adaptation,
             use_augmentation=not no_augment,
-            **overrides,
+            freeze_encoder=freeze_encoder,
+            eval_subset_size=eval_subset_size,
+            whisper_timestamp_prob=whisper_timestamp_prob,
+            dedup_max_run=dedup_max_run or None,
+            max_unlabeled_vocal_frac=max_unlabeled_vocal_frac,
+            ref_selfwer_file=str(ref_selfwer_file) if ref_selfwer_file else None,
+            max_ref_self_wer=max_ref_self_wer,
+            use_alignment=not no_mfa_alignment,
+            windows_per_song=windows_per_song,
+            line_overlap_threshold=line_overlap_threshold,
+            audio_domain_mode=audio_domain_mode,
+            manifests_from=str(manifests_from) if manifests_from else None,
+            max_train_windows=max_train_windows,
+            train_window_seed=train_window_seed,
+            exp_name=exp_name,
         )
     except ValueError as e:
         logger.error(f"Invalid configuration: {e}")
         return
 
     logger.info(f"Experiment: {config['exp_name']}")
-    logger.info(f"Architecture: {config['architecture']} (auto-detected)")
+    logger.info(f"Architecture: {config['architecture']} (auto-detected), adaptation {config['adaptation']}")
     logger.info(f"Model: {config['base_model']}")
     logger.info(f"Filenames: {', '.join(config['filenames'])}")
-    logger.info(f"Epochs: {config['max_epochs']} (per job: {config['epochs_per_job']})")
-
-    if all_train_windows:
-        config["max_train_windows"] = None
 
     job_dir = Path(config['output_dir']) / config['exp_name']
     if (job_dir / "config.json").exists():
@@ -952,7 +942,6 @@ def finetune_setup(
         return
     job_dir.mkdir(parents=True, exist_ok=True)
     train_manifest = job_dir / "train_manifest.jsonl"
-    val_manifest = None
 
     if manifests_from:
         for name in ("train_manifest.jsonl", "val_manifest.jsonl", "val_subset_manifest.jsonl"):
@@ -961,8 +950,12 @@ def finetune_setup(
         if not train_manifest.exists():
             logger.error(f"No train_manifest.jsonl in {manifests_from}")
             return
-        if (job_dir / "val_subset_manifest.jsonl").exists():
-            val_manifest = job_dir / "val_manifest.jsonl"
+        # The copied manifest's recipe, not this command's (unused) construction flags.
+        source_keys = finetune_data.source_data_keys(manifests_from)
+        for key in finetune_data.DATA_KEYS:
+            if key in source_keys and key not in ("train_dir", "val_dir", "filenames"):
+                config[key] = source_keys[key]
+        config["manifest_data_keys"] = source_keys
         logger.info(f"Copied manifests from {manifests_from}")
     else:
         train_dataset = finetune_data.LyricsDataset(
@@ -989,7 +982,6 @@ def finetune_setup(
         )
         logger.info(f"Training: {n_train} chunks (synced-line segments)")
 
-        val_manifest = None
         if val_dir:
             val_dataset = finetune_data.LyricsDataset(
                 dataset_dir=val_dir,
@@ -1010,91 +1002,211 @@ def finetune_setup(
             )
             logger.info(f"Validation: {n_val} chunks")
 
-            subset_size = config.get("eval_subset_size", 200)
             val_subset_manifest = job_dir / "val_subset_manifest.jsonl"
             n_subset = finetune_data.write_subset_manifest(
-                val_manifest, val_subset_manifest, size=subset_size, seed=42,
+                val_manifest, val_subset_manifest, size=config["eval_subset_size"], seed=42,
             )
-            logger.info(f"Validation subset (used during training): {n_subset} chunks")
+            logger.info(f"Validation subset (scored at every export): {n_subset} chunks")
 
     if audio_domain_mode:
         config["audio_domain_windows"] = finetune_domains.apply_audio_domains(
             job_dir, config["filenames"], audio_domain_mode,
         )
 
-    if config.get("max_train_windows"):
-        with open(train_manifest) as f:
-            rows = [line for line in f if line.strip()]
-        k = config["max_train_windows"]
-        if k < len(rows):
-            rows = random.Random(config["train_window_seed"]).sample(rows, k)
-            shutil.copy2(train_manifest, job_dir / "train_manifest_full.jsonl")
-            with open(train_manifest, "w") as f:
-                f.writelines(rows)
-        logger.info(f"Training windows: {len(rows)} (max_train_windows={k})")
+    with open(train_manifest) as f:
+        rows = [line for line in f if line.strip()]
+    if config.get("max_train_windows") and config["max_train_windows"] < len(rows):
+        rows = random.Random(config["train_window_seed"]).sample(rows, config["max_train_windows"])
+        shutil.copy2(train_manifest, job_dir / "train_manifest_full.jsonl")
+        with open(train_manifest, "w") as f:
+            f.writelines(rows)
+        logger.info(f"Training windows: {len(rows)} (max_train_windows={config['max_train_windows']})")
 
-    finetune_jobs.setup_finetune_job(config, train_manifest, val_manifest)
-
-    num_chunks = (config['max_epochs'] + config['epochs_per_job'] - 1) // config['epochs_per_job']
-    logger.info(f"Job ready at {job_dir} ({num_chunks} chunks)")
+    try:
+        resolve_steps(config, len(rows))
+    except ValueError as e:
+        logger.error(str(e))
+        return
+    finetune_jobs.setup_finetune_job(config)
+    logger.info(
+        f"Job ready at {job_dir}: {config['max_steps']} steps ({config['steps_per_epoch']} per epoch), "
+        f"{config['schedule']} decaying from {config['decay_start']}, kept {config['keep_steps']}, "
+        f"exports at {config['export_steps'] + ([config['max_steps']] if config['export_final'] else [])}"
+    )
 
 
 @finetune_app.command("run")
 def finetune_run(
     job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
-    chunk_id: int = typer.Option(..., "--chunk-id", help="Chunk to process (1-based, for SLURM)"),
 ):
     """
-    Process one chunk (block of epochs) of a finetuning job.
-    
-    This is typically called from a SLURM job, not run directly.
+    Train a job to its final step, resuming from its latest checkpoint. Rerun it to
+    continue after a time limit.
     """
+    from lyricscribe.finetune import engine
     from lyricscribe.finetune import trainer as finetune_trainer
 
-    config_path = job_dir / "config.json"
-    if not config_path.exists():
-        logger.error(f"No config found at {config_path}")
+    if not (job_dir / "config.json").exists():
+        logger.error(f"No config found at {job_dir / 'config.json'}")
         return
+    config = load_finetune_config(job_dir)
+    if finetune_jobs.load_job_status(job_dir)["status"] == "complete":
+        logger.info(f"{job_dir} is already complete")
+        return
+    rank0 = engine.is_main_process()
+    if rank0:
+        finetune_jobs.set_status(job_dir, "running")
+    try:
+        result = finetune_trainer.run_job(config, job_dir)
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        if rank0:
+            finetune_jobs.set_status(job_dir, "failed")
+        raise
+    if rank0:
+        finetune_jobs.set_status(job_dir, "complete" if result["complete"] else "pending", result["global_step"])
+    logger.info(f"At step {result['global_step']} of {config['max_steps']} (complete={result['complete']})")
+
+
+@finetune_app.command("prepare-manifests")
+def finetune_prepare_manifests(
+    source: Path = typer.Argument(..., help="Experiment (or prepared) dir holding the manifests to copy."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Where to write the prepared manifest set."),
+    exclude_songs: Path = typer.Option(
+        None, "--exclude-songs", help="File of song ids (one per line) removed from training."
+    ),
+    repoint: str = typer.Option(None, "--repoint", help="Audio filename replacing each row's file name."),
+    whisper_segments: bool = typer.Option(
+        False, "--whisper-segments", help="Rebuild Whisper timestamp segments from each song's lyrics."
+    ),
+    whisper_model: str = typer.Option(
+        None, "--whisper-cap-model", help="Whisper tokenizer for dropping windows over its label cap (all families)."
+    ),
+    eval_exclude_songs: Path = typer.Option(
+        None, "--eval-exclude-songs", help="Validation song ids the eval-loss subset must avoid (e.g. tune300)."
+    ),
+    eval_subset_size: int = typer.Option(200, "--eval-subset-size", min=1),
+    eval_seed: int = typer.Option(42, "--eval-seed"),
+    recipe: list[str] = typer.Option(
+        None, "--recipe",
+        help="key=value data key the source config doesn't record (JSON value), e.g. use_alignment=false.",
+    ),
+):
+    """
+    Prepare one family-agnostic manifest set.
+    """
+    from lyricscribe.finetune import data as finetune_data
+
+    def read_ids(path: Path | None) -> set[str] | None:
+        """
+        Song ids listed one per line.
+
+        :param path: File, or ``None``.
+        :return: The ids, or ``None``.
+        """
+        return {line.strip() for line in path.read_text().splitlines() if line.strip()} if path else None
+
+    report = finetune_data.prepare_manifests(
+        source,
+        output_dir,
+        exclude_songs=read_ids(exclude_songs),
+        repoint=repoint,
+        whisper_segments=whisper_segments,
+        whisper_model=whisper_model,
+        eval_exclude_songs=read_ids(eval_exclude_songs),
+        eval_subset_size=eval_subset_size,
+        eval_seed=eval_seed,
+        recipe={k: json.loads(v) for k, v in (item.split("=", 1) for item in recipe or [])},
+    )
+    typer.echo(json.dumps(report, indent=2))
+
+
+@finetune_app.command("extend")
+def finetune_extend(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Constant-LR job dir (setup with --cooldown 0)."),
+    to_step: int = typer.Option(..., "--to", help="New final step."),
+    keep: list[int] = typer.Option(None, "--keep", help="Extra kept checkpoint step (repeatable)."),
+):
+    """
+    Continue a constant-LR run to a later final step.
+    """
+    from lyricscribe.finetune import engine
+
+    config = engine.extend_trunk(job_dir, to_step, keep)
+    finetune_jobs.write_status(job_dir, config, "pending", finetune_jobs.load_job_status(job_dir)["global_step"])
+    typer.echo(f"Runs to step {config['max_steps']}, keeping {config['keep_steps']}")
+
+
+@finetune_app.command("branch")
+def finetune_branch(
+    job_dir: Path = typer.Option(..., "--job-dir", help="Constant-LR job dir to branch from."),
+    name: str = typer.Option(..., "--name", help="Branch name (a job dir under <job-dir>/branches)."),
+    to_step: int = typer.Option(None, "--to", help="Final step of the branch."),
+    epoch: float = typer.Option(None, "--epoch", help="End the branch after this many epochs (instead of --to)."),
+    at_step: int = typer.Option(None, "--at", help="Kept checkpoint to branch from (default: --cooldown before the end)."),
+    cooldown: float = typer.Option(0.2, "--cooldown", help="Fraction of the branch's end step spent cooling down."),
+):
+    """
+    Branch a WSD cooldown off a kept checkpoint; the branch is a job of its own (train it with
+    ``finetune run``) that exports at its end.
+    """
+    from lyricscribe.finetune import engine
 
     config = load_finetune_config(job_dir)
-    status = finetune_jobs.load_job_status(job_dir)
-    config["current_epoch"] = status["current_epoch"]
+    if epoch is not None:
+        to_step = engine.epochs_to_steps(epoch, config["steps_per_epoch"])
+    if to_step is None:
+        logger.error("give --to or --epoch")
+        raise typer.Exit(1)
+    at = at_step if at_step is not None else engine.cooldown_start(to_step, cooldown)
+    typer.echo(str(engine.create_branch(job_dir, at, to_step, name)))
 
-    chunk_data = finetune_jobs.load_chunk_status(job_dir, chunk_id)
-    if chunk_data["status"] == "success":
-        logger.info(f"Chunk {chunk_id} already complete, skipping")
-        return
 
-    logger.info(f"Processing chunk {chunk_id}: epochs {chunk_data['start_epoch']} to {chunk_data['end_epoch']}")
+@finetune_app.command("throughput")
+def finetune_throughput(
+    model: str = typer.Option(..., "--model", help="Base model."),
+    manifest: Path = typer.Option(..., "--manifest", help="Training manifest."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="Scratch dir for the probe."),
+    batch_size: int = typer.Option(None, "--batch-size", help="Per-device windows (default: arch default)."),
+    global_batch: int = typer.Option(None, "--global-batch", help="Windows per optimizer step (default: 64)."),
+    steps: int = typer.Option(30, "--steps", min=10, help="Optimizer steps (the first 5 are not timed)."),
+    adaptation: str = typer.Option(None, "--adaptation", help="full or nvidia_adapter (default: the model's)."),
+):
+    """
+    Time training steps with the full training setup (optimizer, augmentation, precision).
+    """
+    import torch
 
-    train_manifest = job_dir / "train_manifest.jsonl"
-    val_subset = job_dir / "val_subset_manifest.jsonl"
-    val_full = job_dir / "val_manifest.jsonl"
-    if val_subset.exists():
-        val_manifest = val_subset
-    elif val_full.exists():
-        val_manifest = val_full
-    else:
-        val_manifest = None
+    from lyricscribe.finetune import engine
+    from lyricscribe.finetune import trainer as finetune_trainer
 
-    try:
-        result = finetune_trainer.run_training_job(
-            config, train_manifest, val_manifest,
-            chunk_end_epoch=chunk_data["end_epoch"],
-        )
-        
-        if result["status"] == "complete":
-            logger.info("Training already complete!")
-            finetune_jobs.update_chunk_status(job_dir, chunk_id, "success")
-        else:
-            checkpoint_path = result.get("checkpoint_path")
-            finetune_jobs.update_chunk_status(job_dir, chunk_id, "success")
-            logger.info(f"Chunk {chunk_id} complete: checkpoint at {checkpoint_path}")
-    
-    except Exception as e:
-        logger.error(f"Chunk {chunk_id} failed: {e}")
-        finetune_jobs.update_chunk_status(job_dir, chunk_id, "failed")
-        raise
+    config = create_finetune_config(
+        base_model=model, train_dir=manifest.parent, output_dir=output_dir, filenames=["probe"],
+        exp_name="throughput", batch_size=batch_size, global_batch=global_batch, max_steps=steps, adaptation=adaptation,
+    )
+    with open(manifest) as f:
+        n_windows = sum(1 for line in f if line.strip())
+    resolve_steps(config, n_windows)
+    config["train_manifest"] = str(manifest)
+    job_dir = output_dir / "throughput"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    result = finetune_trainer.run_job(config, job_dir, save=False)
+    sps = result["seconds_per_step"]
+    gpus = engine.world_size()
+    per_epoch = engine.steps_per_epoch(n_windows, config["global_batch"])
+    summary = {
+        "model": model,
+        "per_device": config["batch_size"],
+        "global_batch": config["global_batch"],
+        "gpus": gpus,
+        "seconds_per_step": sps,
+        "steps_per_epoch": per_epoch,
+        "gpu_hours_per_epoch": None if sps is None else sps * per_epoch * gpus / 3600,
+        "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else None,
+    }
+    if engine.is_main_process():
+        (job_dir / "throughput.json").write_text(json.dumps(summary, indent=2))
+    typer.echo(json.dumps(summary, indent=2))
 
 
 @finetune_app.command("inspect")
@@ -1102,70 +1214,51 @@ def finetune_inspect(
     job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
 ):
     """
-    Inspect finetuning job details and processing statistics.
+    Show a job's progress, exports and metrics.
     """
     if not (job_dir / "status.json").exists():
         logger.error(f"No job found at {job_dir}")
         return
-    
     finetune_jobs.show_job_stats(job_dir)
 
 
 @finetune_app.command("reset")
 def finetune_reset(
     job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
+    force: bool = typer.Option(False, "--force", help="Confirm deleting the job's checkpoints, exports and state."),
 ):
     """
-    Reset a finetuning job to start from scratch.
-    
-    Deletes all checkpoints and resets chunk statuses.
+    Reset a finetuning job to start from scratch (refused while branches link to its checkpoints).
     """
     if not (job_dir / "status.json").exists():
         logger.error(f"No job found at {job_dir}")
         return
-    
-    finetune_jobs.reset_job(job_dir)
-    logger.info(f"Job reset: {job_dir}")
-    logger.info(f"Run training again with: lyricscribe finetune run --job-dir {job_dir} --chunk-id 1")
+    if not force:
+        logger.error(f"reset deletes {job_dir}'s checkpoints, exports and training state; pass --force to confirm")
+        return
+    try:
+        finetune_jobs.reset_job(job_dir)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return
+    logger.info(f"Run training again with: lyricscribe finetune run --job-dir {job_dir}")
 
 
 @finetune_app.command("retry")
 def finetune_retry(
     job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
-    chunk_id: int = typer.Option(None, "--chunk-id", help="Specific chunk to retry (default: all failed chunks)"),
 ):
     """
-    Reset failed chunks back to pending so they can be re-run.
-
-    Without ``--chunk-id``, resets every failed chunk in the experiment.
-    With ``--chunk-id``, resets only that specific chunk.
-
-    Use this after fixing a bug to re-run failed chunks without losing
-    successful checkpoints.
+    Mark a failed job pending again; its checkpoints are kept, so the next run resumes.
     """
     if not (job_dir / "status.json").exists():
         logger.error(f"No job found at {job_dir}")
         return
-
-    if chunk_id is not None:
-        chunk_path = job_dir / "chunks" / f"chunk_{chunk_id}.json"
-        if not chunk_path.exists():
-            logger.error(f"Chunk {chunk_id} not found at {chunk_path}")
-            return
-
-        chunk_data = finetune_jobs.load_chunk_status(job_dir, chunk_id)
-        if chunk_data["status"] == "success":
-            logger.error(f"Chunk {chunk_id} already succeeded — use 'reset' to start over")
-            return
-
-        finetune_jobs.update_chunk_status(job_dir, chunk_id, "pending")
-        logger.info(f"Chunk {chunk_id} reset to pending")
-    else:
-        n = finetune_jobs.reset_failed_chunks(job_dir)
-        if n == 0:
-            logger.info(f"No failed chunks in {job_dir.name}")
-        else:
-            logger.info(f"Reset {n} failed chunks in {job_dir.name} to pending")
+    if finetune_jobs.load_job_status(job_dir)["status"] != "failed":
+        logger.info(f"{job_dir.name} has not failed")
+        return
+    finetune_jobs.set_status(job_dir, "pending")
+    logger.info(f"{job_dir.name} reset to pending")
 
 
 @finetune_app.command("retry-all")
@@ -1173,29 +1266,18 @@ def finetune_retry_all(
     experiments_dir: Path = typer.Option(..., "--experiments-dir", help="Directory containing experiment subdirectories"),
 ):
     """
-    Reset all failed chunks across every experiment in a directory.
-
-    This is the "I just deployed a fix, retry everything" button. It
-    leaves successful chunks and existing checkpoints alone.
+    Mark every failed job in a directory pending again.
     """
     if not experiments_dir.exists():
         logger.error(f"Directory not found: {experiments_dir}")
         return
-
-    total_reset = 0
-    total_experiments = 0
-    for job_dir in sorted(experiments_dir.iterdir()):
-        if not job_dir.is_dir():
-            continue
-        if not (job_dir / "status.json").exists():
-            continue
-        total_experiments += 1
-        n = finetune_jobs.reset_failed_chunks(job_dir)
-        if n > 0:
-            logger.info(f"  {job_dir.name}: reset {n} chunks")
-            total_reset += n
-
-    logger.info(f"Reset {total_reset} chunks across {total_experiments} experiments")
+    n = 0
+    for job_dir in sorted(p for p in experiments_dir.iterdir() if (p / "status.json").exists()):
+        if finetune_jobs.load_job_status(job_dir)["status"] == "failed":
+            finetune_jobs.set_status(job_dir, "pending")
+            logger.info(f"  {job_dir.name}: reset")
+            n += 1
+    logger.info(f"Reset {n} failed jobs")
 
 
 @finetune_app.command("status")
@@ -1203,43 +1285,22 @@ def finetune_status(
     experiments_dir: Path = typer.Option(..., "--experiments-dir", help="Directory containing experiment subdirectories"),
 ):
     """
-    Print a one-line summary of every experiment's progress.
-
-    Shows chunk counts, last checkpoint, and last metric values for
-    each experiment in the directory.
+    Print a one-line summary of every job in a directory.
     """
     if not experiments_dir.exists():
         logger.error(f"Directory not found: {experiments_dir}")
         return
-
-    rows = []
-    for job_dir in sorted(experiments_dir.iterdir()):
-        if not job_dir.is_dir():
-            continue
-        if not (job_dir / "status.json").exists():
-            continue
-        rows.append(finetune_jobs.gather_experiment_status(job_dir))
-
+    rows = [finetune_jobs.gather_experiment_status(p) for p in sorted(experiments_dir.iterdir())
+            if (p / "status.json").exists()]
     if not rows:
         logger.info(f"No experiments found in {experiments_dir}")
         return
-
-    name_width = max(len(r["exp_name"]) for r in rows)
+    width = max(len(r["exp_name"]) for r in rows)
     for r in rows:
-        c = r["chunks"]
-        ckpt = r["last_checkpoint"] or "none"
-        chunks_str = f"{c['success']}✓ {c['failed']}✗ {c['running']}▶ {c['pending']}⏸"
-        loss_str = ""
-        if r["last_metrics"]:
-            for k in ("train_loss", "loss", "eval_loss"):
-                if k in r["last_metrics"]:
-                    loss_str = f" {k}={r['last_metrics'][k]:.3f}"
-                    break
-        logger.info(
-            f"  {r['exp_name']:<{name_width}}  "
-            f"{r['current_epoch']:>2}/{r['max_epochs']} epochs  "
-            f"chunks={chunks_str}  ckpt={ckpt}{loss_str}"
-        )
+        metrics = r["last_metrics"] or {}
+        loss = next((f" {k}={metrics[k]:.3f}" for k in ("eval_loss", "train_loss") if k in metrics), "")
+        logger.info(f"  {r['exp_name']:<{width}}  step {r['global_step']:>6}/{r['max_steps']:<6}  {r['status']:<8}  "
+                    f"export={r['last_export'] or 'none'}{loss}")
 
 
 @finetune_app.command("tune-batch")
@@ -1278,17 +1339,13 @@ def finetune_tune_batch(
     start: int = typer.Option(
         1,
         "--start",
-        help="Smallest value to try. For Whisper/Parakeet this is "
-             "batch_size (samples); for Canary it is batch_duration "
-             "(seconds of audio per batch). Values outside the default "
-             "per-architecture candidate list are filtered out.",
+        help="Smallest batch_size to try. Values outside the candidate "
+             "list are filtered out.",
     ),
     max_bs: int = typer.Option(
-        2400,
+        128,
         "--max",
-        help="Largest value to try. Default covers Canary's full "
-             "duration range up to 2400s; Whisper/Parakeet candidates "
-             "cap at 128 regardless.",
+        help="Largest batch_size to try.",
     ),
     safety_margin_pct: float = typer.Option(
         15.0,
@@ -1357,45 +1414,29 @@ def finetune_tune_batch(
 @finetune_app.command("export-model")
 def finetune_export(
     job_dir: Path = typer.Option(..., "--job-dir", help="Path to job directory"),
-    output_path: Path = typer.Option(..., "--output", help="Path to save exported model"),
-    epoch: int = typer.Option(None, "--epoch", help="Epoch to export (default: latest)"),
+    output_path: Path = typer.Option(..., "--output", help="Path to copy the export to"),
+    step: int = typer.Option(None, "--step", help="Export step to copy (default: latest)"),
 ):
     """
-    Export a checkpoint for use in transcription.
+    Copy one of a job's inference exports (``exports/step_<N>``) elsewhere.
 
-    Defaults to the latest checkpoint. Use --epoch to pick a specific one.
-    Use 'lyricscribe finetune inspect' to see available checkpoints and metrics.
+    Use 'lyricscribe finetune inspect' to see the available exports and metrics.
     """
-    config = load_finetune_config(job_dir)
-
-    if epoch is not None:
-        checkpoint = get_checkpoint_for_epoch(job_dir, config, epoch)
-        if not checkpoint:
-            logger.error(f"No checkpoint found for epoch {epoch}")
-            available = list_checkpoints(job_dir, config)
-            if available:
-                epochs_str = ", ".join(str(e) for e, _ in available)
-                logger.error(f"Available epochs: {epochs_str}")
-            return
-    else:
-        checkpoint = get_latest_checkpoint(job_dir, config)
-        if not checkpoint:
-            logger.error("No checkpoints found!")
-            return
-
+    exports = dict(list_exports(job_dir))
+    if not exports:
+        logger.error(f"{job_dir} has no exports yet")
+        return
+    if step is None:
+        step = max(exports)
+    if step not in exports:
+        logger.error(f"No export at step {step}; available: {sorted(exports)}")
+        return
     if output_path.exists():
         logger.error(f"Output path already exists: {output_path}")
-        logger.error("Remove it manually before exporting.")
         return
-
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if checkpoint.suffix == ".nemo":
-        shutil.copy(checkpoint, output_path)
-    else:
-        shutil.copytree(checkpoint, output_path)
-
-    logger.info(f"Model exported: {checkpoint} -> {output_path}")
+    shutil.copytree(exports[step], output_path)
+    logger.info(f"Model exported: {exports[step]} -> {output_path}")
     logger.info(f"Use with: lyricscribe transcribe setup --model {output_path}")
 
 

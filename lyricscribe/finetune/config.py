@@ -11,15 +11,25 @@ def detect_architecture(model_name: str) -> str:
     Map a model identifier to its architecture name.
 
     :param model_name: Model identifier (e.g. ``nvidia/parakeet-tdt-0.6b-v3``).
-    :return: One of ``"whisper"``, ``"canary"``, ``"parakeet"``,
-        ``"qwen3_asr"``, ``"qwen3_omni"``.
+    :return: One of ``"whisper"``, ``"canary"``, ``"parakeet"``, ``"qwen3_asr"``,
+        ``"qwen3_omni"``, ``"nemotron"``, ``"cohere"``, ``"granite"``, ``"musicflamingo"``.
     :raises ValueError: If the name doesn't match any known architecture.
     """
     name = model_name.lower().replace("_", "-")
+    if "nemotron-3.5-transcribe" in name:
+        return "nemotron"
+    if "cohere-transcribe" in name:
+        return "cohere"
     if "qwen3-asr" in name:
         return "qwen3_asr"
     if "qwen3-omni" in name:
         return "qwen3_omni"
+    if "music-flamingo" in name or "musicflamingo" in name:
+        return "musicflamingo"
+    if "granite-speech" in name:
+        if "nar" in name or "ctc" in name:
+            raise ValueError(f"{model_name}: only the Granite Speech LLM is trainable here")
+        return "granite"
     if "whisper" in name:
         return "whisper"
     if "canary" in name:
@@ -28,20 +38,30 @@ def detect_architecture(model_name: str) -> str:
         return "parakeet"
     raise ValueError(
         f"Cannot detect architecture from model name '{model_name}'. "
-        "Model name must contain 'whisper', 'canary', 'parakeet', "
-        "'qwen3-asr' or 'qwen3-omni'."
+        "Model name must contain 'whisper', 'canary', 'parakeet', 'qwen3-asr', "
+        "'qwen3-omni', 'nemotron-3.5-transcribe', 'cohere-transcribe', 'granite-speech' "
+        "or 'music-flamingo'."
     )
 
 
 _CONFIG_KEYS = {
     "exp_name",
     "batch_size",
-    "max_epochs",
-    "epochs_per_job",
+    "global_batch",
     "learning_rate",
-    "warmup_epochs",
+    "weight_decay",
+    "schedule",
+    "warmup_steps",
+    "cooldown",
+    "min_lr",
+    "epochs",
+    "max_steps",
+    "keep_steps",
+    "export_steps",
+    "export_every_epoch",
+    "export_final",
+    "resume_every",
     "use_augmentation",
-    "batch_duration",
     "freeze_encoder",
     "eval_subset_size",
     "whisper_timestamp_prob",
@@ -52,27 +72,35 @@ _CONFIG_KEYS = {
     "line_overlap_threshold",
     "ref_selfwer_file",
     "max_ref_self_wer",
-    "grad_accum",
-    "save_steps",
-    "lora_rank",
-    "lora_targets",
     "max_train_windows",
     "train_window_seed",
     "audio_domain_mode",
     "manifests_from",
+    "seed",
+    "prompt_mode",
+    "adaptation",
+    "base_dtype",
+    "gradient_checkpointing",
+    "num_workers",
 }
 
+# Per-device batch (gradient accumulation makes up the global batch) and default LR.
 _ARCH_DEFAULTS = {
-    "qwen3_asr": {
-        "batch_size": 4, "grad_accum": 4, "max_epochs": 3, "epochs_per_job": 3,
-        "learning_rate": 3e-5, "warmup_epochs": 0.09, "save_steps": 500,
-    },
-    "qwen3_omni": {
-        "batch_size": 1, "grad_accum": 16, "max_epochs": 1, "epochs_per_job": 1,
-        "learning_rate": 1e-4, "warmup_epochs": 0.03, "save_steps": 500,
-        "lora_rank": 16, "lora_targets": "attn", "max_train_windows": 20000,
-    },
+    "whisper": {"batch_size": 16, "learning_rate": 1e-5},
+    "parakeet": {"batch_size": 4, "learning_rate": 3.16e-5},
+    "canary": {"batch_size": 16, "learning_rate": 3.16e-5},
+    "cohere": {"batch_size": 8, "learning_rate": 3.16e-5},
+    "qwen3_asr": {"batch_size": 4, "learning_rate": 3.16e-5},
+    "granite": {"batch_size": 1, "learning_rate": 3.16e-5},
+    "nemotron": {"batch_size": 1, "learning_rate": 1e-4},
+    "qwen3_omni": {"batch_size": 1, "learning_rate": 1e-4},
+    "musicflamingo": {"batch_size": 1, "learning_rate": 1e-4},
 }
+
+ADAPTATIONS = ("full", "nvidia_adapter")
+# Models that only train with the NVIDIA adapter recipe; Qwen3-ASR can train either way.
+ADAPTER_ARCHITECTURES = ("nemotron", "qwen3_omni", "musicflamingo")
+ADAPTER_LR = 1e-4
 
 
 def create_finetune_config(
@@ -84,17 +112,18 @@ def create_finetune_config(
     **kwargs,
 ) -> dict:
     """
-    Create a finetuning job configuration dictionary.
+    Create a finetuning job configuration dictionary. The run length is resolved by
+    :func:`resolve_steps` once the training manifest exists.
 
-    Architecture is auto-detected from model name.
-
-    :param base_model: Model identifier (e.g., "nvidia/parakeet-tdt-0.6b-v3")
-    :param train_dir: Directory with training songs
-    :param output_dir: Directory for experiment outputs
-    :param filenames: Audio filenames to train on (multiple = random mix)
-    :param val_dir: Directory with validation songs (optional)
-    :param kwargs: Additional config parameters
-    :return: Configuration dictionary
+    :param base_model: Model identifier (e.g., "nvidia/parakeet-tdt-0.6b-v3"); the architecture
+        is detected from it.
+    :param train_dir: Directory with training songs.
+    :param output_dir: Directory for experiment outputs.
+    :param filenames: Audio filenames to train on (multiple = random mix).
+    :param val_dir: Directory with validation songs (optional).
+    :param kwargs: Settings from :data:`_CONFIG_KEYS`.
+    :return: Configuration dictionary.
+    :raises ValueError: On unknown keys or an adaptation the model can't train with.
     """
     if not filenames:
         raise ValueError("At least one --filename is required")
@@ -103,34 +132,55 @@ def create_finetune_config(
         raise ValueError(f"Unknown finetune config keys: {sorted(unknown)}")
 
     architecture = detect_architecture(base_model)
-    kwargs = {**_ARCH_DEFAULTS.get(architecture, {}), **kwargs}
+    adaptation = kwargs.get("adaptation") or ("nvidia_adapter" if architecture in ADAPTER_ARCHITECTURES else "full")
+    if adaptation not in ADAPTATIONS:
+        raise ValueError(f"adaptation must be one of {ADAPTATIONS}, got {adaptation!r}")
+    allowed = ("nvidia_adapter",) if architecture in ADAPTER_ARCHITECTURES else (
+        ADAPTATIONS if architecture == "qwen3_asr" else ("full",))
+    if adaptation not in allowed:
+        raise ValueError(f"{architecture} trains with {allowed}, not {adaptation!r}")
+    defaults = dict(_ARCH_DEFAULTS.get(architecture, {}))
+    if adaptation == "nvidia_adapter":
+        defaults["learning_rate"] = ADAPTER_LR
+    kwargs = {**defaults, **{k: v for k, v in kwargs.items() if v is not None}}
+    schedule = kwargs.get("schedule", "wsd")
+    if schedule not in ("wsd", "cosine", "linear"):
+        raise ValueError(f"schedule must be wsd, cosine or linear, got {schedule!r}")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    arch_short = {"qwen3_asr": "qasr", "qwen3_omni": "qomni"}.get(architecture, architecture[:3].lower())
+    arch_short = {"qwen3_asr": "qasr", "qwen3_omni": "qomni", "nemotron": "ntron"}.get(
+        architecture, architecture[:3].lower()
+    )
     filenames_short = "_".join(Path(f).stem for f in filenames)
-    exp_name = kwargs.get("exp_name") if kwargs.get("exp_name") else f"{arch_short}_{filenames_short}_{timestamp}"
-
-    default_lr = {
-        "whisper": 1e-5,
-        "canary": 1e-5,
-        "parakeet": 5e-5,
-    }.get(architecture)
+    exp_name = kwargs.get("exp_name") or f"{arch_short}_{filenames_short}_{timestamp}"
 
     config = {
         "architecture": architecture,
         "base_model": base_model,
+        "adaptation": adaptation,
         "train_dir": str(train_dir),
         "val_dir": str(val_dir) if val_dir else None,
         "output_dir": str(output_dir),
         "exp_name": exp_name,
         "filenames": filenames,
-        "batch_size": kwargs.get("batch_size", 16 if architecture == "parakeet" else 24),
-        "max_epochs": kwargs.get("max_epochs", 10),
-        "epochs_per_job": kwargs.get("epochs_per_job", 5 if architecture == "whisper" else 3),
-        "learning_rate": kwargs.get("learning_rate", default_lr),
-        "warmup_epochs": kwargs.get("warmup_epochs", 5),
+        "batch_size": kwargs.get("batch_size", 16),
+        "global_batch": kwargs.get("global_batch", 64),
+        "learning_rate": kwargs.get("learning_rate"),
+        "weight_decay": kwargs.get("weight_decay", 0.01),
+        "schedule": schedule,
+        "warmup_steps": kwargs.get("warmup_steps", 200),
+        # WSD: the last fraction of the run that decays (0 = a constant-LR trunk to branch from).
+        "cooldown": kwargs.get("cooldown", 0.2),
+        "min_lr": kwargs.get("min_lr", 0.0),
+        "epochs": kwargs.get("epochs", 3),
+        "max_steps": kwargs.get("max_steps"),
+        "keep_steps": sorted(set(kwargs.get("keep_steps") or [])),
+        "export_steps": sorted(set(kwargs.get("export_steps") or [])),
+        "export_every_epoch": kwargs.get("export_every_epoch", False),
+        "export_final": kwargs.get("export_final", True),
+        "resume_every": kwargs.get("resume_every", 500),
+        "seed": kwargs.get("seed", 0),
         "use_augmentation": kwargs.get("use_augmentation", True),
-        "batch_duration": kwargs.get("batch_duration", 1440),
         "freeze_encoder": kwargs.get("freeze_encoder", False),
         "eval_subset_size": kwargs.get("eval_subset_size", 200),
         # Fraction of Whisper samples trained with timestamp labels.
@@ -154,22 +204,48 @@ def create_finetune_config(
         # Random training-window subset (None = every manifest window).
         "max_train_windows": kwargs.get("max_train_windows"),
         "train_window_seed": kwargs.get("train_window_seed", 0),
-        "grad_accum": kwargs.get("grad_accum", 1),
-        "save_steps": kwargs.get("save_steps", 2000),
-        "current_epoch": 0,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    if architecture == "qwen3_omni":
-        config["lora_rank"] = kwargs.get("lora_rank", 16)
-        config["lora_targets"] = kwargs.get("lora_targets", "attn")
+    for key in ("prompt_mode", "base_dtype", "gradient_checkpointing", "num_workers"):
+        if key in kwargs:
+            config[key] = kwargs[key]
+    return config
 
+
+def resolve_steps(config: dict, n_windows: int) -> dict:
+    """
+    Fix the run's step plan from the training manifest's size: steps per epoch, the final
+    step, the WSD decay start and the export steps.
+
+    :param config: Config from :func:`create_finetune_config`.
+    :param n_windows: Training windows.
+    :return: *config*, updated.
+    :raises ValueError: If the manifest is smaller than one global batch.
+    """
+    from lyricscribe.finetune.engine import cooldown_start, epochs_to_steps, steps_per_epoch
+
+    spe = steps_per_epoch(n_windows, int(config["global_batch"]))
+    if spe < 1:
+        raise ValueError(f"{n_windows} windows is less than one global batch of {config['global_batch']}")
+    max_steps = int(config["max_steps"] or epochs_to_steps(config["epochs"], spe))
+    exports = set(config["export_steps"])
+    if config["export_every_epoch"]:
+        exports |= {e * spe for e in range(1, max_steps // spe + 1)}
+    config.update({
+        "steps_per_epoch": spe,
+        "max_steps": max_steps,
+        "decay_start": (
+            cooldown_start(max_steps, config["cooldown"]) if config["schedule"] == "wsd" and config["cooldown"] else None
+        ),
+        "export_steps": sorted(x for x in exports if x < max_steps),
+    })
     return config
 
 
 def load_finetune_config(job_dir: Path) -> dict:
     """
     Load finetune config from job directory.
-    
+
     :param job_dir: Path to job directory
     :return: Configuration dictionary
     """
@@ -177,80 +253,14 @@ def load_finetune_config(job_dir: Path) -> dict:
         return json.load(f)
 
 
-def get_latest_checkpoint(job_dir: Path, config: dict) -> Path | None:
+def list_exports(job_dir: Path) -> list[tuple[int, Path]]:
     """
-    Find the latest checkpoint in job directory.
-    
-    :param job_dir: Path to job directory
-    :param config: Job configuration
-    :return: Path to latest checkpoint or None
+    The job's inference exports, by step.
+
+    :param job_dir: Job directory.
+    :return: ``(step, path)`` pairs, oldest first.
     """
-    ckpt_dir = Path(config["output_dir"]) / config["exp_name"] / "checkpoints"
-    if not ckpt_dir.exists():
-        return None
-
-    checkpoints = list({
-        p for p in ckpt_dir.iterdir()
-        if p.name.startswith("epoch_")
-    })
-    if not checkpoints:
-        return None
-    
-    def epoch_from_path(p: Path) -> int:
-        """
-        Epoch number of an ``epoch_N`` checkpoint, or -1.
-
-        :param p: Checkpoint path.
-        :return: The epoch.
-        """
-        try:
-            return int(p.stem.split("_")[1])
-        except (IndexError, ValueError):
-            return -1
-    
-    return max(checkpoints, key=epoch_from_path)
-
-
-def get_checkpoint_for_epoch(job_dir: Path, config: dict, epoch: int) -> Path | None:
-    """
-    Find the checkpoint for a specific epoch.
-
-    :param job_dir: Path to job directory
-    :param config: Job configuration
-    :param epoch: Epoch number to find
-    :return: Path to checkpoint or None
-    """
-    ckpt_dir = Path(config["output_dir"]) / config["exp_name"] / "checkpoints"
-    if not ckpt_dir.exists():
-        return None
-
-    for candidate in ckpt_dir.iterdir():
-        if candidate.name == f"epoch_{epoch}" or candidate.stem == f"epoch_{epoch}":
-            return candidate
-
-    return None
-
-
-def list_checkpoints(job_dir: Path, config: dict) -> list[tuple[int, Path]]:
-    """
-    List all available checkpoints sorted by epoch.
-
-    :return: List of (epoch, path) tuples
-    :param job_dir: Path to job directory
-    :param config: Job configuration
-    """
-    ckpt_dir = Path(config["output_dir"]) / config["exp_name"] / "checkpoints"
-    if not ckpt_dir.exists():
+    root = job_dir / "exports"
+    if not root.is_dir():
         return []
-
-    results = []
-    for p in ckpt_dir.iterdir():
-        if not p.name.startswith("epoch_"):
-            continue
-        try:
-            epoch = int(p.stem.split("_")[1])
-            results.append((epoch, p))
-        except (IndexError, ValueError):
-            continue
-
-    return sorted(results, key=lambda x: x[0])
+    return sorted((int(p.name.split("_")[1]), p) for p in root.glob("step_*") if p.is_dir())

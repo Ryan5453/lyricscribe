@@ -16,29 +16,6 @@ logger = logging.getLogger(__name__)
 
 _BATCH_SIZE_CANDIDATES: tuple[int, ...] = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128)
 
-# Canary batches by duration (Lhotse), so sweep batch_duration in seconds.
-_BATCH_DURATION_CANDIDATES: tuple[int, ...] = (60, 120, 300, 600, 900, 1200, 1440, 1800, 2400)
-
-
-def _candidates_for(architecture: str) -> tuple[int, ...]:
-    """
-    Sweep stops for the batch knob of *architecture*.
-
-    :param architecture: Detected architecture.
-    :return: Candidate values in ascending order.
-    """
-    return _BATCH_DURATION_CANDIDATES if architecture == "canary" else _BATCH_SIZE_CANDIDATES
-
-
-def _param_label(architecture: str) -> str:
-    """
-    Name of the batch knob being swept, for printing.
-
-    :param architecture: Detected architecture.
-    :return: The label.
-    """
-    return "batch_duration (s)" if architecture == "canary" else "batch_size"
-
 
 def _build_shared_manifest(
     dataset_dir: Path,
@@ -47,7 +24,7 @@ def _build_shared_manifest(
     work_dir: Path,
 ) -> Path:
     """
-    Build one NeMo manifest from real audio + ``lyrics.json`` under
+    Build one training manifest from real audio + ``lyrics.json`` under
     *dataset_dir*, shared across all trials. One window per song is
     enough for the probe — the manifest's only job is to supply the
     dataloader with representative real samples.
@@ -94,7 +71,7 @@ def _run_trial(
 
     :param manifest: Shared probe manifest.
     :param model_name: Base model hub id or path.
-    :param bs: Batch value to try (``batch_duration`` seconds for Canary).
+    :param bs: Per-rank batch_size to try.
     :param freeze_encoder: Freeze the encoder.
     :param max_duration_s: Per-sample audio cap.
     :param num_gpus: DDP world size.
@@ -221,10 +198,10 @@ def tune_batch_size(
     :return: Per-trial result dicts, one per attempted batch size.
     """
     architecture = detect_architecture(model_name)
-    candidates = [b for b in _candidates_for(architecture) if start <= b <= max_bs]
+    candidates = [b for b in _BATCH_SIZE_CANDIDATES if start <= b <= max_bs]
     if not candidates:
         logger.error(
-            f"No {_param_label(architecture)} candidates in [{start}, {max_bs}]"
+            f"No batch_size candidates in [{start}, {max_bs}]"
         )
         return []
 
@@ -234,7 +211,6 @@ def tune_batch_size(
     print(f"  dataset_dir    = {dataset_dir}")
     print(f"  filename       = {filename}")
     print(f"  model          = {model_name}  ({architecture})")
-    print(f"  sweeping       = {_param_label(architecture)}")
     print(f"  freeze_encoder = {freeze_encoder}")
     print(f"  max_duration_s = {max_duration_s}")
     print(f"  num_gpus (DDP) = {num_gpus}")
