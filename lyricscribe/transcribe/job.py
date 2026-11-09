@@ -178,7 +178,7 @@ def _create_transcriber(model_name: str, batch_size: int, config: dict | None = 
     if prompt_mode not in (None, "native"):
         raise ValueError(f"{backend} takes no prompt; got prompt_mode {prompt_mode!r}")
     if backend == "parakeet":
-        return ParakeetTranscriber(model_name, batch_size, dtype=config.get("dtype"))
+        return ParakeetTranscriber(model_name, batch_size, dtype=config.get("dtype"), max_new_tokens=max_new_tokens)
     raise ValueError(f"Unknown backend {backend!r}; expected one of {BACKENDS}")
 
 

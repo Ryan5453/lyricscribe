@@ -2,87 +2,42 @@ import logging
 
 import numpy as np
 import torch
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    ParakeetForTDT,
-)
+from transformers import AutoConfig, AutoProcessor, ParakeetForTDT
 
 from lyricscribe.transcribe.adapter import check_train_record
-from lyricscribe.transcribe.base import ChunkTranscriber, Decode
+from lyricscribe.transcribe.base import DECODE_KNOBS, MAX_NEW_TOKENS, ChunkTranscriber, Decode
 from lyricscribe.transcribe.chunking import SAMPLE_RATE
+from lyricscribe.transcribe.tdt import TDTDecoder
 
 logger = logging.getLogger(__name__)
-
-class NeMoGreedyParakeetForTDT(ParakeetForTDT):
-    """
-    ``ParakeetForTDT`` whose greedy decoding applies NeMo's per-frame symbol
-    cap: after ``max_symbols_per_step`` labels at the same encoder frame, the
-    frame pointer is forced one frame on. transformers' TDT generation skips
-    this guard (its RNN-T generation has it), so a run of duration-0 labels can
-    grow unbounded at one frame.
-    """
-
-    def generate(self, *args, **kwargs):
-        """
-        Greedy TDT decoding with the per-frame symbol cap.
-
-        :param args: ``generate`` positional arguments.
-        :param kwargs: ``generate`` keyword arguments.
-        :return: ``ParakeetRNNTGenerateOutput`` with ``sequences`` and ``durations``.
-        """
-        self._labels_at_frame = None
-        try:
-            return super().generate(*args, **kwargs)
-        finally:
-            del self._labels_at_frame
-
-    def _update_model_kwargs_for_generation(self, outputs, *args, **kwargs):
-        """
-        Advance by the predicted duration, then by one more frame wherever the
-        current frame has reached the symbol cap.
-
-        :param outputs: Model outputs for this step.
-        :param args: Base-class positional arguments.
-        :param kwargs: Base-class keyword arguments.
-        :return: The updated model kwargs.
-        """
-        model_kwargs = super()._update_model_kwargs_for_generation(outputs, *args, **kwargs)
-        tokens = outputs.logits[:, -1, : self.config.vocab_size].argmax(dim=-1)
-        stayed = (tokens != self.config.blank_token_id) & (self._step_durations[-1] == 0)
-        if self._labels_at_frame is None:
-            self._labels_at_frame = torch.zeros_like(tokens)
-        self._labels_at_frame = torch.where(stayed, self._labels_at_frame + 1, torch.zeros_like(tokens))
-        force = (self._labels_at_frame >= self.max_symbols_per_step).long()
-        self._labels_at_frame = self._labels_at_frame * (1 - force)
-        self._step_durations[-1] = self._step_durations[-1] + force
-        model_kwargs["encoder_frame_idxs"] = model_kwargs["encoder_frame_idxs"] + force
-        self._encoder_finished = model_kwargs["encoder_frame_idxs"] >= model_kwargs["encoder_valid_lengths"]
-        return model_kwargs
-
-
-MODEL_CLASSES = {"parakeet_tdt": NeMoGreedyParakeetForTDT}
 
 
 class ParakeetTranscriber(ChunkTranscriber):
     """
-    NVIDIA Parakeet TDT (FastConformer encoder, token-and-duration transducer decoder),
-    greedy decoding in fp32.
+    NVIDIA Parakeet TDT (FastConformer encoder, token-and-duration transducer decoder) in fp32,
+    decoded by :class:`~lyricscribe.transcribe.tdt.TDTDecoder`: greedy, or NeMo's recommended TDT
+    beam search (``malsd_batch``), with the shared repetition controls on emitted labels.
 
-    The model is language-agnostic, so the language is ignored. It has no beam
-    search or repetition controls in transformers, so asking for them raises.
+    The model is language-agnostic, so the language is ignored.
     """
 
-    def __init__(self, model_name: str, batch_size: int = 8, dtype: str | None = None) -> None:
+    supports = frozenset(DECODE_KNOBS)
+
+    def __init__(
+        self, model_name: str, batch_size: int = 8, dtype: str | None = None, max_new_tokens: int = MAX_NEW_TOKENS
+    ) -> None:
         """
         :param model_name: Hub id or checkpoint dir in transformers format.
-        :param batch_size: Chunks decoded per ``generate`` call.
+        :param batch_size: Chunks decoded together.
         :param dtype: ``float32`` (default) or ``bfloat16``.
+        :param max_new_tokens: Labels allowed per chunk.
         """
         super().__init__(model_name, batch_size)
         self.dtype = getattr(torch, dtype or "float32")
+        self.max_new_tokens = max_new_tokens
         self.model = None
         self.processor = None
+        self.tdt = None
 
     def load(self) -> None:
         """
@@ -94,34 +49,71 @@ class ParakeetTranscriber(ChunkTranscriber):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.train_record = check_train_record(self.model_name, self.prompt_mode)
         model_type = AutoConfig.from_pretrained(self.model_name).model_type
-        if model_type not in MODEL_CLASSES:
+        if model_type != "parakeet_tdt":
             raise ValueError(f"{self.model_name}: not a Parakeet TDT model (model_type {model_type!r})")
-        logger.info(f"Loading Parakeet ({model_type}): {self.model_name} on {device}")
+        logger.info(f"Loading Parakeet TDT: {self.model_name} on {device}")
         # cuDNN SDPA rebuilds its graph per sequence shape, which stalls decoding.
         torch.backends.cuda.enable_cudnn_sdp(False)
         self.processor = AutoProcessor.from_pretrained(self.model_name)
-        self.model = MODEL_CLASSES[model_type].from_pretrained(
-            self.model_name, dtype=self.dtype, device_map=device
-        ).eval()
+        self.model = ParakeetForTDT.from_pretrained(self.model_name, dtype=self.dtype, device_map=device).eval()
+        cfg, gen = self.model.config, self.model.generation_config
+        self.tdt = TDTDecoder(
+            self._predict, self._joint, vocab=cfg.vocab_size, blank=cfg.blank_token_id, durations=list(cfg.durations),
+            start=gen.decoder_start_token_id, eos=gen.eos_token_id, max_symbols=self.model.max_symbols_per_step,
+            max_new_tokens=self.max_new_tokens,
+        )
+
+    def _predict(self, labels: torch.Tensor, state: tuple | None):
+        """
+        One prediction-network step, as transformers' ``ParakeetRNNTDecoder`` runs it.
+
+        :param labels: ``(N,)`` previous labels.
+        :param state: LSTM ``(h, c)``, or ``None`` for the zero state.
+        :return: ``(decoder output (N, H), state)``.
+        """
+        dec = self.model.decoder
+        emb = dec.embedding(labels[:, None])
+        if state is None:
+            zeros = torch.zeros(dec.lstm.num_layers, labels.shape[0], dec.lstm.hidden_size, device=emb.device, dtype=emb.dtype)
+            state = (zeros, zeros.clone())
+        out, state = dec.lstm(emb, state)
+        return dec.decoder_projector(out)[:, 0], state
+
+    def _joint(self, enc: torch.Tensor, dec: torch.Tensor) -> torch.Tensor:
+        """
+        Token and duration logits.
+
+        :param enc: ``(N, H)`` projected encoder frames.
+        :param dec: ``(N, H)`` decoder outputs.
+        :return: ``(N, V + D)`` logits.
+        """
+        return self.model.joint(decoder_hidden_states=dec, encoder_hidden_states=enc)
 
     @torch.inference_mode()
     def _decode(self, wavs: list[np.ndarray], language: str | None, decode: Decode) -> list[str]:
         """
-        Decode chunks of one song in a single ``generate`` call.
+        Encode the chunks together, then decode them greedily or by beam search.
 
         :param wavs: 16 kHz mono chunks.
         :param language: Ignored.
-        :param decode: Greedy settings (checked by the caller).
+        :param decode: Decoding settings (checked by the caller).
         :return: One transcription per chunk.
         """
-        del language, decode
+        del language
         inputs = self.processor(wavs, sampling_rate=SAMPLE_RATE, return_tensors="pt").to(self.model.device, dtype=self.model.dtype)
-        out = self.model.generate(**inputs)
-        ids = out.sequences if hasattr(out, "sequences") else out
-        if getattr(out, "durations", None) is not None:
-            # generate() only pads finished rows when the config has an eos_token_id (NeMo
-            # conversions lack it), so drop tokens emitted past each chunk's own frames.
-            frames = self.model.encoder._get_subsampling_output_length(inputs["attention_mask"].sum(-1))
-            emitted_at = torch.cumsum(out.durations, dim=1) - out.durations
-            ids = ids.masked_fill(emitted_at >= frames[:, None], self.model.config.pad_token_id)
-        return self.processor.batch_decode(ids, skip_special_tokens=True)
+        encoded = self.model.get_audio_features(
+            input_features=inputs["input_features"], attention_mask=inputs["attention_mask"], output_attention_mask=True,
+        )
+        enc, lengths = encoded.pooler_output, encoded.attention_mask.sum(-1)
+        if decode.num_beams > 1:
+            labels = self.tdt.beam(enc, lengths, decode.num_beams, decode)
+        else:
+            labels = self.tdt.greedy(enc, lengths, decode)
+        self.last_generate_kwargs = {
+            **decode.as_dict(),
+            "search": "nemo malsd_batch (length-normalised)" if decode.num_beams > 1 else "greedy",
+            "max_new_tokens": self.max_new_tokens,
+            "max_symbols_per_step": self.tdt.max_symbols,
+            "eos_token_id": self.tdt.eos,
+        }
+        return self.processor.batch_decode(labels, skip_special_tokens=True)

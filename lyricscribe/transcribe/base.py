@@ -62,6 +62,25 @@ class Decode:
         return asdict(self)
 
 
+def penalize_generated(scores: torch.FloatTensor, generated: torch.LongTensor, penalty: float) -> torch.FloatTensor:
+    """
+    Multiply the log-probability of every generated token by *penalty* (see
+    :class:`GeneratedRepetitionPenalty`), on logits or log-probabilities alike.
+
+    :param scores: ``(rows, vocab)`` logits or log-probabilities.
+    :param generated: ``(rows, length)`` token ids generated so far.
+    :param penalty: Multiplicative penalty.
+    :return: The penalised scores.
+    """
+    if generated.shape[1] == 0:
+        return scores
+    score = torch.gather(scores, 1, generated)
+    logp = torch.gather(torch.log_softmax(scores, dim=-1), 1, generated)
+    # Tokens already masked to -inf stay masked.
+    score = torch.where(torch.isfinite(logp), score + (penalty - 1) * logp, score)
+    return scores.scatter(1, generated, score)
+
+
 class GeneratedRepetitionPenalty(LogitsProcessor):
     """
     Repetition penalty on log-probabilities, restricted to generated tokens:
@@ -102,14 +121,7 @@ class GeneratedRepetitionPenalty(LogitsProcessor):
         """
         if self.start is None:
             self.start = input_ids.shape[1]
-        generated = input_ids[:, self.start:]
-        if generated.shape[1] == 0:
-            return scores
-        score = torch.gather(scores, 1, generated)
-        logp = torch.gather(torch.log_softmax(scores, dim=-1), 1, generated)
-        # Tokens already masked to -inf stay masked.
-        score = torch.where(torch.isfinite(logp), score + (self.penalty - 1) * logp, score)
-        return scores.scatter(1, generated, score)
+        return penalize_generated(scores, input_ids[:, self.start:], self.penalty)
 
 
 class GeneratedNoRepeatNGram(NoRepeatNGramLogitsProcessor):

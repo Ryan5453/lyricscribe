@@ -260,13 +260,13 @@ def transcribe_setup(
         1.0,
         "--repetition-penalty",
         help="Decoder repetition penalty on generated tokens (never the "
-             "prompt). ``1.0`` disables. Every backend but Parakeet applies it.",
+             "prompt). ``1.0`` disables. Every backend applies it.",
     ),
     no_repeat_ngram_size: int = typer.Option(
         0,
         "--no-repeat-ngram-size",
         help="Decoder ban on repeating a generated n-gram (never the prompt). "
-             "``0`` disables. Every backend but Parakeet applies it.",
+             "``0`` disables. Every backend applies it.",
     ),
     mit: bool = typer.Option(
         False,
@@ -279,7 +279,7 @@ def transcribe_setup(
         1,
         "--num-beams",
         min=1,
-        help="Beam width; 1 (default) is greedy. Every backend but Parakeet applies it.",
+        help="Beam width; 1 (default) is greedy. Every backend applies it (Parakeet: NeMo's TDT beam search).",
     ),
     condition_on_prev: bool = typer.Option(
         True,

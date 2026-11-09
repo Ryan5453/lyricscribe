@@ -283,10 +283,12 @@ Segmentation:
 
 Decoding:
 
-- `--repetition-penalty`: Whisper decoder repetition penalty; 1.0 disables (default: 1.0)
-- `--no-repeat-ngram-size`: Block repeated n-grams; 0 disables. Applies to Whisper, Canary, Qwen3-ASR, the audio-LLMs, Cohere, Granite and Nemotron. (default: 0)
+- `--repetition-penalty`: Multiplies the log-probability of every already-generated token by this factor; the prompt is never penalised. 1.0 disables (default: 1.0)
+- `--no-repeat-ngram-size`: Ban repeating a generated n-gram; the prompt is never counted. 0 disables (default: 0)
 - `--mit`: Shortcut for `--repetition-penalty 1.7 --no-repeat-ngram-size 5`
-- `--num-beams`: Whisper beam width; 1 is greedy (default: 5)
+- `--num-beams`: Beam width; 1 is greedy (default: 1). Parakeet uses NeMo's TDT beam search.
+
+Every backend applies all three; a backend refuses a setting it can't apply.
 - `--condition-on-prev` / `--no-condition-on-prev`: Whisper long-form conditioning on previous windows (default: on)
 - `--temperature-fallback`: Whisper temperature fallback, triggered by `--compression-ratio-threshold` (default 2.4) and `--logprob-threshold` (default -1.0)
 - `--prompt-from-dirname`: Use the song directory name as Whisper's decoder prompt or Qwen3-ASR's context
