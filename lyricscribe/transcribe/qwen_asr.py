@@ -372,8 +372,6 @@ class Qwen3ASRTranscriber(Transcriber):
             raise TrainRecordMismatch(f"{self.adapter or self.model_name} was trained with an empty context; got {context[:60]!r}")
         prompt = _build_prompt(context, language)
         config = copy.deepcopy(self.generation_config)
-        kwargs = generate_kwargs(self.max_new_tokens, decode)
-        self.last_generate_kwargs = {**describe_kwargs(kwargs), "prompt": prompt}
         outs = []
         for i in range(0, len(wavs), max(1, self.batch_size)):
             sub = wavs[i:i + max(1, self.batch_size)]
@@ -381,6 +379,9 @@ class Qwen3ASRTranscriber(Transcriber):
                 text=[prompt] * len(sub), audio=sub, return_tensors="pt", padding=True
             )
             inputs = inputs.to(self.model.device).to(self.model.dtype)
+            # Fresh per call: the repetition controls record where this call's prompt ends.
+            kwargs = generate_kwargs(self.max_new_tokens, decode)
+            self.last_generate_kwargs = {**describe_kwargs(kwargs), "prompt": prompt}
             ids = self.model.generate(**inputs, generation_config=config, **kwargs)
             outs.extend(
                 self.processor.batch_decode(
