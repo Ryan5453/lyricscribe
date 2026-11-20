@@ -487,7 +487,8 @@ def environment_record() -> dict:
     """
     Software and hardware a job runs on.
 
-    :return: Code root, commit (:func:`git_commit`), ``uv.lock`` hash, package versions and GPU.
+    :return: Code root, commit (:func:`git_commit`), ``uv.lock`` hash, package versions, GPU and CPU model
+        (CPU-computed features differ between CPU types).
     """
     root = Path(__file__).resolve().parents[2]
     lock = root / "uv.lock"
@@ -497,6 +498,15 @@ def environment_record() -> dict:
             versions[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             versions[package] = None
+    cpu = None
+    try:
+        cpu = next(
+            line.split(":", 1)[1].strip()
+            for line in Path("/proc/cpuinfo").read_text().splitlines()
+            if line.startswith("model name")
+        )
+    except (OSError, StopIteration):
+        pass
     gpu = None
     if torch.cuda.is_available():
         gpu = {"name": torch.cuda.get_device_name(0), "capability": list(torch.cuda.get_device_capability(0))}
@@ -506,6 +516,7 @@ def environment_record() -> dict:
         "uv_lock_sha256": hashlib.sha256(lock.read_bytes()).hexdigest() if lock.exists() else None,
         "versions": versions,
         "gpu": gpu,
+        "cpu": cpu,
         "host": os.uname().nodename,
     }
 
