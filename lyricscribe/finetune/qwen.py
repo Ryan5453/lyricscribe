@@ -347,10 +347,13 @@ class _QwenTrainerBase:
 
     def _gc_args(self) -> dict:
         """
-        Gradient checkpointing (non-reentrant: reentrant breaks DDP with "marked as ready twice").
+        Gradient checkpointing (non-reentrant: reentrant breaks DDP with "marked as ready twice"),
+        unless the config's ``gradient_checkpointing`` is false.
 
         :return: ``TrainingArguments`` fields.
         """
+        if not self.config.get("gradient_checkpointing", True):
+            return {}
         return {"gradient_checkpointing": True, "gradient_checkpointing_kwargs": {"use_reentrant": False}}
 
     def parts(self, manifest: Path, seed: int, eval_manifest: Path | None = None) -> TrainingParts:
