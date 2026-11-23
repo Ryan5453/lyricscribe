@@ -211,3 +211,205 @@ def merge(
     typer.echo(f"wrote {out}: {r['tensors']} tensors, weights {r['weights']}")
     if r["dropped_keys"]:
         typer.echo(f"dropped (not in every member): {r['dropped_keys']}")
+
+
+@analyze_app.command("ortho")
+def ortho(
+    job_dirs: list[Path] = typer.Argument(..., help="Job dirs to audit for orthographic conventions"),
+    deloop: int | None = typer.Option(None, "--deloop", min=1, help="Post-hoc deloop max run."),
+    selfwer_file: Path | None = _SELFWER_OPT,
+    max_self_wer: float = _MAX_SELFWER_OPT,
+    dump_pairs_dir: Path | None = typer.Option(
+        None, "--dump-pairs-dir",
+        help="Write per-job distinct substitution pairs JSON here (input for `analyze judge-pairs`).",
+    ),
+    out: Path | None = typer.Option(None, "--out", help="Write full audit summary JSON."),
+):
+    """
+    Decompose scored substitutions into structural orthographic conventions vs. genuine errors (T23).
+    """
+    from lyricscribe.analysis.ortho import audit_job
+
+    keep = _keep_set(selfwer_file, max_self_wer)
+    summaries: dict[str, dict] = {}
+    if dump_pairs_dir is not None:
+        dump_pairs_dir.mkdir(parents=True, exist_ok=True)
+
+    for d in job_dirs:
+        res = audit_job(d, deloop_max_run=deloop, keep=keep)
+        pairs = res.pop("pairs")
+        summaries[str(d)] = res
+        typer.echo(f"\n=== {d} ===")
+        typer.echo(
+            f"  WER={100 * res['wer']:.3f}%  convention={100 * res['convention_wer_pts']:.3f}pt "
+            f"({100 * res['convention_error_share']:.2f}% of errors)  "
+            f"WER_excl_conv={100 * res['wer_excl_convention']:.3f}%  (n={res['n_songs']})"
+        )
+        for cls, info in res["by_class"].items():
+            typer.echo(
+                f"    {cls:15s} {info['count']:7d}  "
+                f"({100 * info['share_of_subs']:5.2f}% of subs, {100 * info['wer_pts']:.3f} WER pts)"
+            )
+        if dump_pairs_dir is not None:
+            safe_name = str(d).strip("/").replace("/", "_")
+            pairs_path = dump_pairs_dir / f"ortho_pairs_{safe_name}.json"
+            pairs_path.write_text(json.dumps(pairs, ensure_ascii=False, indent=1) + "\n")
+            typer.echo(f"  wrote {len(pairs)} distinct pairs -> {pairs_path}")
+
+    _write_json(out, summaries)
+
+
+@analyze_app.command("judge-pairs")
+def judge_pairs_cmd(
+    pairs_file: Path = typer.Argument(..., help="Pairs JSON written by `analyze ortho --dump-pairs-dir`"),
+    out: Path = typer.Option(..., "--out", help="Destination JSON with per-pair verdicts and summary"),
+    model: str = typer.Option(
+        "perplexity-ai/pplx-decider-v1.3", "--model",
+        help="System-1 pplx-decider HF repo ID or local checkpoint dir.",
+    ),
+    revision: str | None = typer.Option(
+        None, "--revision",
+        help="Optional pinned HF revision (auto-recorded in the output JSON if unset).",
+    ),
+    batch_size: int = typer.Option(64, "--batch-size", min=1),
+    min_count: int = typer.Option(1, "--min-count", min=1),
+    seed: int = typer.Option(0, "--seed"),
+):
+    """
+    Blind System-1 adjudication of substitution pairs via pplx-decider logits (T23b).
+    """
+    from lyricscribe.analysis.ortho import judge_pairs
+
+    pairs = json.loads(pairs_file.read_text())
+    res = judge_pairs(
+        pairs,
+        model_name=model,
+        revision=revision or None,
+        batch_size=batch_size,
+        min_count=min_count,
+        seed=seed,
+    )
+    _write_json(out, res)
+    cm = res["confusion"]
+    typer.echo(
+        f"adjudicated {res['n_distinct_pairs']} pairs ({res['total_occurrences']} occurrences) | "
+        f"weighted agreement={100 * res['agreement']:.2f}%"
+    )
+    typer.echo(
+        f"  both_conv={cm['both_convention']}  rule_only_fp={cm['rule_only_fp']}  "
+        f"judge_only_missed={cm['judge_only_missed']}  both_genuine={cm['both_genuine']}"
+    )
+
+
+@analyze_app.command("third-vote")
+def third_vote_cmd(
+    dataset_dir: Path = typer.Argument(..., help="Dataset dir with per-song lyrics.json"),
+    consensus: Path = typer.Option(..., "--consensus", help="ROVER consensus job dir"),
+    member: list[str] = typer.Option(
+        ..., "--member", help="Member job as name=job_dir (repeat at least twice)."
+    ),
+    selfwer_file: Path | None = _SELFWER_OPT,
+    deloop: int | None = typer.Option(None, "--deloop", min=1),
+    suspect_threshold: float = typer.Option(0.5, "--suspect-threshold"),
+    out: Path | None = typer.Option(None, "--out", help="Write per-song audit JSONL"),
+    suspects_out: Path | None = typer.Option(None, "--suspects-out", help="Write suspect same-provider JSONL"),
+    summary_out: Path | None = typer.Option(None, "--summary-out", help="Write aggregate summary JSON"),
+):
+    """
+    Validate reference self-WER against multi-architecture ASR consensus (T8 third-vote audit).
+    """
+    from lyricscribe.analysis.refquality import third_vote_audit
+
+    member_jobs: dict[str, Path] = {}
+    for arg in member:
+        name, sep, path = arg.partition("=")
+        if not sep:
+            raise typer.BadParameter(f"--member must be name=job_dir, got {arg!r}")
+        member_jobs[name] = Path(path)
+
+    res = third_vote_audit(
+        dataset_dir,
+        consensus,
+        member_jobs,
+        selfwer_file=selfwer_file,
+        deloop_max_run=deloop,
+        suspect_wer_threshold=suspect_threshold,
+        out_path=out,
+        suspects_out=suspects_out,
+    )
+    typer.echo(
+        f"songs={res['n_songs']}  same_provider={res['n_same_provider']}  "
+        f"diff_provider={res['n_different_provider']}  "
+        f"median_disagreement={res['median_system_disagreement']:.4f}"
+    )
+    if res["corr_selfwer_ref_vs_consensus_diff_provider"] is not None:
+        typer.echo(
+            f"corr(self_wer, ref_vs_consensus) = {res['corr_selfwer_ref_vs_consensus_diff_provider']:.4f}"
+        )
+    typer.echo(f"suspect same-provider refs: {res['n_suspect_same_provider']}")
+    _write_json(summary_out, res)
+
+
+@analyze_app.command("readability")
+def readability_cmd(
+    job_dirs: list[Path] = typer.Argument(..., help="Job dirs to score with Jam-ALT readability metrics"),
+    selfwer_file: Path | None = _SELFWER_OPT,
+    max_self_wer: float = _MAX_SELFWER_OPT,
+    by_language: bool = typer.Option(False, "--by-language", help="Per-language readability breakdown."),
+    allow_partial: bool = typer.Option(False, "--allow-partial", help="Allow incomplete job dirs."),
+    out: Path | None = typer.Option(None, "--out", help="Write readability JSON."),
+):
+    """
+    Compute Jam-ALT readability metrics (WER, case-sensitive WER, punctuation/line/section F1).
+    """
+    from lyricscribe.analysis.scoring import readability_many
+
+    keep = _keep_set(selfwer_file, max_self_wer)
+    results = readability_many(
+        job_dirs, keep=keep, by_language=by_language, require_complete=not allow_partial
+    )
+    for name, res in results.items():
+        if "error" in res:
+            typer.echo(f"SKIP {name}: {res['error']}")
+            continue
+        m = res["all"]
+        parts = [f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in sorted(m.items())]
+        typer.echo(f"{name} (n={res['n_songs']}): " + "  ".join(parts))
+    _write_json(out, results)
+
+
+@analyze_app.command("examples")
+def examples_cmd(
+    job_dirs: list[Path] = typer.Argument(..., help="Job dirs to compare side-by-side"),
+    song: list[str] | None = typer.Option(None, "--song", help="Explicit song ID (repeatable)."),
+    label: list[str] | None = typer.Option(None, "--label", help="Display label matching each job dir."),
+    top_diff: int = typer.Option(10, "--top-diff", min=1, help="Top songs by cross-system WER spread."),
+    deloop: int | None = typer.Option(None, "--deloop", min=1),
+    max_words: int = typer.Option(80, "--max-words", min=10),
+    out: Path | None = typer.Option(None, "--out", help="Write side-by-side comparison JSON."),
+):
+    """
+    Export qualitative side-by-side multi-model song excerpts for error analysis.
+    """
+    from lyricscribe.analysis.scoring import qualitative_examples
+
+    records = qualitative_examples(
+        job_dirs,
+        songs=song,
+        top_diff=top_diff,
+        deloop_max_run=deloop,
+        labels=label,
+        max_words=max_words,
+    )
+    for rec in records:
+        typer.echo(
+            f"\n[{rec['song_id']} | {rec['language']} | words={rec['ref_words']} | "
+            f"WER spread={100 * rec['wer_spread']:.1f}pt]"
+        )
+        typer.echo(f"  REF: {rec['ref_excerpt']}")
+        for sys_name, info in rec["systems"].items():
+            typer.echo(
+                f"  {sys_name} (WER={100 * info['wer']:.1f}% I/D/S={info['I']}/{info['D']}/{info['S']}): "
+                f"{info['excerpt']}"
+            )
+    _write_json(out, records)

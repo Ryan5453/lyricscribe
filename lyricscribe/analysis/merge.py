@@ -63,6 +63,16 @@ def merge_checkpoints(
     total = sum(weights)
     weights = [w / total for w in weights]
 
+    loop_configs = [
+        (Path(m) / "loop_config.json").read_text() if (Path(m) / "loop_config.json").exists() else None
+        for m in members
+    ]
+    if len(set(loop_configs)) > 1:
+        raise ValueError(
+            "Refusing to merge checkpoints with mismatched loop_config.json "
+            "(cannot weight-average looped/pruned checkpoints with incompatible layouts)"
+        )
+
     merged: dict = {}
     keys = None
     dropped: set[str] = set()

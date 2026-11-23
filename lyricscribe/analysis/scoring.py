@@ -1,4 +1,5 @@
 import logging
+import math
 from pathlib import Path
 
 from lyricscribe.analysis.common import (
@@ -154,3 +155,166 @@ def discover_job_dirs(root: Path, pattern: str) -> list[Path]:
         if d.is_dir() and (d / "config.json").exists() and any(d.glob("results*.jsonl")):
             found.add(d)
     return sorted(found)
+
+
+def readability_job(
+    job_dir: Path,
+    *,
+    keep: set[str] | None = None,
+    by_language: bool = False,
+    require_complete: bool = True,
+) -> dict:
+    """
+    Compute the full Jam-ALT readability metric suite (``alt_eval.compute_metrics``):
+    WER, case-sensitive WER / case error rate, and punctuation, parentheses, line-break
+    and section-break precision/recall/F1 on un-normalised hypotheses and references.
+
+    :param job_dir: Transcription job directory.
+    :param keep: Optional reference-quality song ID keep-set.
+    :param by_language: Also compute readability metrics per language.
+    :param require_complete: Refuse partial or corrupt job dirs.
+    :return: ``{"n_songs": int, "all": {...}, "by_language": {...}?}``.
+    """
+    from alt_eval import compute_metrics
+
+    job = load_job(job_dir)
+    songs = scorable_songs(job, require_complete=require_complete)
+    if keep is not None:
+        songs = [s for s in songs if s in keep]
+
+    raw_refs: dict[str, tuple[str, str, str]] = {}
+    for d in job.dataset_dirs:
+        raw_refs.update(raw_references(d))
+
+    ids = [s for s in songs if raw_refs.get(s, ("", "", ""))[1].strip()]
+    if not ids:
+        raise IncompleteJobError(f"{job_dir}: no songs with non-empty raw references")
+
+    refs = [raw_refs[s][1] for s in ids]
+    hyps = [job.hyps[s] or "" for s in ids]
+    langs = [raw_refs[s][0] for s in ids]
+
+    def _clean(m: dict) -> dict:
+        out_m = {}
+        for k, v in m.items():
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                out_m[k] = None if math.isnan(fv) else fv
+            else:
+                out_m[k] = v
+        return out_m
+
+    out: dict = {
+        "n_songs": len(ids),
+        "all": _clean(compute_metrics(refs, hyps, languages=langs)),
+    }
+    if by_language:
+        out["by_language"] = {}
+        for lang in sorted(set(langs)):
+            idx = [i for i, lg in enumerate(langs) if lg == lang]
+            out["by_language"][lang] = _clean(
+                compute_metrics([refs[i] for i in idx], [hyps[i] for i in idx], languages=lang)
+            )
+    return out
+
+
+def readability_many(
+    job_dirs: list[Path],
+    *,
+    keep: set[str] | None = None,
+    by_language: bool = False,
+    require_complete: bool = True,
+) -> dict[str, dict]:
+    """
+    Compute Jam-ALT readability metrics across several job directories.
+
+    :param job_dirs: Job directories.
+    :param keep: Optional song ID keep-set.
+    :param by_language: Per-language breakdown.
+    :param require_complete: Refuse partial or corrupt jobs.
+    :return: ``{job_dir: readability_dict}``; skipped jobs map to ``{"error": msg}``.
+    """
+    out: dict[str, dict] = {}
+    for d in job_dirs:
+        try:
+            out[str(d)] = readability_job(
+                d, keep=keep, by_language=by_language, require_complete=require_complete
+            )
+        except (FileNotFoundError, IncompleteJobError) as e:
+            out[str(d)] = {"error": str(e)}
+    return out
+
+
+def qualitative_examples(
+    job_dirs: list[Path],
+    *,
+    songs: list[str] | None = None,
+    top_diff: int = 10,
+    deloop_max_run: int | None = None,
+    labels: list[str] | None = None,
+    max_words: int = 80,
+) -> list[dict]:
+    """
+    Build side-by-side multi-model song comparison records for qualitative error analysis.
+
+    Ranks common songs by the largest cross-system WER spread (unless explicit *songs* are
+    requested) and includes each system's WER, I/D/S counts and normalised/raw excerpts.
+
+    :param job_dirs: Two or more job directories on the same dataset.
+    :param songs: Explicit song IDs to inspect (overrides *top_diff* ranking).
+    :param top_diff: Number of highest-divergence songs to return when *songs* is unset.
+    :param deloop_max_run: Optional deloop cap applied to hypotheses.
+    :param labels: Optional display names matching *job_dirs*.
+    :param max_words: Word cap for the preview excerpt of each song.
+    :return: List of per-song comparison dictionaries.
+    """
+    from lyricscribe.evaluate import job_song_pairs
+
+    if not job_dirs:
+        raise ValueError("Need at least one job directory")
+    names = labels if (labels and len(labels) == len(job_dirs)) else [str(d) for d in job_dirs]
+
+    per_job: dict[str, dict[str, tuple[str, str, str]]] = {}
+    for name, d in zip(names, job_dirs):
+        loaded = job_song_pairs(Path(d), verbose=False, deloop_max_run=deloop_max_run)
+        if loaded is None:
+            raise ValueError(f"{d}: no evaluable songs")
+        per_job[name] = {sid: (ref, hyp, lang) for sid, ref, hyp, lang in loaded["songs"]}
+
+    common_ids = sorted(set.intersection(*(set(m) for m in per_job.values())))
+    if songs:
+        target_ids = [s for s in songs if s in common_ids]
+    else:
+        target_ids = common_ids
+
+    records: list[dict] = []
+    for sid in target_ids:
+        ref, _, lang = per_job[names[0]][sid]
+        systems: dict[str, dict] = {}
+        wers: list[float] = []
+        for name in names:
+            r, h, _ = per_job[name][sid]
+            st = corpus_stats([r], [h])
+            wers.append(st["wer"])
+            systems[name] = {
+                "wer": round(st["wer"], 4),
+                "I": st["I"],
+                "D": st["D"],
+                "S": st["S"],
+                "H": st["H"],
+                "excerpt": " ".join(h.split()[:max_words]),
+            }
+        spread = (max(wers) - min(wers)) if wers else 0.0
+        records.append({
+            "song_id": sid,
+            "language": lang,
+            "ref_words": len(ref.split()),
+            "wer_spread": round(spread, 4),
+            "ref_excerpt": " ".join(ref.split()[:max_words]),
+            "systems": systems,
+        })
+
+    if not songs:
+        records.sort(key=lambda x: (-x["wer_spread"], x["song_id"]))
+        records = records[:top_diff]
+    return records

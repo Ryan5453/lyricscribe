@@ -89,6 +89,10 @@ def load_qwen3_asr(model_name: str, dtype: torch.dtype, device: str):
     :return: ``(model, processor, generation_config)``.
     """
     src = _resolve_dir(model_name)
+    if (src / "loop_config.json").exists():
+        from lyricscribe.finetune.loop import load_loop_checkpoint
+
+        return load_loop_checkpoint(src, dtype=dtype, device=device)
     cfg = json.loads((src / "config.json").read_text())
     if "thinker_config" not in cfg:
         model = Qwen3ASRForConditionalGeneration.from_pretrained(

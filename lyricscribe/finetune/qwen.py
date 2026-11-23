@@ -431,16 +431,25 @@ class Qwen3ASRTrainer(_QwenTrainerBase):
     def _load(self, path: str) -> None:
         """
         Load a transformers-native Qwen3-ASR checkpoint, encoding audio item by item as
-        inference does, and wrap it in an adapter for the adapter recipe.
+        inference does, and wrap it in an adapter or loop variant when configured.
 
         :param path: Hub id or local checkpoint path.
         """
-        logger.info(f"Loading Qwen3-ASR: {path} ({'adapter recipe' if self.adapter else 'full FT'})")
+        loop_variant = self.config.get("loop_variant")
+        tag = f"loop={loop_variant}" if loop_variant else ("adapter recipe" if self.adapter else "full FT")
+        logger.info(f"Loading Qwen3-ASR: {path} ({tag})")
         self.processor = AutoProcessor.from_pretrained(path)
         # The adapter recipe's frozen base is bf16; ``base_dtype`` overrides it for CPU checks.
         dtype = getattr(torch, self.config.get("base_dtype") or "bfloat16") if self.adapter else torch.float32
         model = Qwen3ASRForConditionalGeneration.from_pretrained(path, dtype=dtype, device_map=engine.device_map())
         model.config.use_cache = False
+        if loop_variant:
+            from lyricscribe.finetune.loop import build_loop_variant, loop_parameter_summary
+
+            model, _ = build_loop_variant(
+                model, loop_variant, tokenizer=self.processor.tokenizer, in_place=True
+            )
+            logger.info(f"Loop variant {loop_variant}: {loop_parameter_summary(model)}")
         _encode_audio_per_item(model)
         # Qwen3-ASR ships sampling fields alongside do_sample=False, which
         # save_pretrained() rejects; they are unused under greedy decoding.
@@ -450,6 +459,21 @@ class Qwen3ASRTrainer(_QwenTrainerBase):
                 if getattr(gc, field, None) is not None:
                     setattr(gc, field, None)
         self.model = nvidia_adapter(model, QWEN3_ASR_LORA_MODULES, QWEN3_ASR_FULL_RANK) if self.adapter else model
+
+    def notes(self) -> dict:
+        """
+        Recipe facts recorded in the training state.
+
+        :return: Notes dict including loop variant summary when enabled.
+        """
+        out = super().notes()
+        loop_variant = self.config.get("loop_variant")
+        if loop_variant:
+            from lyricscribe.finetune.loop import loop_parameter_summary
+
+            out["loop_variant"] = loop_variant
+            out["loop_params"] = loop_parameter_summary(self.model)
+        return out
 
     def collator(self):
         """
@@ -469,12 +493,18 @@ class Qwen3ASRTrainer(_QwenTrainerBase):
 
     def export(self, path: Path) -> Path:
         """
-        Save the full model (checking the inference architecture name) or the adapter, with the processor.
+        Save the full model (checking the inference architecture name), looped checkpoint or
+        adapter, with the processor.
 
         :param path: Output dir.
         :return: *path*.
         """
-        super().export(path)
+        if self.config.get("loop_variant"):
+            from lyricscribe.finetune.loop import save_loop_checkpoint
+
+            save_loop_checkpoint(self.model, self.processor, path)
+        else:
+            super().export(path)
         if not self.adapter:
             cfg = json.loads((path / "config.json").read_text())
             assert cfg.get("architectures") == ["Qwen3ASRForConditionalGeneration"], cfg.get("architectures")
@@ -575,9 +605,11 @@ def eval_loss(
         dataset.rows = random.Random(seed).sample(dataset.rows, rows)
     results = {}
     if architecture == "qwen3_asr":
+        from lyricscribe.transcribe.qwen_asr import load_qwen3_asr
+
         collator = Qwen3ASRCollator(AutoProcessor.from_pretrained(base_model))
         for name in [base_model, *checkpoints]:
-            model = Qwen3ASRForConditionalGeneration.from_pretrained(name, dtype=torch.bfloat16).to("cuda:0")
+            model, _, _ = load_qwen3_asr(name, dtype=torch.bfloat16, device="cuda:0")
             _encode_audio_per_item(model)
             results["base" if name == base_model else name] = mean_token_ce(model, collator, dataset, batch_size)
             logger.info(f"{name}: CE {results['base' if name == base_model else name]:.4f}")

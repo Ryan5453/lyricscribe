@@ -82,6 +82,7 @@ _CONFIG_KEYS = {
     "base_dtype",
     "gradient_checkpointing",
     "num_workers",
+    "loop_variant",
 }
 
 # Per-device batch (gradient accumulation makes up the global batch) and default LR.
@@ -139,6 +140,16 @@ def create_finetune_config(
         ADAPTATIONS if architecture == "qwen3_asr" else ("full",))
     if adaptation not in allowed:
         raise ValueError(f"{architecture} trains with {allowed}, not {adaptation!r}")
+    loop_variant = kwargs.get("loop_variant")
+    if loop_variant is not None:
+        from lyricscribe.finetune.loop import LOOP_VARIANTS
+
+        if architecture != "qwen3_asr" or adaptation != "full":
+            raise ValueError(
+                f"loop_variant is only supported for full-FT qwen3_asr, got {architecture}/{adaptation}"
+            )
+        if loop_variant not in LOOP_VARIANTS:
+            raise ValueError(f"loop_variant must be one of {LOOP_VARIANTS}, got {loop_variant!r}")
     defaults = dict(_ARCH_DEFAULTS.get(architecture, {}))
     if adaptation == "nvidia_adapter":
         defaults["learning_rate"] = ADAPTER_LR
@@ -206,7 +217,7 @@ def create_finetune_config(
         "train_window_seed": kwargs.get("train_window_seed", 0),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    for key in ("prompt_mode", "base_dtype", "gradient_checkpointing", "num_workers"):
+    for key in ("prompt_mode", "base_dtype", "gradient_checkpointing", "num_workers", "loop_variant"):
         if key in kwargs:
             config[key] = kwargs[key]
     return config

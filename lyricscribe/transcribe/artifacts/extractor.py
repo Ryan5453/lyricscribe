@@ -56,21 +56,25 @@ def _compute_mag_spectrogram(audio: np.ndarray) -> np.ndarray:
     return magnitude
 
 
-def extract_artifact_features(song_dir: Path) -> dict:
+def extract_artifact_features(
+    song_dir: Path,
+    separated_filename: str = "htdemucs_ft_vocals.wav",
+) -> dict:
     """
     Extract per-frame artifact features for one song in the MUSDB dataset.
 
-    :param song_dir: absolute path to the directory containing vocals.wav and htdemucs_ft_vocals.wav
+    :param song_dir: absolute path to the directory containing ``vocals.wav`` and *separated_filename*
+    :param separated_filename: Separated vocal audio filename inside *song_dir*.
     :returns dictionary of per-frame features
     """
 
     stems_path = song_dir / "vocals.wav"
-    separated_path = song_dir / "htdemucs_ft_vocals.wav"
+    separated_path = song_dir / separated_filename
 
     if not (stems_path.exists()):
         raise FileNotFoundError("Could not find the clean stems")
     if not (separated_path.exists()):
-        raise FileNotFoundError("Could not find separated vocals")
+        raise FileNotFoundError(f"Could not find separated vocals ({separated_filename})")
     
 
     logger.info(f"Loading audio for {song_dir.name}")
@@ -99,17 +103,18 @@ def extract_artifact_features(song_dir: Path) -> dict:
     asr = artifacts_rms /(vocal_rms + 1e-8) 
 
 
-    total_energy = artifacts_mag.sum(axis=1, keepdims=True)
+    total_energy = artifacts_mag.sum(axis=1, keepdims=True) + 1e-12
       # weighted average of frequency (bin value * magnitude)
     spectral_centroid = (artifacts_mag * freqs[None, :]).sum(axis=1) / total_energy.squeeze()
 
     # the formula for spectral flatness (geometric mean / arithmetic mean)
-    log_mean = np.mean(np.log(artifacts_mag), axis=1)
-    mean_log = np.log(np.mean(artifacts_mag, axis=1))
+    log_mean = np.mean(np.log(artifacts_mag + 1e-12), axis=1)
+    mean_log = np.log(np.mean(artifacts_mag, axis=1) + 1e-12)
     spectral_flatness = np.exp(log_mean - mean_log)
 
     return {
         "song_id": song_dir.name,
+        "separated_filename": separated_filename,
         "sample_rate": sample_rate,
         "hop_length": hop_length,
         "n_frames": n_frames,
@@ -121,12 +126,17 @@ def extract_artifact_features(song_dir: Path) -> dict:
     }
 
 
-def process_dataset(musdb_dir: Path, output_dir: Path) -> None:
+def process_dataset(
+    musdb_dir: Path,
+    output_dir: Path,
+    separated_filename: str = "htdemucs_ft_vocals.wav",
+) -> None:
     """
         Set up the dataset of the frequency of artifacts for running Montreal Force Alignment.
         
         :param musdb_dir: absolute path to the directory containing vocals.wav from the MUSDB-18 dataset
         :param output_dir: absolute path to the direction to save the dataset
+        :param separated_filename: Separated vocal audio filename inside each song dir.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     song_dirs = sorted([d for d in musdb_dir.iterdir() if d.is_dir()])
@@ -143,7 +153,7 @@ def process_dataset(musdb_dir: Path, output_dir: Path) -> None:
             continue
 
         try:
-            features = extract_artifact_features(song_dir)
+            features = extract_artifact_features(song_dir, separated_filename=separated_filename)
             output_path.write_text(json.dumps(features, indent=2))
             success += 1
         except Exception as e:

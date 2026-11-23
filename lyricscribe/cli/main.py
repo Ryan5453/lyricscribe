@@ -598,13 +598,18 @@ def evaluate_run(
 def artifact_extract(
     musdb_dir: Path = typer.Option(..., "--musdb-dir", help="Root MUSDB directory"),
     output_dir: Path = typer.Option(..., "--output-dir", help="Directory to write artifact feature JSON files"),
+    separated_filename: str = typer.Option(
+        "htdemucs_ft_vocals.wav",
+        "--separated-filename",
+        help="Separated vocal filename inside each song dir (e.g. vocals_bs_roformer_anvuew.wav).",
+    ),
 ):
     """
     Extract per-frame artifact features for each song.
     """
     from lyricscribe.transcribe.artifacts import extractor
 
-    extractor.process_dataset(musdb_dir, output_dir)
+    extractor.process_dataset(musdb_dir, output_dir, separated_filename=separated_filename)
 
 
 @dataset_app.command("align")
@@ -708,6 +713,39 @@ def artifact_build(
     )
 
 
+@artifacts_app.command("analyse")
+def artifact_analyse(
+    dataset_csv: Path = typer.Option(
+        ..., "--input", help="Word-level CSV written by `lyricscribe artifacts build`"
+    ),
+    output: Path = typer.Option(
+        ..., "--output", help="Path to write quartile summary CSV"
+    ),
+):
+    """
+    Bucket word-level errors into Q1-Q4 artifact-to-vocal ratio quartiles per model.
+    """
+    import csv
+
+    from lyricscribe.transcribe.artifacts import correlation
+
+    rows = []
+    with open(dataset_csv, newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append({
+                **row,
+                "insertion_count": int(row["insertion_count"]),
+                "artifact_to_signal_ratio": float(row["artifact_to_signal_ratio"]),
+            })
+    summary = correlation.analyse(rows, csv_output=output)
+    for r in summary:
+        typer.echo(
+            f"{r['model']} {r['quartile']}: n={r['n_words']} err={100 * r['error_rate']:.2f}% "
+            f"(D={100 * r['deletion_rate']:.2f}% S={100 * r['substitution_rate']:.2f}% "
+            f"I/w={r['mean_insertions_per_word']:.4f})"
+        )
+
+
 @finetune_app.command("setup")
 def finetune_setup(
     train_dir: Path = typer.Argument(
@@ -758,6 +796,12 @@ def finetune_setup(
         None, "--adaptation",
         help="full (default up to 2B) or nvidia_adapter (full-rank encoder + projector, LoRA on the LLM; "
              "the default for Nemotron, Qwen3-Omni and Music Flamingo, and an option for Qwen3-ASR).",
+    ),
+    loop_variant: str = typer.Option(
+        None, "--loop-variant",
+        help="Qwen3-ASR full-FT loop/pruning variant: inkling_add_2b (zero-gated 2x middle loop), "
+             "enc_loop_2a (encoder-only BiCycle loop), double_loop_3 (encoder+decoder loop), "
+             "or pruned_ctrl (parameter-matched unlooped control).",
     ),
     no_augment: bool = typer.Option(False, "--no-augment", help="Disable SpecAugment"),
     freeze_encoder: bool = typer.Option(
@@ -910,6 +954,7 @@ def finetune_setup(
             seed=seed,
             prompt_mode=prompt_mode,
             adaptation=adaptation,
+            loop_variant=loop_variant,
             use_augmentation=not no_augment,
             freeze_encoder=freeze_encoder,
             eval_subset_size=eval_subset_size,
