@@ -1139,6 +1139,7 @@ def _effective(trainer: Trainer, parts: TrainingParts) -> dict:
         "spec_augment": SPEC_AUGMENT if trainer.augment else None,
         "layout": None if parts.layout is None else vars(parts.layout),
         "gradient_checkpointing": args.gradient_checkpointing,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
     }
 
 
@@ -1279,6 +1280,12 @@ def run(arch_trainer, config: dict, job_dir: Path, save: bool = True) -> dict:
 
     env = environment_record()
     torch.backends.cuda.enable_cudnn_sdp(False)
+    if config.get("deterministic"):
+        # Before the first cuBLAS call; an op without a deterministic kernel raises.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     seed = int(config.get("seed", 0))
     # Before model init and get_peft_model, so the seed sets the LoRA init too.
     set_seed(seed)
