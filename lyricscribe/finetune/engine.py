@@ -818,16 +818,17 @@ class ZeroNonFiniteGradsCallback(TrainerCallback):
 
 class GradientCheckCallback(TrainerCallback):
     """
-    On a fresh run, require a non-zero gradient on every trainable parameter: all but LoRA ``A``
-    matrices at the first optimizer step, and the ``A`` matrices at the third (they stay zero
-    until the first update has moved ``B``, so they are checked at the second step).
+    On a fresh run, require a non-zero gradient on every trainable parameter. Parameters that
+    sit behind a zero-initialised factor (LoRA ``A`` matrices behind ``B``, and a loop
+    variant's ``entry_gates`` behind its ``loop_gates``) stay at zero gradient until the
+    first update, so they are checked at the second step and everything else at the first.
     """
 
     def __init__(self) -> None:
         """
         Armed for both checks.
         """
-        self.pending = {0: "first", 1: "lora_A"}
+        self.pending = {0: "first", 1: "deferred"}
 
     def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
         """
@@ -846,7 +847,8 @@ class GradientCheckCallback(TrainerCallback):
             return control
         missing, zero = [], []
         for name, p in model.named_parameters():
-            if not p.requires_grad or ((".lora_A." in name) != (kind == "lora_A")):
+            deferred = ".lora_A." in name or name.endswith(".entry_gates")
+            if not p.requires_grad or deferred != (kind == "deferred"):
                 continue
             if p.grad is None:
                 missing.append(name)
